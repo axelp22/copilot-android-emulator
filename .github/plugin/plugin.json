@@ -16,6 +16,5 @@
     "canvas",
     "device-control"
   ],
-  "logo": "docs/images/android-emulator-canvas.png",
   "extensions": "extensions"
 }

@@ -56,8 +56,9 @@ extensions/android-emulator/extension.mjs   # shim re-export (already written)
 
 Merge two sources into one device list:
 
-1. **Running targets** — `adb devices -l` yields serials (`emulator-5554`,
-   `3A141FDJG004U8`). For emulator serials, resolve the AVD name with
+1. **Running targets** — `adb devices -l` yields serials (`emulator-5554` for an
+   emulator, an opaque hardware id for a connected device). For emulator serials,
+   resolve the AVD name with
    `adb -s <serial> emu avd name` (first line of output, before `OK`).
 2. **Offline AVDs** — `emulator -list-avds` yields AVDs that are not booted.
 
