@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { defaultClaimsRoot } from "./device-claims.mjs";
+import { defaultQueueRoot } from "./device-claims.mjs";
 
 /**
  * A cross-session FIFO for devices.
@@ -52,7 +52,7 @@ function isLive(record) {
 }
 
 export class DeviceQueue {
-    constructor({ root = defaultClaimsRoot(), owner = {} } = {}) {
+    constructor({ root = defaultQueueRoot(), owner = {} } = {}) {
         this.root = root;
         this.holdersDir = path.join(root, "holders");
         this.ticketsDir = path.join(root, "tickets");

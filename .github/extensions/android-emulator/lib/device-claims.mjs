@@ -21,6 +21,15 @@ export function defaultClaimsRoot() {
     return path.join(os.homedir(), ".copilot", "android-emulator", "claims");
 }
 
+/**
+ * The queue keeps its own directory. Nesting it inside the claims directory made
+ * two separate mechanisms look like one thing on disk, and left anything scanning
+ * claims to step over the queue's subdirectories.
+ */
+export function defaultQueueRoot() {
+    return path.join(os.homedir(), ".copilot", "android-emulator", "queue");
+}
+
 function safeName(value) {
     return String(value).replace(/[^A-Za-z0-9._-]/g, "_");
 }

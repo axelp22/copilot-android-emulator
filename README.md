@@ -109,6 +109,21 @@ never boots or shuts them down.
   detects this and reports an error rather than retrying silently; restarting the
   emulator clears it.
 - **Recording is capped at 180 seconds** for the same reason.
+- **Queue order comes from the wall clock.** Waiting sessions are ordered by the
+  timestamp they wrote, so the machine's clock stepping backwards can let a newer
+  ticket go first, and a large step forwards can expire a live hold early. Strict
+  ordering would need a sequence handed out under a lock; on one machine with a
+  stable clock this has not been a problem in practice.
+- **The queue only coordinates sessions running this extension.** It is cooperative,
+  like the claims it sits alongside. Capture started by Android Studio, `scrcpy` or a
+  bare `adb` command is detected and shown, but nothing stops it.
+- **A session waiting for "any device" queues on all of them.** It holds a place in
+  every candidate's queue until one is granted. That is what makes "give me whichever
+  frees first" work, but a waiter that stalls while still heartbeating keeps those
+  places, which can hold up sessions behind it when devices are scarce.
+- **A running build cannot be cancelled from the canvas.** Install runs to completion
+  or failure. Closing the canvas does not stop it; only shutting the extension down
+  does, which it does before giving the device up.
 
 ## Agent tools
 
@@ -260,6 +275,8 @@ rendered canvas in a real browser.
 node scripts/verify/device-layer.mjs
 node scripts/verify/canvas-server.mjs
 node scripts/verify/stream-decode.mjs
+node scripts/verify/stream-lifecycle.mjs
+node scripts/verify/recording-coexistence.mjs
 node scripts/verify/boot-lifecycle.mjs
 node scripts/verify/cross-session-claims.mjs
 node scripts/verify/device-queue.mjs
@@ -287,6 +304,16 @@ hardware, so treat it as unproven rather than working:
   not been verified.
 - **Teardown on `session.shutdown`.** Stream children, leases and servers are closed
   on shutdown, but the handler has not been observed firing.
+- **Install against a real Android app project.** The build path is verified end to
+  end — including launching the installed app and confirming it reaches the
+  foreground — but against a stand-in `gradlew`, because this repository is not an
+  Android project. A real AGP build has not been run through the button. Flavored and
+  multi-module layouts are handled by searching the whole `outputs/apk` tree, which is
+  likewise unexercised on a real flavored project.
+- **Reclaiming a hold from a recycled process id.** A crashed session's hold is
+  reclaimed by checking whether its process is still alive. If the operating system
+  has reused that process id, the hold survives until its 60-second lease expires
+  instead. The expiry path is tested; the recycled-pid case is not.
 
 
 What *is* verified against a real emulator and a connected device is listed above
