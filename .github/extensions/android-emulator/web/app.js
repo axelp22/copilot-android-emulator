@@ -65,6 +65,8 @@ const noImageDataUrl = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQ
 const frameElements = { viewport: elements.viewport, phoneFrame: elements.phoneFrame };
 const useVideoDecoder = supportsVideoDecoder();
 const PNG_FALLBACK_INTERVAL_MS = 600;
+/** If nothing has painted by now, stop waiting on WebCodecs and poll screenshots. */
+const H264_WATCHDOG_MS = 10_000;
 
 let state = null;
 let pending = false;
@@ -73,6 +75,7 @@ let activeStreamKey = "";
 let eventSource = null;
 let screenError = null;
 let pngFallbackTimer = null;
+let h264Watchdog = null;
 
 function agentControlUnavailable(currentState = state) {
     return currentState?.lease?.active === true || currentState?.controlPending === true;
@@ -109,6 +112,7 @@ function showScreenError(details) {
     screenError = String(details || "Unknown device error.");
     h264Stream.stop();
     stopPngFallback();
+    stopH264Watchdog();
     elements.screen.src = noImageDataUrl;
     elements.screen.classList.remove("has-frame");
     elements.screenWindow.classList.remove("has-frame");
@@ -301,6 +305,11 @@ function stopPngFallback() {
     pngFallbackTimer = null;
 }
 
+function stopH264Watchdog() {
+    clearTimeout(h264Watchdog);
+    h264Watchdog = null;
+}
+
 /** Used when the canvas runtime has no WebCodecs decoder: poll `screencap` instead. */
 function startPngFallback() {
     stopPngFallback();
@@ -323,6 +332,7 @@ function ensureStream() {
         activeStreamKey = "";
         h264Stream.stop();
         stopPngFallback();
+        stopH264Watchdog();
         setScreenMode("png");
         elements.screen.src = noImageDataUrl;
         elements.screen.classList.remove("has-frame");
@@ -362,6 +372,8 @@ function drawVideoFrame(frame) {
     if (state?.state !== "Booted") {
         return;
     }
+    clearTimeout(h264Watchdog);
+    h264Watchdog = null;
     const width = frame.displayWidth || frame.codedWidth || frame.width;
     const height = frame.displayHeight || frame.codedHeight || frame.height;
     if (width && height && (elements.h264Screen.width !== width || elements.h264Screen.height !== height)) {
@@ -387,6 +399,17 @@ function startH264Stream(fps) {
     elements.screen.classList.remove("has-frame");
     elements.screenWindow.classList.remove("has-frame");
     setScreenStatus(`Connecting H.264 stream at ${fps} fps`);
+    clearTimeout(h264Watchdog);
+    h264Watchdog = setTimeout(() => {
+        h264Watchdog = null;
+        if (state?.state !== "Booted" || screenError) {
+            return;
+        }
+        // Never leave the canvas blank because video decoding failed.
+        h264Stream.stop();
+        setScreenStatus("Video unavailable; streaming screenshots instead");
+        startPngFallback();
+    }, H264_WATCHDOG_MS);
     void h264Stream.start({ url: streamUrl(), fps });
 }
 

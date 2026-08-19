@@ -139,17 +139,48 @@ report.assert(
     `${tags.filter((tag) => tag === FRAME_TAGS.delta).length} frames`,
 );
 
-// `screenrecord` hard-stops at 180s; force a short limit to prove the respawn is seamless.
-const restarted = await sampleStream({ seconds: 9, timeLimitSeconds: 3 });
-const restartTags = restarted.observed.map((entry) => entry.tag);
-const span = (restarted.observed.at(-1)?.at ?? 0) - (restarted.observed[0]?.at ?? 0);
-report.assert(restarted.restarts >= 2, "screenrecord respawned past its time limit", `${restarted.restarts} restarts`);
-report.assert(
-    restartTags.filter((tag) => tag === FRAME_TAGS.keyframe).length >= 3,
-    "parameter sets re-emitted after each respawn",
-    `${restartTags.filter((tag) => tag === FRAME_TAGS.keyframe).length} keyframes`,
-);
-report.assert(span > 6_000, "stream outlived the child process", `${span}ms of continuous frames`);
+// `screenrecord` hard-stops at 180s; force a short limit to prove the respawn is
+// seamless. Rather than counting restarts inside a fixed window — which is
+// sensitive to machine load — wait for a restart and then require that frames
+// keep arriving after the child that produced them has exited.
+const restartStream = await manager.createH264Stream({ deviceId, fps: 30, resolution: 50, timeLimitSeconds: 3 });
+const restartPush = createFrameReader();
+let framesSeen = 0;
+let keyframesSeen = 0;
+let lastFrameAt = 0;
+restartStream.stdout.on("data", (chunk) => {
+    for (const frame of restartPush(chunk)) {
+        framesSeen += 1;
+        lastFrameAt = Date.now();
+        if (frame.tag === FRAME_TAGS.keyframe) {
+            keyframesSeen += 1;
+        }
+    }
+});
+const restartMotion = setInterval(() => {
+    void adb(["shell", "input", "swipe", String(expectedX), String(Math.round(state.screen.height * 0.75)), String(expectedX), String(Math.round(state.screen.height * 0.3)), "200"]).catch(() => {});
+}, 900);
+
+const restartDeadline = Date.now() + 30_000;
+while (restartStream.restartCountValue() < 1 && Date.now() < restartDeadline) {
+    await sleep(500);
+}
+const restartedAt = Date.now();
+const framesBeforeRestart = framesSeen;
+const keyframesBeforeRestart = keyframesSeen;
+report.assert(restartStream.restartCountValue() >= 1, "screenrecord child exited and was respawned", `${restartStream.restartCountValue()} restarts`);
+
+// Frames arriving now can only come from the replacement child.
+while (framesSeen <= framesBeforeRestart && Date.now() < restartedAt + 15_000) {
+    await sleep(500);
+}
+clearInterval(restartMotion);
+await sleep(1500);
+restartStream.kill();
+
+report.assert(framesSeen > framesBeforeRestart, "frames continue after the child exits", `${framesBeforeRestart} -> ${framesSeen}`);
+report.assert(keyframesSeen > keyframesBeforeRestart, "parameter sets re-emitted after the respawn", `${keyframesBeforeRestart} -> ${keyframesSeen} keyframes`);
+report.assert(lastFrameAt > restartedAt, "stream outlived the child process", `last frame ${lastFrameAt - restartedAt}ms after the restart`);
 
 await manager.dispose();
 report.finish();

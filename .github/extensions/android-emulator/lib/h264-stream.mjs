@@ -21,11 +21,12 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const HEALTHY_RUN_MS = 1_500;
 const RESTART_BACKOFF_MS = 250;
 /**
- * How long to wait after the last byte before assuming the trailing NAL unit is
- * complete. A still screen produces no further data, so without this the newest
- * frame would never reach the canvas.
+ * A still screen stops producing frames, which would leave the newest picture
+ * stranded behind an undelimited NAL unit. Rather than guess that a partial unit
+ * is complete — a truncated sample makes the decoder reject the stream — the
+ * current screen is re-sent as a PNG seed frame while the encoder is quiet.
  */
-const IDLE_FLUSH_MS = 60;
+const IDLE_REFRESH_MS = 800;
 
 /**
  * Wrap one payload as `[uint32 length][uint8 tag][payload]`, where `length`
@@ -40,7 +41,7 @@ export function frame(tag, payload) {
 
 /** Build an `avcC` decoder configuration record from raw SPS/PPS NAL units. */
 export function buildAvcC(sps, pps) {
-    if (!sps || sps.length < 4 || !pps || pps.length === 0) {
+    if (!isParameterSet(sps, NAL_SPS, 4) || !isParameterSet(pps, NAL_PPS, 1)) {
         return null;
     }
     return Buffer.concat([
@@ -58,6 +59,20 @@ export function buildAvcC(sps, pps) {
         Buffer.from([(pps.length >> 8) & 0xff, pps.length & 0xff]),
         pps,
     ]);
+}
+
+/**
+ * A parameter set must carry the right NAL type, a zero forbidden bit and enough
+ * bytes to describe a profile. A truncated SPS would otherwise yield an avcC whose
+ * codec string the decoder rejects outright.
+ */
+function isParameterSet(nal, expectedType, minimumLength) {
+    return (
+        Buffer.isBuffer(nal) &&
+        nal.length >= minimumLength + 1 &&
+        (nal[0] & 0x80) === 0 &&
+        (nal[0] & 0x1f) === expectedType
+    );
 }
 
 /** Prefix each NAL unit with its 4-byte length, producing one AVCC sample. */
@@ -120,7 +135,7 @@ export function createAnnexBParser(onNalUnit) {
                 if (started && index > 0) {
                     const nal = trimTrailingZeroes(buffer.subarray(0, index));
                     if (nal.length > 0) {
-                        onNalUnit(Buffer.from(nal));
+                        onNalUnit(Buffer.from(nal), { speculative: false });
                     }
                 }
                 buffer = Buffer.from(buffer.subarray(index + codeLength));
@@ -134,7 +149,8 @@ export function createAnnexBParser(onNalUnit) {
         /**
          * Emit the trailing NAL unit. Annex-B only delimits units by the *next* start
          * code, so a still screen would otherwise strand its last frame in the buffer.
-         * Callers flush on idle and at end of stream.
+         * Callers flush on idle and at end of stream. The unit is reported as
+         * speculative because a stall mid-unit would otherwise truncate it.
          */
         flush() {
             if (!started || buffer.length === 0) {
@@ -146,7 +162,7 @@ export function createAnnexBParser(onNalUnit) {
             if (nal.length === 0) {
                 return false;
             }
-            onNalUnit(Buffer.from(nal));
+            onNalUnit(Buffer.from(nal), { speculative: true });
             return true;
         },
         reset() {
@@ -187,17 +203,24 @@ export async function createH264Stream({
     let pendingPrefix = [];
     let restartCount = 0;
     let idleTimer = null;
+    let seedInFlight = false;
 
     const parser = createAnnexBParser(handleNalUnit);
 
-    function scheduleIdleFlush() {
+    function scheduleIdleRefresh() {
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
             idleTimer = null;
-            if (!stopped) {
-                parser.flush();
+            if (stopped || seedInFlight) {
+                return;
             }
-        }, IDLE_FLUSH_MS);
+            // The encoder has gone quiet; paint the live screen instead of waiting.
+            void sendSeedFrame().finally(() => {
+                if (!stopped) {
+                    scheduleIdleRefresh();
+                }
+            });
+        }, IDLE_REFRESH_MS);
         idleTimer.unref?.();
     }
 
@@ -237,15 +260,21 @@ export async function createH264Stream({
         write(frame(FRAME_TAGS.config, avcC));
     }
 
-    function handleNalUnit(nal) {
+    function handleNalUnit(nal, { speculative = false } = {}) {
         const type = nal[0] & 0x1f;
-        if (type === NAL_SPS) {
-            sps = nal;
-            sendConfig();
-            return;
-        }
-        if (type === NAL_PPS) {
-            pps = nal;
+        if (type === NAL_SPS || type === NAL_PPS) {
+            // An idle flush fires when the pipe stalls, which can happen part-way
+            // through a unit. A truncated parameter set produces an avcC whose codec
+            // string the decoder rejects, so only accept delimited ones. Parameter
+            // sets always precede a frame, so a real copy follows immediately.
+            if (speculative) {
+                return;
+            }
+            if (type === NAL_SPS) {
+                sps = nal;
+            } else {
+                pps = nal;
+            }
             sendConfig();
             return;
         }
@@ -268,11 +297,19 @@ export async function createH264Stream({
     }
 
     async function sendSeedFrame() {
+        if (seedInFlight) {
+            return;
+        }
+        seedInFlight = true;
         try {
             const png = await screencapPng(serial);
-            write(frame(FRAME_TAGS.seed, png));
+            if (!stopped) {
+                write(frame(FRAME_TAGS.seed, png));
+            }
         } catch (error) {
             onDiagnostic?.(`seed frame unavailable: ${error?.message ?? error}`);
+        } finally {
+            seedInFlight = false;
         }
     }
 
@@ -303,7 +340,7 @@ export async function createH264Stream({
         next.stdout.on("data", (chunk) => {
             consecutiveFailures = 0;
             parser.push(chunk);
-            scheduleIdleFlush();
+            scheduleIdleRefresh();
         });
         next.stdout.on("error", () => {});
         next.stderr?.on("data", (chunk) => {
@@ -320,8 +357,9 @@ export async function createH264Stream({
             }
             clearTimeout(idleTimer);
             idleTimer = null;
-            if (!stopped) {
-                // Deliver the run's final frame before the parser is reset.
+            if (!stopped && code === 0 && signal == null) {
+                // A clean exit means the last unit was written in full, so it is safe
+                // to deliver. A killed child may have been cut mid-unit.
                 parser.flush();
             }
             if (stopped) {

@@ -7,6 +7,11 @@ function avcCodecString(description) {
         .join("")}`;
 }
 
+/** An avcC record starts with configurationVersion 1 and carries at least one SPS. */
+function looksLikeAvcC(description) {
+    return description instanceof Uint8Array && description.length >= 7 && description[0] === 0x01;
+}
+
 function sameBytes(a, b) {
     if (!a || !b || a.length !== b.length) {
         return false;
@@ -35,6 +40,7 @@ export function createH264StreamController({ onFrame, onError }) {
     let timestamp = 0;
     let failed = false;
     let currentDescription = null;
+    let awaitingKeyframe = false;
 
     function stop() {
         abortController?.abort();
@@ -48,6 +54,7 @@ export function createH264StreamController({ onFrame, onError }) {
         }
         decoder = null;
         currentDescription = null;
+        awaitingKeyframe = false;
     }
 
     function fail(error) {
@@ -59,21 +66,37 @@ export function createH264StreamController({ onFrame, onError }) {
         onError(error);
     }
 
+    /**
+     * A corrupt sample must not blank the canvas for good: drop the decoder and
+     * resume from the next keyframe instead of tearing the stream down.
+     */
+    function recoverDecoder() {
+        if (decoder) {
+            try {
+                decoder.close();
+            } catch {
+                // Already closed.
+            }
+        }
+        decoder = null;
+        currentDescription = null;
+        awaitingKeyframe = true;
+    }
+
     function configureDecoder(description) {
         if (!supportsVideoDecoder()) {
             throw new Error("This canvas runtime does not expose WebCodecs VideoDecoder.");
+        }
+        if (!looksLikeAvcC(description)) {
+            return;
         }
         // The stream re-sends parameter sets after every `screenrecord` restart.
         // Reconfiguring for identical bytes would flush the decoder for no reason.
         if (decoder && sameBytes(currentDescription, description)) {
             return;
         }
-        if (decoder) {
-            decoder.close();
-        }
-        timestamp = 0;
-        currentDescription = description.slice();
-        decoder = new VideoDecoder({
+
+        const next = new VideoDecoder({
             output: (videoFrame) => {
                 try {
                     onFrame(videoFrame);
@@ -83,13 +106,32 @@ export function createH264StreamController({ onFrame, onError }) {
                     videoFrame.close();
                 }
             },
-            error: fail,
+            error: recoverDecoder,
         });
-        decoder.configure({
-            codec: avcCodecString(description),
-            description,
-            optimizeForLatency: true,
-        });
+        try {
+            next.configure({
+                codec: avcCodecString(description),
+                description,
+                optimizeForLatency: true,
+            });
+        } catch {
+            // Keep decoding with the existing configuration; the stream re-sends
+            // parameter sets, so a usable one should follow.
+            try {
+                next.close();
+            } catch {
+                // Already closed.
+            }
+            return;
+        }
+
+        if (decoder) {
+            decoder.close();
+        }
+        timestamp = 0;
+        currentDescription = description.slice();
+        awaitingKeyframe = false;
+        decoder = next;
     }
 
     async function drawSeed(payload) {
@@ -145,14 +187,24 @@ export function createH264StreamController({ onFrame, onError }) {
                         if (!decoder) {
                             continue;
                         }
+                        if (awaitingKeyframe) {
+                            if (tag !== 0x02) {
+                                continue;
+                            }
+                            awaitingKeyframe = false;
+                        }
                         timestamp += Math.round(1_000_000 / fps);
-                        decoder.decode(
-                            new EncodedVideoChunk({
-                                type: tag === 0x02 ? "key" : "delta",
-                                timestamp,
-                                data: payload,
-                            }),
-                        );
+                        try {
+                            decoder.decode(
+                                new EncodedVideoChunk({
+                                    type: tag === 0x02 ? "key" : "delta",
+                                    timestamp,
+                                    data: payload,
+                                }),
+                            );
+                        } catch {
+                            recoverDecoder();
+                        }
                     } else if (tag === 0x04) {
                         await drawSeed(payload);
                     }

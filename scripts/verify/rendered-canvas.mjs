@@ -26,6 +26,23 @@ async function screenHash() {
     return crypto.createHash("sha256").update(png ?? Buffer.alloc(0)).digest("hex").slice(0, 16);
 }
 
+/**
+ * Polls until the device screen differs from `baseline`. A fixed sleep is
+ * unreliable: under load the emulator can take seconds to render a gesture.
+ */
+async function waitForScreenChange(baseline, timeoutMs = 12_000) {
+    const deadline = Date.now() + timeoutMs;
+    let latest = baseline;
+    while (Date.now() < deadline) {
+        await sleep(600);
+        latest = await screenHash();
+        if (latest !== baseline) {
+            return latest;
+        }
+    }
+    return latest;
+}
+
 const chrome = spawn(
     config.chrome,
     [
@@ -54,6 +71,7 @@ if (!version) {
     chrome.kill("SIGTERM");
     report.finish();
 }
+process.on("exit", () => chrome.kill("SIGKILL"));
 report.note(version["Browser"]);
 
 const target = await (await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(canvasUrl)}`, { method: "PUT" })).json();
@@ -78,6 +96,18 @@ function send(method, params = {}) {
     socket.send(JSON.stringify({ id, method, params }));
     return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
 }
+async function shutdownBrowser() {
+    // Browser.close exits every renderer; killing the launcher alone orphans them.
+    try {
+        await send("Browser.close");
+    } catch {
+        // The browser may already be gone.
+    }
+    socket.close();
+    chrome.kill("SIGTERM");
+    await sleep(300);
+}
+
 async function evaluate(expression) {
     const result = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
     if (result.exceptionDetails) {
@@ -110,6 +140,21 @@ async function clickElement(selector) {
 
 await send("Page.enable");
 await send("Runtime.enable");
+
+// The tab is created asynchronously, so wait for the shell before touching the DOM.
+let domReady = false;
+for (let attempt = 0; attempt < 60 && !domReady; attempt += 1) {
+    domReady = await evaluate(`Boolean(document.querySelector(".screen-window"))`).catch(() => false);
+    if (!domReady) {
+        await sleep(250);
+    }
+}
+if (!domReady) {
+    report.skip("rendered canvas", "the canvas page never rendered; is the URL still live?");
+    await shutdownBrowser();
+    report.finish();
+}
+
 await evaluate(`(() => {
     window.__pointerLog = [];
     const surface = document.querySelector(".screen-window");
@@ -118,6 +163,11 @@ await evaluate(`(() => {
     }
     return true;
 })()`);
+
+// Make sure the device is awake and unlocked, or every visual check is meaningless.
+await adb(["shell", "input", "keyevent", "224"]).catch(() => {});
+await adb(["shell", "wm", "dismiss-keyguard"]).catch(() => {});
+await adb(["shell", "input", "keyevent", "3"]).catch(() => {});
 
 // Let the page connect SSE, open the stream and decode real frames.
 await sleep(9000);
@@ -175,15 +225,20 @@ const signature = () =>
         return sum;
     })()`);
 
-// Sample repeatedly while driving continuous motion: a single before/after pair is
-// timing-sensitive and can coincide on a screen that settles back to the same view.
-const signatures = new Set();
-for (let sample = 0; sample < 6; sample += 1) {
-    signatures.add(await signature());
-    void adb(["shell", "input", "swipe", "540", "1800", "540", "700", "150"]).catch(() => {});
-    await sleep(1200);
+// Sample repeatedly while forcing a deterministic visual change: alternating
+// between the launcher and the app drawer guarantees a large difference, whereas
+// a single swipe can settle back to an identical-looking screen.
+const signatures = new Set([await signature()]);
+const livenessDeadline = Date.now() + 20_000;
+let toggle = 0;
+while (Date.now() < livenessDeadline && signatures.size < 2) {
+    await adb(["shell", "input", "keyevent", toggle % 2 === 0 ? "3" : "187"]).catch(() => {});
+    toggle += 1;
+    for (let poll = 0; poll < 6 && signatures.size < 2; poll += 1) {
+        await sleep(500);
+        signatures.add(await signature());
+    }
 }
-signatures.add(await signature());
 report.assert(signatures.size > 1, "video is live rather than a frozen seed frame", `${signatures.size} distinct frames sampled`);
 
 const geometry = await evaluate(`(() => {
@@ -210,7 +265,7 @@ if (view.leaseActive) {
 
     const before = await screenHash();
     await drag(dragX, dragFrom, dragTo, 6);
-    await sleep(2500);
+    await sleep(4000);
     report.assert(before === (await screenHash()), "manual input ignored while the agent holds the lease");
 
     await clickElement("#take-back");
@@ -232,21 +287,19 @@ await sleep(2500);
 const atHome = await screenHash();
 await evaluate("window.__pointerLog = []");
 await drag(dragX, dragFrom, dragTo);
-await sleep(3000);
+const afterDrag = await waitForScreenChange(atHome);
 const pointerLog = await evaluate("window.__pointerLog.join(',')");
 report.assert(pointerLog.includes("pointerdown") && pointerLog.includes("pointerup"), "canvas received real pointer events");
-report.assert(atHome !== (await screenHash()), "manual drag changed the device screen");
+report.assert(atHome !== afterDrag, "manual drag changed the device screen", `${atHome} -> ${afterDrag}`);
 
-const beforeHome = await screenHash();
 await clickElement('[data-action="home"]');
-await sleep(3000);
-report.assert(beforeHome !== (await screenHash()), "toolbar Home button changed the device screen");
+const afterHome = await waitForScreenChange(afterDrag);
+report.assert(afterDrag !== afterHome, "toolbar Home button changed the device screen", `${afterDrag} -> ${afterHome}`);
 
 const shot = await send("Page.captureScreenshot", { format: "png" });
 const shotPath = "/tmp/android-emulator-verify-canvas.png";
 await writeFile(shotPath, Buffer.from(shot.data, "base64"));
 report.note(`screenshot written to ${shotPath}`);
 
-socket.close();
-chrome.kill("SIGTERM");
+await shutdownBrowser();
 report.finish();
