@@ -12,6 +12,7 @@ import {
     getWmSize,
     listAttached,
     listAvds,
+    listForeignCaptures,
     requireEmulatorBinary,
     resolveToolchain,
     startAdbServer,
@@ -23,6 +24,7 @@ import {
     orientationFromRotation,
 } from "./device-model.mjs";
 import { DeviceClaimStore } from "./device-claims.mjs";
+import { DeviceQueue } from "./device-queue.mjs";
 import { DeviceRegistry } from "./device-registry.mjs";
 import { InputDispatcher } from "./input-dispatcher.mjs";
 import { ScreenService } from "./screen-service.mjs";
@@ -35,6 +37,8 @@ const BOOT_TIMEOUT_MS = 180_000;
  */
 const DISCOVERY_TTL_MS = 750;
 const AVD_LIST_TTL_MS = 10_000;
+/** Probing the device for foreign capture costs adb calls, so reuse it briefly. */
+const FOREIGN_CAPTURE_TTL_MS = 5_000;
 const BOOT_POLL_INTERVAL_MS = 2_000;
 const SHUTDOWN_TIMEOUT_MS = 45_000;
 
@@ -62,7 +66,11 @@ export class DeviceSessionManager {
         // Shared with other Copilot sessions so they can see, and avoid, a device
         // this session is already driving.
         this.claims = new DeviceClaimStore({});
+        // Exclusion and turn-taking across sessions; the claim store only reports.
+        this.queue = new DeviceQueue({});
         this.foreignClaimCache = new Map();
+        this.foreignCaptureCache = new Map();
+        this.foreignCaptureCheckedAt = 0;
         this.discoveryCompletedAt = 0;
         this.lastDiscovery = null;
         this.avdListCache = null;
@@ -91,9 +99,26 @@ export class DeviceSessionManager {
         this.artifactsRoot = artifactsRoot;
     }
 
-    /** Identifies this session in claims other sessions can read. */
+    /** Identifies this session in the records other sessions read. */
     setSessionIdentity(identity) {
         this.claims.setOwner(identity);
+        this.queue.setOwner({
+            sessionId: identity.sessionId,
+            sessionLabel: identity.workingDirectory ? identity.workingDirectory.split("/").pop() : undefined,
+        });
+    }
+
+    /** Devices a request for "any" may be satisfied by. */
+    availableDeviceIds() {
+        return Array.from(this.state.devices.values())
+            .filter((device) => device.isAvailable !== false && device.state === DEVICE_STATES.booted)
+            .map((device) => device.id);
+    }
+
+    async queueStatus() {
+        await this.refreshDevices();
+        const deviceIds = Array.from(this.state.devices.keys());
+        return { devices: await this.queue.status(deviceIds) };
     }
 
     async refreshForeignClaims() {
@@ -103,6 +128,26 @@ export class DeviceSessionManager {
 
     foreignClaimFor(deviceId) {
         return this.foreignClaimCache.get(deviceId) ?? null;
+    }
+
+    /**
+     * Detects capture started outside this extension entirely. Claims only reveal
+     * sessions that publish one; this catches everything else.
+     */
+    async refreshForeignCaptures(devices) {
+        if (Date.now() - this.foreignCaptureCheckedAt < FOREIGN_CAPTURE_TTL_MS) {
+            return this.foreignCaptureCache;
+        }
+        const running = devices.filter((device) => device.serial && device.state === DEVICE_STATES.booted);
+        const results = await Promise.all(
+            running.map(async (device) => {
+                const foreign = await listForeignCaptures(device.serial).catch(() => []);
+                return [device.id, foreign.length > 0];
+            }),
+        );
+        this.foreignCaptureCache = new Map(results);
+        this.foreignCaptureCheckedAt = Date.now();
+        return this.foreignCaptureCache;
     }
 
     setDiagnosticSink(onDiagnostic) {
@@ -307,11 +352,35 @@ export class DeviceSessionManager {
             this.refreshDevices().then(() => this.state.listDevicePicker(currentDeviceId)),
             this.refreshForeignClaims(),
         ]);
+        await this.refreshForeignCaptures(Array.from(this.state.devices.values())).catch(() => {});
+
+        const deviceIds = Object.values(picker.groups).flatMap((group) => group.map((item) => item.deviceId));
+        const queueByDevice = new Map(
+            (await this.queue.status(deviceIds).catch(() => [])).map((entry) => [entry.deviceId, entry]),
+        );
+
         for (const group of Object.values(picker.groups)) {
             for (const item of group) {
                 const claim = this.foreignClaimFor(item.deviceId);
                 item.foreignUse = claim
                     ? { sessionLabel: claim.sessionLabel, mode: claim.mode, reason: claim.reason }
+                    : null;
+                // Capture we did not start, by something that publishes no claim.
+                item.foreignCapture = this.foreignCaptureCache.get(item.deviceId) === true;
+
+                const queued = queueByDevice.get(item.deviceId);
+                item.queue = queued
+                    ? {
+                          holder: queued.holder
+                              ? {
+                                    sessionLabel: queued.holder.sessionLabel,
+                                    reason: queued.holder.reason,
+                                    isMine: queued.holder.isMine,
+                                }
+                              : null,
+                          waiting: queued.waiting.length,
+                          myPosition: queued.waiting.find((waiter) => waiter.isMine)?.position ?? null,
+                      }
                     : null;
             }
         }
@@ -581,19 +650,54 @@ export class DeviceSessionManager {
         return this.state.hasActiveLease(deviceId);
     }
 
+    /**
+     * Takes the device for this session, queueing behind other sessions when asked.
+     * `deviceId` may be "any" to accept whichever device becomes free first.
+     */
     async acquireLease(input) {
         await this.refreshDevices();
-        await this.assertNotClaimedElsewhere(input.deviceId);
-        this.state.reserveLease(input);
+
+        const wantsAny = input.deviceId === "any";
+        const candidates = wantsAny ? this.availableDeviceIds() : [input.deviceId];
+        if (candidates.length === 0) {
+            throw new AppError("no_available_device", "No booted device is available to take.", 409);
+        }
+
+        const granted = await this.queue.acquire(candidates, {
+            reason: input.reason ?? null,
+            timeoutMs: Math.max(0, Math.round((input.waitSeconds ?? 0) * 1000)),
+        });
+        if (!granted) {
+            const [status] = await this.queue.status(candidates);
+            throw new AppError(
+                "device_busy",
+                status?.holder
+                    ? `${status.holder.sessionLabel} is using this device` +
+                      `${status.holder.reason ? ` (${status.holder.reason})` : ""}.` +
+                      ` ${status.waiting.length} session(s) waiting. Pass waitSeconds to queue for it.`
+                    : "The device could not be taken. Pass waitSeconds to queue for it.",
+                409,
+                { queue: status ?? null },
+            );
+        }
+
+        const deviceId = granted.deviceId;
+        const leaseInput = { ...input, deviceId };
         try {
-            await this.stopManualInput(input.deviceId);
-            const snapshot = this.state.acquireLease(input);
-            await this.claims
-                .claim(input.deviceId, { mode: "control", reason: input.reason ?? null })
-                .catch(() => {});
-            return snapshot;
+            this.state.reserveLease(leaseInput);
         } catch (error) {
-            this.state.cancelLeaseReservation(input.deviceId, input.ownerInstanceId);
+            await this.queue.release(deviceId);
+            throw error;
+        }
+
+        try {
+            await this.stopManualInput(deviceId);
+            const snapshot = this.state.acquireLease(leaseInput);
+            await this.claims.claim(deviceId, { mode: "control", reason: input.reason ?? null }).catch(() => {});
+            return { ...snapshot, waitedMs: granted.waitedMs };
+        } catch (error) {
+            this.state.cancelLeaseReservation(deviceId, input.ownerInstanceId);
+            await this.queue.release(deviceId);
             throw error;
         }
     }
@@ -608,24 +712,6 @@ export class DeviceSessionManager {
         }
     }
 
-    /**
-     * Refuses control when another Copilot session is already driving the device.
-     * Two agents on one device interleave taps and corrupt each other's runs.
-     */
-    async assertNotClaimedElsewhere(deviceId) {
-        await this.refreshForeignClaims();
-        const claim = this.foreignClaimFor(deviceId);
-        if (claim?.mode === "control") {
-            throw new AppError(
-                "device_claimed_elsewhere",
-                `Another Copilot session (${claim.sessionLabel}) is driving this device` +
-                    `${claim.reason ? `: ${claim.reason}` : ""}. Wait for it to finish, or pick another device.`,
-                409,
-                { sessionLabel: claim.sessionLabel, workingDirectory: claim.workingDirectory },
-            );
-        }
-    }
-
     async renewLease(input) {
         return this.state.renewLease(input);
     }
@@ -633,6 +719,8 @@ export class DeviceSessionManager {
     async releaseLease(input) {
         const snapshot = this.state.releaseLease(input);
         await this.downgradeClaim(input.deviceId);
+        // Hand the device to whoever is next in line.
+        await this.queue.release(input.deviceId).catch(() => {});
         return snapshot;
     }
 
@@ -642,6 +730,7 @@ export class DeviceSessionManager {
         const snapshot = this.state.revokeLease(deviceId);
         await this.state.settleActiveOperations(deviceId);
         await this.downgradeClaim(deviceId);
+        await this.queue.release(deviceId).catch(() => {});
         return snapshot;
     }
 
@@ -854,7 +943,8 @@ export class DeviceSessionManager {
     async dispose() {
         await this.video.stopAll().catch(() => {});
         this.input.clearTouchSessions();
-        // Never leave a device looking taken by a session that has exited.
+        // Never leave a device taken, or a queue blocked, by a session that has exited.
         await this.claims.releaseAll().catch(() => {});
+        await this.queue.releaseAll().catch(() => {});
     }
 }

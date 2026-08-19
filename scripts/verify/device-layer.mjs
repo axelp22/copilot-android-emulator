@@ -113,6 +113,11 @@ await manager.notifyTouch({ deviceId, phase: "up", x: 0.5005, y: 0.5005, coordin
 report.assert(true, "jittery pointer degrades to a tap");
 
 // --- rotation ----------------------------------------------------------------
+// Rotation is relative to the device's current orientation, so start from a known
+// one: earlier activity can leave the display rotated.
+await adb(["shell", "settings", "put", "system", "user_rotation", "0"]);
+await sleep(1200);
+await manager.refreshDeviceGeometry(deviceId).catch(() => {});
 const rotated = await manager.rotateDevice({ deviceId, direction: "right" });
 report.assert(rotated.requestedOrientation === "landscape", "rotate right requests landscape", rotated.requestedOrientation);
 report.assert(typeof rotated.applied === "boolean", "rotation reports whether the app allowed it", String(rotated.applied));

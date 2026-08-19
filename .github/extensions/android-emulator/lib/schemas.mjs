@@ -114,12 +114,24 @@ export const actionSchemas = {
         type: "object",
         additionalProperties: false,
         properties: {
-            deviceId: { type: "string", minLength: 1 },
+            deviceId: {
+                type: "string",
+                minLength: 1,
+                description: 'Device to take control of, or "any" to take whichever booted device is free first.',
+            },
             reason: { type: "string", minLength: 1, maxLength: 240 },
             ttlSeconds: { type: "integer", minimum: 15, maximum: 900 },
+            waitSeconds: {
+                type: "integer",
+                minimum: 0,
+                maximum: 900,
+                description:
+                    "How long to queue behind other sessions already using the device. 0 (the default) fails immediately when it is busy.",
+            },
         },
         required: ["deviceId"],
     },
+    queueStatus: { type: "object", additionalProperties: false, properties: {} },
     renewControl: {
         type: "object",
         additionalProperties: false,

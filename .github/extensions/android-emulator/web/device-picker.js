@@ -1,7 +1,38 @@
 import { renderIcon } from "./icons.js";
 
+/** Reads "2 waiting" off the queue, or nothing when nobody is queued. */
+function waitingSuffix(queue) {
+    const waiting = queue?.waiting ?? 0;
+    return waiting > 0 ? ` · ${waiting} waiting` : "";
+}
+
 /** Describes how a device is currently being used, if at all. */
 function usageBadge(device) {
+    const queue = device.queue ?? null;
+
+    // We are in line for this device: the most useful thing we can say.
+    if (queue?.myPosition) {
+        return {
+            kind: "waiting",
+            label: `Waiting · #${queue.myPosition}`,
+            title: `You are number ${queue.myPosition} in line for this device${
+                queue.holder ? `, behind ${queue.holder.sessionLabel}` : ""
+            }`,
+        };
+    }
+
+    // The queue holder is authoritative: it is what actually blocks other sessions.
+    if (queue?.holder && !queue.holder.isMine) {
+        return {
+            kind: "foreign",
+            label: `In use · ${queue.holder.sessionLabel}${waitingSuffix(queue)}`,
+            title:
+                `${queue.holder.sessionLabel} is using this device` +
+                `${queue.holder.reason ? `: ${queue.holder.reason}` : ""}.` +
+                ` Agents can queue for it instead of interrupting.`,
+        };
+    }
+
     // Another Copilot session takes priority: it is the case you cannot see from here.
     if (device.foreignUse) {
         const other = device.foreignUse;
@@ -14,10 +45,18 @@ function usageBadge(device) {
                 : `Another Copilot session (${other.sessionLabel}) has this device open`,
         };
     }
+    // Capture we cannot attribute to a session: another tool is using the device.
+    if (device.foreignCapture) {
+        return {
+            kind: "foreign",
+            label: "In use elsewhere",
+            title: "Something outside Copilot is capturing this device — Android Studio, scrcpy, or an adb command",
+        };
+    }
     if (device.leaseActive) {
         return {
             kind: "agent",
-            label: "Agent control",
+            label: `Agent control${waitingSuffix(queue)}`,
             title: device.leaseReason ? `An agent is driving this device: ${device.leaseReason}` : "An agent is driving this device",
         };
     }

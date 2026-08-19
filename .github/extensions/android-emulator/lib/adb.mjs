@@ -311,6 +311,37 @@ export function parsePngDimensions(buffer) {
     };
 }
 
+/**
+ * Device-side `screenrecord` processes that this machine's Copilot extensions did
+ * not start. Each of our streams records its PID in `/data/local/tmp`, so anything
+ * recording without a matching file is another tool — Android Studio, scrcpy, a
+ * plain `adb` command, or a Copilot session running a build without claim support.
+ *
+ * This is the only signal that works when the other user is not cooperating, which
+ * is exactly when "is this device free?" matters most.
+ */
+export async function listForeignCaptures(serial) {
+    const [processes, owned] = await Promise.all([
+        adbShell(serial, ["ps", "-A"], { timeout: 15_000 }).catch(() => ""),
+        adbShell(serial, ["cat", "/data/local/tmp/copilot-stream-*.pid"], { timeout: 15_000 }).catch(() => ""),
+    ]);
+
+    const ownedPids = new Set(
+        owned
+            .split(/\s+/)
+            .map((value) => value.trim())
+            .filter((value) => /^\d+$/.test(value)),
+    );
+
+    const recorderPids = processes
+        .split(/\r?\n/)
+        .filter((line) => line.trim().split(/\s+/).at(-1) === "screenrecord")
+        .map((line) => line.trim().split(/\s+/)[1])
+        .filter((pid) => /^\d+$/.test(pid));
+
+    return recorderPids.filter((pid) => !ownedPids.has(pid));
+}
+
 export async function screencapPng(serial) {
     const image = await adbExecOut(serial, ["screencap", "-p"], { timeout: 30_000 });
     if (!image || image.length === 0) {

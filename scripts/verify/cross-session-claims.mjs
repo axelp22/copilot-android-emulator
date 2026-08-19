@@ -11,6 +11,7 @@ import path from "node:path";
 import { config, createReporter, extensionRoot } from "./_shared.mjs";
 
 const { DeviceClaimStore } = await import(path.join(extensionRoot, "lib", "device-claims.mjs"));
+const { DeviceQueue } = await import(path.join(extensionRoot, "lib", "device-queue.mjs"));
 const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
 
 const report = createReporter("CROSS-SESSION CLAIMS");
@@ -19,11 +20,17 @@ const root = await mkdtemp(path.join(os.tmpdir(), "android-claims-"));
 const manager = new DeviceSessionManager({ onDiagnostic: () => {} });
 manager.setArtifactsRoot(config.artifactsRoot);
 manager.claims = new DeviceClaimStore({ root, owner: { sessionId: "session-A", workingDirectory: "/work/repo-a" } });
+// Point the queue at the same scratch root so the suite never touches real state.
+manager.queue = new DeviceQueue({ root: path.join(root, "queue"), owner: { sessionId: "session-A", sessionLabel: "repo-a" } });
 
 // Stands in for a second Copilot session sharing the same devices.
 const otherSession = new DeviceClaimStore({
     root,
     owner: { sessionId: "session-B", workingDirectory: "/work/repo-b" },
+});
+const otherQueue = new DeviceQueue({
+    root: path.join(root, "queue"),
+    owner: { sessionId: "session-B", sessionLabel: "repo-b" },
 });
 
 const deviceId = await manager.resolveDeviceId(config.deviceId);
@@ -48,6 +55,7 @@ await manager.revokeLease(deviceId);
 
 // --- another session is driving it -------------------------------------------
 await otherSession.claim(deviceId, { mode: "control", reason: "running a test suite" });
+await otherQueue.acquire(deviceId, { reason: "running a test suite", timeoutMs: 0 });
 await manager.refreshForeignClaims();
 const foreign = manager.foreignClaimFor(deviceId);
 report.assert(foreign?.mode === "control", "another session's control is detected", foreign?.sessionLabel ?? "none");
@@ -59,7 +67,7 @@ await manager
     .catch((error) => {
         refused = error;
     });
-report.assert(refused?.code === "device_claimed_elsewhere", "control is refused while another session drives it", refused?.code ?? "not refused");
+report.assert(refused?.code === "device_busy", "control is refused while another session drives it", refused?.code ?? "not refused");
 report.assert(
     String(refused?.message).includes("repo-b"),
     "the refusal names the other session",
@@ -70,6 +78,37 @@ report.assert(
 const picker = await manager.listDevicePicker(deviceId);
 const row = Object.values(picker.groups).flat().find((item) => item.deviceId === deviceId);
 report.assert(row?.foreignUse?.mode === "control", "the device picker reports the other session", JSON.stringify(row?.foreignUse ?? null));
+report.assert(row?.queue?.holder?.sessionLabel === "repo-b", "the picker names the session holding the device", String(row?.queue?.holder?.sessionLabel));
+
+// --- waiting for a busy device rather than failing ----------------------------
+// The point of the queue: a second session can line up instead of interrupting.
+const queuedAcquire = manager.acquireLease({
+    deviceId,
+    reason: "queued run",
+    ownerInstanceId: "a",
+    ttlSeconds: 60,
+    waitSeconds: 30,
+});
+await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+const waitingStatus = await manager.queueStatus();
+const waitingRow = waitingStatus.devices.find((entry) => entry.deviceId === deviceId);
+report.assert(waitingRow?.waiting.length === 1, "a queued session is listed as waiting", `${waitingRow?.waiting.length ?? 0} waiting`);
+report.assert(waitingRow?.waiting[0]?.isMine === true, "the waiting session recognises itself in the queue");
+
+const waitingPicker = await manager.listDevicePicker(deviceId);
+const waitingPickerRow = Object.values(waitingPicker.groups).flat().find((item) => item.deviceId === deviceId);
+report.assert(waitingPickerRow?.queue?.myPosition === 1, "the picker shows our place in line", String(waitingPickerRow?.queue?.myPosition));
+
+await otherQueue.release(deviceId);
+const grantedAfterWait = await queuedAcquire;
+report.assert(grantedAfterWait.lease.active, "the queued session gets the device once it is free");
+report.assert(grantedAfterWait.waitedMs > 0, "the grant reports how long it waited", `${grantedAfterWait.waitedMs}ms`);
+await manager.revokeLease(deviceId);
+
+const afterRevoke = await manager.queueStatus();
+const freedRow = afterRevoke.devices.find((entry) => entry.deviceId === deviceId);
+report.assert(!freedRow?.holder, "releasing control frees the device in the queue", JSON.stringify(freedRow?.holder ?? null));
 
 // --- the other session goes away ---------------------------------------------
 await otherSession.releaseAll();
@@ -94,5 +133,36 @@ report.assert(
 const remaining = (await readdir(root)).filter((name) => name.includes("session-dead"));
 report.assert(remaining.length === 0, "the stale claim file is cleaned up", `${remaining.length} left`);
 
+// --- capture started outside the extension entirely ---------------------------
+// Claims only reveal sessions that publish one. Android Studio, scrcpy or a plain
+// adb command publish nothing, which is exactly when "is it free?" matters.
+const { listForeignCaptures } = await import(path.join(extensionRoot, "lib", "adb.mjs"));
+const { adb } = await import("./_shared.mjs");
+
+const before = await listForeignCaptures(config.serial).catch(() => []);
+report.assert(before.length === 0, "no foreign capture on an idle device", `${before.length} found`);
+
+await adb(["shell", "screenrecord --time-limit 30 /sdcard/verify-foreign.mp4 >/dev/null 2>&1 &"]).catch(() => {});
+await new Promise((resolve) => setTimeout(resolve, 3500));
+const during = await listForeignCaptures(config.serial).catch(() => []);
+report.assert(during.length > 0, "capture started outside the extension is detected", `pids ${during.join(",")}`);
+
+// Foreign-capture probing is cached briefly to keep adb calls off the hot path,
+// so wait out that window rather than reading a stale answer.
+await new Promise((resolve) => setTimeout(resolve, 5_500));
+const capturePicker = await manager.listDevicePicker(config.deviceId);
+const flagged = Object.values(capturePicker.groups)
+    .flat()
+    .find((item) => item.deviceId === config.deviceId);
+report.assert(flagged?.foreignCapture === true, "the picker flags the device as in use elsewhere", String(flagged?.foreignCapture));
+
+for (const pid of during) {
+    await adb(["shell", "kill", "-INT", pid]).catch(() => {});
+}
+await adb(["shell", "rm", "-f", "/sdcard/verify-foreign.mp4"]).catch(() => {});
+
 await manager.dispose();
+const strandedHolders = (await readdir(path.join(root, "queue", "holders")).catch(() => [])).length;
+report.assert(strandedHolders === 0, "a session that exits leaves no device held", `${strandedHolders} left`);
+
 report.finish();

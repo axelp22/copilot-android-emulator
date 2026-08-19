@@ -298,7 +298,10 @@ const canvas = createCanvas({
         },
         {
             name: "acquire_control",
-            description: "Acquire an exclusive, time-limited lease so the agent can drive the device safely.",
+            description:
+                "Acquire an exclusive, time-limited lease so the agent can drive the device safely. " +
+                'Devices are shared with other Copilot sessions: pass waitSeconds to queue for a busy one, ' +
+                'or deviceId "any" to take whichever booted device frees up first.',
             inputSchema: actionSchemas.acquireControl,
             handler: async (ctx) =>
                 withCanvasError(() =>
@@ -307,8 +310,17 @@ const canvas = createCanvas({
                         reason: ensureString(ctx.input.reason, "Agent sequence"),
                         ownerInstanceId: ctx.instanceId,
                         ttlSeconds: ctx.input.ttlSeconds,
+                        waitSeconds: ctx.input.waitSeconds,
                     }),
                 ),
+        },
+        {
+            name: "queue_status",
+            description:
+                "Show which Copilot session is using each device and who is waiting behind it. " +
+                "Use this before taking a device, or to explain why a request is queued.",
+            inputSchema: actionSchemas.queueStatus,
+            handler: async () => withCanvasError(() => manager.queueStatus()),
         },
         {
             name: "renew_control",

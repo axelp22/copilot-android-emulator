@@ -242,6 +242,11 @@ select {
     color: light-dark(#a1242a, #ff9a9c);
 }
 
+.device-row-badge[data-kind="waiting"] {
+    background: color-mix(in oklch, #6e7681 24%, transparent);
+    color: light-dark(#4a5058, #c9d1d9);
+}
+
 .device-row-badge[data-kind="current"] {
     background: color-mix(in oklch, var(--device-accent) 18%, transparent);
     color: var(--device-accent);

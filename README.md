@@ -117,7 +117,8 @@ never boots or shuts them down.
 | `diagnose_adb` | Validate the Android SDK, `adb` server, and emulator tooling. |
 | `list_devices` | List AVDs, running emulators, and connected devices. |
 | `get_device_state` | Get state, lease, and metadata for a device. |
-| `acquire_control` | Acquire an exclusive, time-limited control lease. |
+| `acquire_control` | Acquire an exclusive, time-limited control lease. Pass `waitSeconds` to queue for a busy device, or `deviceId: "any"` to take the first free one. |
+| `queue_status` | Show which session is using each device and who is waiting behind it. |
 | `renew_control` | Renew an active control lease. |
 | `release_control` | Release an active control lease. |
 | `capture_screen` | Capture a PNG screenshot as a session artifact without acquiring control. |
@@ -150,6 +151,8 @@ glance whether one is free before switching to it:
 | *Open* | Open in another canvas in this session |
 | *Agent control* | An agent in this session holds a control lease |
 | *In use · &lt;session&gt;* | **Another Copilot session** is driving it |
+| *Waiting · #N* | You are queued for it, at position N |
+| *In use elsewhere* | Something outside Copilot is capturing it |
 
 Control leases live in memory, so on their own they only coordinate the canvases and
 agents inside a single session — and each session runs its own extension process. Two
@@ -163,6 +166,46 @@ names that session in the error. Claims carry a heartbeat and the owning process
 so a session that crashes or is killed never leaves a device looking permanently
 taken: the next session to look discards the stale claim.
 
+Claims are cooperative, so they only reveal sessions running this extension. Capture
+started by anything else — Android Studio, `scrcpy`, a bare `adb screenrecord` — is
+detected separately by comparing the device's `screenrecord` processes against the
+ones this extension started, and shown as *In use elsewhere*.
+
+## Taking turns on a shared device
+
+Refusing a busy device is safe but unhelpful when several sessions genuinely need the
+same emulator. Sessions can instead queue for it, first come first served:
+
+```
+acquire_control { deviceId: "emulator-5554", waitSeconds: 300 }
+```
+
+The call waits until the device is free and then returns as usual, reporting how long
+it waited. Without `waitSeconds` the behaviour is unchanged: a busy device fails
+immediately, naming the session using it and how many are waiting.
+
+Pass `deviceId: "any"` to take whichever booted device becomes free first, which is
+what you want when a pool of emulators is interchangeable. The request queues for
+every candidate at once and keeps the first grant.
+
+`queue_status` shows, for each device, the session holding it and the sessions waiting
+behind it. The device picker shows the same thing: the holder's name on the device,
+and *Waiting · #N* on a device you are queued for.
+
+The queue lives in files under `~/.copilot/android-emulator/queue/`, so it works
+across sessions and across separate extension processes:
+
+- A device is held by creating `holders/<device>.json` **exclusively** — two sessions
+  racing for a free device cannot both win, because the second create fails.
+- Waiting sessions write a ticket stamped with the time they asked. A device is only
+  granted to the oldest waiting ticket, so a session that arrives later cannot jump
+  the queue.
+- Holders and tickets carry a heartbeat and process id. A session that crashes while
+  holding a device is reclaimed rather than blocking everyone behind it.
+
+The queue is cooperative in the same way claims are: it coordinates sessions running
+this extension, not other tools on the machine.
+
 ## Implementation notes
 
 See [`docs/SPEC.md`](docs/SPEC.md) for the architecture, the `adb` capability mapping,
@@ -172,13 +215,16 @@ and the H.264 streaming design (including the `screenrecord` 180-second restart 
 
 The suites in [`scripts/verify/`](scripts/verify/) run against real hardware — there is
 no mocking. They cover the device layer, the canvas server and its security posture,
-stream decodability, emulator cold boot, and the rendered canvas in a real browser.
+stream decodability, emulator cold boot, cross-session sharing and queueing, and the
+rendered canvas in a real browser.
 
 ```sh
 node scripts/verify/device-layer.mjs
 node scripts/verify/canvas-server.mjs
 node scripts/verify/stream-decode.mjs
 node scripts/verify/boot-lifecycle.mjs
+node scripts/verify/cross-session-claims.mjs
+node scripts/verify/device-queue.mjs
 node scripts/verify/rendered-canvas.mjs "<canvas url>"
 ```
 

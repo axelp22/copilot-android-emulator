@@ -41,18 +41,24 @@ function processAlive(pid) {
 export class DeviceClaimStore {
     constructor({ root = defaultClaimsRoot(), owner = {} } = {}) {
         this.root = root;
+        // Built field by field: spreading the caller's object last would let an
+        // explicit `pid: undefined` erase the real one, making this session's own
+        // claims look like they came from a dead process.
         this.owner = {
             sessionId: owner.sessionId ?? `pid-${process.pid}`,
             workingDirectory: owner.workingDirectory ?? process.cwd(),
-            pid: process.pid,
-            ...owner,
+            pid: Number.isInteger(owner.pid) ? owner.pid : process.pid,
         };
         this.claims = new Map();
         this.heartbeat = null;
     }
 
-    setOwner(owner) {
-        this.owner = { ...this.owner, ...owner };
+    setOwner(owner = {}) {
+        this.owner = {
+            sessionId: owner.sessionId ?? this.owner.sessionId,
+            workingDirectory: owner.workingDirectory ?? this.owner.workingDirectory,
+            pid: Number.isInteger(owner.pid) ? owner.pid : this.owner.pid,
+        };
     }
 
     label() {
