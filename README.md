@@ -123,6 +123,30 @@ never boots or shuts them down.
 Tools that control a device require a lease acquired with `acquire_control`;
 `capture_screen` does not.
 
+## Knowing whether a device is free
+
+The device picker labels every device with how it is being used, so you can tell at a
+glance whether one is free before switching to it:
+
+| Label | Meaning |
+| --- | --- |
+| *This canvas* | The device this canvas is showing |
+| *Open* | Open in another canvas in this session |
+| *Agent control* | An agent in this session holds a control lease |
+| *In use · &lt;session&gt;* | **Another Copilot session** is driving it |
+
+Control leases live in memory, so on their own they only coordinate the canvases and
+agents inside a single session — and each session runs its own extension process. Two
+sessions could otherwise drive one emulator at the same time, interleaving taps and
+corrupting both runs.
+
+Sessions therefore publish a small claim file under
+`~/.copilot/android-emulator/claims/` naming the session, its working directory and
+what it is doing. `acquire_control` refuses a device another session is driving, and
+names that session in the error. Claims carry a heartbeat and the owning process id,
+so a session that crashes or is killed never leaves a device looking permanently
+taken: the next session to look discards the stale claim.
+
 ## Implementation notes
 
 See [`docs/SPEC.md`](docs/SPEC.md) for the architecture, the `adb` capability mapping,
@@ -162,6 +186,7 @@ hardware, so treat it as unproven rather than working:
   not been verified.
 - **Teardown on `session.shutdown`.** Stream children, leases and servers are closed
   on shutdown, but the handler has not been observed firing.
+
 
 What *is* verified against a real emulator and a connected device is listed above
 under [Verifying](#verifying); the suites in `scripts/verify/` are the source of

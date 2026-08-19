@@ -29,6 +29,7 @@ node scripts/verify/canvas-server.mjs          # HTTP/SSE/security/lease gating
 node scripts/verify/stream-decode.mjs          # aspect ratio + ffprobe decodability
 node scripts/verify/stream-lifecycle.mjs       # repeated start/stop leaves no orphaned recorders
 node scripts/verify/recording-coexistence.mjs  # recording does not disturb the live stream
+node scripts/verify/cross-session-claims.mjs   # cross-session device claims (no device needed)
 node scripts/verify/boot-lifecycle.mjs         # cold boot and shutdown of an AVD (slow)
 ```
 

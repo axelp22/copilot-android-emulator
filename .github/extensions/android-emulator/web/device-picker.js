@@ -1,5 +1,40 @@
 import { renderIcon } from "./icons.js";
 
+/** Describes how a device is currently being used, if at all. */
+function usageBadge(device) {
+    // Another Copilot session takes priority: it is the case you cannot see from here.
+    if (device.foreignUse) {
+        const other = device.foreignUse;
+        const controlling = other.mode === "control";
+        return {
+            kind: "foreign",
+            label: controlling ? `In use · ${other.sessionLabel}` : `Open · ${other.sessionLabel}`,
+            title: controlling
+                ? `Another Copilot session (${other.sessionLabel}) is driving this device${other.reason ? `: ${other.reason}` : ""}`
+                : `Another Copilot session (${other.sessionLabel}) has this device open`,
+        };
+    }
+    if (device.leaseActive) {
+        return {
+            kind: "agent",
+            label: "Agent control",
+            title: device.leaseReason ? `An agent is driving this device: ${device.leaseReason}` : "An agent is driving this device",
+        };
+    }
+    if (device.isCurrent) {
+        return { kind: "current", label: "This canvas", title: "Shown in this canvas" };
+    }
+    if (device.isOpen) {
+        const count = device.openCount ?? 1;
+        return {
+            kind: "open",
+            label: count > 1 ? `Open ×${count}` : "Open",
+            title: "Already open in another canvas",
+        };
+    }
+    return null;
+}
+
 export function createDevicePicker({
     elements,
     fetchJson,
@@ -74,6 +109,17 @@ export function createDevicePicker({
         const name = document.createElement("span");
         name.textContent = device.name ?? device.deviceId;
         nameLine.append(kindIcon, name);
+
+        // Say when a device is already in use, so switching to it is an informed choice.
+        const badge = usageBadge(device);
+        if (badge) {
+            const tag = document.createElement("span");
+            tag.className = "device-row-badge";
+            tag.dataset.kind = badge.kind;
+            tag.textContent = badge.label;
+            tag.title = badge.title;
+            nameLine.append(tag);
+        }
         const meta = document.createElement("div");
         meta.className = "device-row-meta";
         meta.textContent = [device.versionLabel, device.kind === "device" ? device.serial : device.deviceId]

@@ -22,6 +22,7 @@ import {
     humanizeAvdName,
     orientationFromRotation,
 } from "./device-model.mjs";
+import { DeviceClaimStore } from "./device-claims.mjs";
 import { DeviceRegistry } from "./device-registry.mjs";
 import { InputDispatcher } from "./input-dispatcher.mjs";
 import { ScreenService } from "./screen-service.mjs";
@@ -58,6 +59,10 @@ export class DeviceSessionManager {
         this.deviceMetaCache = new Map();
         this.discoveryInFlight = null;
         this.bootOperations = new Map();
+        // Shared with other Copilot sessions so they can see, and avoid, a device
+        // this session is already driving.
+        this.claims = new DeviceClaimStore({});
+        this.foreignClaimCache = new Map();
         this.discoveryCompletedAt = 0;
         this.lastDiscovery = null;
         this.avdListCache = null;
@@ -86,6 +91,20 @@ export class DeviceSessionManager {
         this.artifactsRoot = artifactsRoot;
     }
 
+    /** Identifies this session in claims other sessions can read. */
+    setSessionIdentity(identity) {
+        this.claims.setOwner(identity);
+    }
+
+    async refreshForeignClaims() {
+        this.foreignClaimCache = await this.claims.foreignClaims().catch(() => new Map());
+        return this.foreignClaimCache;
+    }
+
+    foreignClaimFor(deviceId) {
+        return this.foreignClaimCache.get(deviceId) ?? null;
+    }
+
     setDiagnosticSink(onDiagnostic) {
         this.onDiagnostic = onDiagnostic;
         this.screen.onDiagnostic = onDiagnostic;
@@ -105,10 +124,15 @@ export class DeviceSessionManager {
 
     attachInstance(deviceId, instanceId) {
         this.state.attachInstance(deviceId, instanceId);
+        void this.claims.claim(deviceId, { mode: "open" }).catch(() => {});
     }
 
     detachInstance(deviceId, instanceId) {
         this.state.detachInstance(deviceId, instanceId);
+        const device = this.state.devices.get(deviceId);
+        if (!device || device.instanceIds.size === 0) {
+            void this.claims.release(deviceId).catch(() => {});
+        }
     }
 
     registerManualInputStop(deviceId, handler) {
@@ -253,7 +277,6 @@ export class DeviceSessionManager {
             return await this.discoveryInFlight;
         } finally {
             this.discoveryInFlight = null;
-        this.bootOperations = new Map();
         }
     }
 
@@ -280,8 +303,19 @@ export class DeviceSessionManager {
     }
 
     async listDevicePicker(currentDeviceId) {
-        await this.refreshDevices();
-        return this.state.listDevicePicker(currentDeviceId);
+        const [picker] = await Promise.all([
+            this.refreshDevices().then(() => this.state.listDevicePicker(currentDeviceId)),
+            this.refreshForeignClaims(),
+        ]);
+        for (const group of Object.values(picker.groups)) {
+            for (const item of group) {
+                const claim = this.foreignClaimFor(item.deviceId);
+                item.foreignUse = claim
+                    ? { sessionLabel: claim.sessionLabel, mode: claim.mode, reason: claim.reason }
+                    : null;
+            }
+        }
+        return picker;
     }
 
     /** Accepts an AVD name or a serial and returns the canonical device id. */
@@ -549,13 +583,46 @@ export class DeviceSessionManager {
 
     async acquireLease(input) {
         await this.refreshDevices();
+        await this.assertNotClaimedElsewhere(input.deviceId);
         this.state.reserveLease(input);
         try {
             await this.stopManualInput(input.deviceId);
-            return this.state.acquireLease(input);
+            const snapshot = this.state.acquireLease(input);
+            await this.claims
+                .claim(input.deviceId, { mode: "control", reason: input.reason ?? null })
+                .catch(() => {});
+            return snapshot;
         } catch (error) {
             this.state.cancelLeaseReservation(input.deviceId, input.ownerInstanceId);
             throw error;
+        }
+    }
+
+    /** Drops the shared claim back to "open" once the agent is done. */
+    async downgradeClaim(deviceId) {
+        const device = this.state.devices.get(deviceId);
+        if (device && device.instanceIds.size > 0) {
+            await this.claims.claim(deviceId, { mode: "open" }).catch(() => {});
+        } else {
+            await this.claims.release(deviceId).catch(() => {});
+        }
+    }
+
+    /**
+     * Refuses control when another Copilot session is already driving the device.
+     * Two agents on one device interleave taps and corrupt each other's runs.
+     */
+    async assertNotClaimedElsewhere(deviceId) {
+        await this.refreshForeignClaims();
+        const claim = this.foreignClaimFor(deviceId);
+        if (claim?.mode === "control") {
+            throw new AppError(
+                "device_claimed_elsewhere",
+                `Another Copilot session (${claim.sessionLabel}) is driving this device` +
+                    `${claim.reason ? `: ${claim.reason}` : ""}. Wait for it to finish, or pick another device.`,
+                409,
+                { sessionLabel: claim.sessionLabel, workingDirectory: claim.workingDirectory },
+            );
         }
     }
 
@@ -564,7 +631,9 @@ export class DeviceSessionManager {
     }
 
     async releaseLease(input) {
-        return this.state.releaseLease(input);
+        const snapshot = this.state.releaseLease(input);
+        await this.downgradeClaim(input.deviceId);
+        return snapshot;
     }
 
     async revokeLease(deviceId) {
@@ -572,6 +641,7 @@ export class DeviceSessionManager {
         // in flight before handing the device back to the user.
         const snapshot = this.state.revokeLease(deviceId);
         await this.state.settleActiveOperations(deviceId);
+        await this.downgradeClaim(deviceId);
         return snapshot;
     }
 
@@ -784,5 +854,7 @@ export class DeviceSessionManager {
     async dispose() {
         await this.video.stopAll().catch(() => {});
         this.input.clearTouchSessions();
+        // Never leave a device looking taken by a session that has exited.
+        await this.claims.releaseAll().catch(() => {});
     }
 }

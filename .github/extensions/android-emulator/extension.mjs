@@ -346,6 +346,11 @@ const canvas = createCanvas({
     ],
     open: async (ctx) =>
         withCanvasError(async () => {
+            // Identifies this session to other sessions sharing the same devices.
+            manager.setSessionIdentity({
+                sessionId: ctx.sessionId,
+                workingDirectory: ctx.session?.workingDirectory ?? process.cwd(),
+            });
             const existing = instances.get(ctx.instanceId);
             const savedDeviceId = existing ? undefined : await canvasBindings?.get(ctx.instanceId);
             const preferred = savedDeviceId !== undefined ? savedDeviceId : (ctx.input?.deviceId ?? null);

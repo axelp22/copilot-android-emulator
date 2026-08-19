@@ -242,6 +242,11 @@ export class DeviceRegistry {
                 deviceFamily: device.deviceFamily,
                 isCurrent: device.id === currentDeviceId,
                 isOpen: device.instanceIds.size > 0,
+                // How many canvases hold it, and whether an agent is driving it, so
+                // the picker can say a device is in use before you switch to it.
+                openCount: device.instanceIds.size,
+                leaseActive: Boolean(device.lease),
+                leaseReason: device.lease?.reason ?? null,
             };
             if (!item.isAvailable) {
                 groups.unavailable.push(item);

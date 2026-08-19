@@ -220,7 +220,38 @@ select {
     stroke-linejoin: round;
 }
 
-.device-row-name > span:last-child,
+.device-row-badge {
+    flex: 0 0 auto;
+    border-radius: 999px;
+    padding: 1px 7px;
+    font-size: 11px;
+    font-weight: var(--font-weight-semibold, 600);
+    line-height: 16px;
+    white-space: nowrap;
+    background: color-mix(in oklch, var(--device-host-foreground) 10%, transparent);
+    color: var(--text-color-muted, #8b949e);
+}
+
+.device-row-badge[data-kind="agent"] {
+    background: color-mix(in oklch, #bf8700 22%, transparent);
+    color: light-dark(#7a5800, #e3b341);
+}
+
+.device-row-badge[data-kind="foreign"] {
+    background: color-mix(in oklch, #ff8182 22%, transparent);
+    color: light-dark(#a1242a, #ff9a9c);
+}
+
+.device-row-badge[data-kind="current"] {
+    background: color-mix(in oklch, var(--device-accent) 18%, transparent);
+    color: var(--device-accent);
+}
+
+.device-row-name > span.device-row-badge {
+    overflow: visible;
+}
+
+.device-row-name > span:nth-child(2),
 .device-row-meta {
     overflow: hidden;
     text-overflow: ellipsis;
