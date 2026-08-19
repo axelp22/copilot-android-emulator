@@ -1,0 +1,21 @@
+{
+  "name": "android-emulator",
+  "description": "View and interact with local Android emulators and devices in a GitHub Copilot canvas.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Axel Palomino",
+    "url": "https://github.com/axelp-microsoft"
+  },
+  "repository": "https://github.com/axelp-microsoft/copilot-android-emulator",
+  "license": "MIT",
+  "keywords": [
+    "android",
+    "emulator",
+    "adb",
+    "copilot-canvas",
+    "canvas",
+    "device-control"
+  ],
+  "logo": "docs/images/android-emulator-canvas.png",
+  "extensions": "extensions"
+}
