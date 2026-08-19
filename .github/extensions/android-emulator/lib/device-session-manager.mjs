@@ -25,6 +25,7 @@ import {
 } from "./device-model.mjs";
 import { DeviceClaimStore } from "./device-claims.mjs";
 import { DeviceQueue } from "./device-queue.mjs";
+import { AppBuildService } from "./app-build-service.mjs";
 import { DeviceRegistry } from "./device-registry.mjs";
 import { InputDispatcher } from "./input-dispatcher.mjs";
 import { ScreenService } from "./screen-service.mjs";
@@ -68,6 +69,10 @@ export class DeviceSessionManager {
         this.claims = new DeviceClaimStore({});
         // Exclusion and turn-taking across sessions; the claim store only reports.
         this.queue = new DeviceQueue({});
+        this.build = new AppBuildService({ manager: this, onDiagnostic: this.onDiagnostic });
+        this.buildPlan = null;
+        // Whether another session holds a device, cached so snapshots stay synchronous.
+        this.sharingCache = new Map();
         this.foreignClaimCache = new Map();
         this.foreignCaptureCache = new Map();
         this.foreignCaptureCheckedAt = 0;
@@ -102,6 +107,8 @@ export class DeviceSessionManager {
     /** Identifies this session in the records other sessions read. */
     setSessionIdentity(identity) {
         this.claims.setOwner(identity);
+        this.build.setWorkingDirectory(identity.workingDirectory);
+        void this.refreshBuildPlan();
         this.queue.setOwner({
             sessionId: identity.sessionId,
             sessionLabel: identity.workingDirectory ? identity.workingDirectory.split("/").pop() : undefined,
@@ -160,11 +167,102 @@ export class DeviceSessionManager {
     }
 
     snapshot(deviceId) {
-        return this.state.snapshot(deviceId);
+        return this.decorate(this.state.snapshot(deviceId), deviceId);
     }
 
     getCachedDeviceState(deviceId) {
-        return this.state.snapshot(deviceId);
+        return this.decorate(this.state.snapshot(deviceId), deviceId);
+    }
+
+    /** Adds the things the canvas needs but the registry knows nothing about. */
+    decorate(snapshot, deviceId) {
+        return {
+            ...snapshot,
+            build: this.buildPlan,
+            install: this.build.statusFor(deviceId),
+            sharing: this.sharingCache.get(deviceId) ?? null,
+        };
+    }
+
+    notifyDevice(deviceId) {
+        this.state.notify(deviceId);
+    }
+
+    async refreshBuildPlan() {
+        this.buildPlan = await this.build.describe().catch(() => null);
+        return this.buildPlan;
+    }
+
+    /**
+     * Refreshes whether another session holds this device. Kept out of snapshot()
+     * so reading state stays synchronous, and only notifies on a real change to
+     * avoid waking every canvas on a timer.
+     */
+    async refreshSharing(deviceId) {
+        if (!deviceId) {
+            return null;
+        }
+        const [status] = await this.queue.status([deviceId]).catch(() => []);
+        const sharing = status?.holder && !status.holder.isMine
+            ? {
+                  heldByOtherSession: true,
+                  holderLabel: status.holder.sessionLabel,
+                  holderReason: status.holder.reason ?? null,
+                  waiting: status.waiting.length,
+              }
+            : { heldByOtherSession: false, holderLabel: null, holderReason: null, waiting: status?.waiting.length ?? 0 };
+
+        const previous = this.sharingCache.get(deviceId);
+        if (JSON.stringify(previous) !== JSON.stringify(sharing)) {
+            this.sharingCache.set(deviceId, sharing);
+            if (this.state.devices.has(deviceId)) {
+                this.state.notify(deviceId);
+            }
+        }
+        return sharing;
+    }
+
+    /**
+     * Runs `fn` with this session holding the device, so a build cannot install
+     * over another session's run. An existing hold from this session is left
+     * alone: releasing it here would strip a lease the agent still depends on.
+     */
+    async withDeviceHold(deviceId, reason, fn) {
+        const [status] = await this.queue.status([deviceId]).catch(() => []);
+        let acquired = false;
+        if (status?.holder?.isMine !== true) {
+            const granted = await this.queue.acquire(deviceId, { reason, timeoutMs: 0 });
+            if (!granted) {
+                const [current] = await this.queue.status([deviceId]);
+                throw new AppError(
+                    "device_busy",
+                    current?.holder
+                        ? `${current.holder.sessionLabel} is using this device` +
+                          `${current.holder.reason ? ` (${current.holder.reason})` : ""}.`
+                        : "The device is in use by another session.",
+                    409,
+                );
+            }
+            acquired = true;
+        }
+        try {
+            return await fn();
+        } finally {
+            if (acquired) {
+                await this.queue.release(deviceId).catch(() => {});
+            }
+        }
+    }
+
+    /** Builds the app in this session's working directory, installs it, launches it. */
+    async buildInstallLaunch({ deviceId, task, launch = true } = {}) {
+        const device = this.state.getDeviceOrThrow(deviceId);
+        if (device.state !== DEVICE_STATES.booted) {
+            throw new AppError("device_not_booted", `${device.name} is not booted.`, 409);
+        }
+        return this.withDeviceHold(deviceId, "Building and installing the app", () =>
+            this.build.buildInstallLaunch({ deviceId, task, launch }),
+        );
     }
 
     attachInstance(deviceId, instanceId) {

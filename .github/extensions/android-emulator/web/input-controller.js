@@ -110,10 +110,21 @@ export function createInputController({
             y: point.y,
             coordinateSpace: "normalized",
         });
+        // Phases must arrive in the order they happened. Posting them concurrently
+        // lets "up" overtake "move", which the device sees as a tap instead of a
+        // drag -- or as nothing at all. This bites exactly when the socket has not
+        // finished connecting yet, i.e. the first gesture after the canvas opens.
+        let ordered = Promise.resolve();
+        const post = (phase, point) => {
+            ordered = ordered
+                .then(() => postTouchPhase(phase, point))
+                .catch((error) => setNotice(error.message, true));
+            return ordered;
+        };
         const fallback = (events) => {
             failed = true;
             for (const event of events) {
-                void postTouchPhase(event.phase, event).catch((error) => setNotice(error.message, true));
+                void post(event.phase, event);
             }
         };
         socket.addEventListener("open", () => {
@@ -142,7 +153,7 @@ export function createInputController({
                 }
                 const event = eventPayload(phase, point);
                 if (failed) {
-                    void postTouchPhase(phase, point).catch((error) => setNotice(error.message, true));
+                    void post(phase, point);
                 } else if (opened && socket.readyState === WebSocket.OPEN) {
                     socket.send(JSON.stringify(event));
                 } else {

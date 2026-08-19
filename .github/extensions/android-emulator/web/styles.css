@@ -860,3 +860,48 @@ button:hover:not(:disabled) {
         animation: none;
     }
 }
+
+.header-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px 4px 8px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: var(--font-weight-semibold, 600);
+    color: var(--device-host-foreground);
+    background: color-mix(in oklch, var(--device-host-foreground) 8%, transparent);
+}
+
+.header-action:disabled {
+    opacity: 0.45;
+}
+
+.header-action-icon {
+    display: inline-grid;
+    place-items: center;
+    width: 15px;
+    height: 15px;
+}
+
+.header-action-icon svg {
+    width: 15px;
+    height: 15px;
+}
+
+/* A build takes minutes, so the button has to look like it is still working. */
+.header-action[data-busy="true"],
+.icon-button[data-busy="true"] {
+    color: var(--device-accent);
+    animation: install-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes install-pulse {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.45;
+    }
+}

@@ -30,6 +30,7 @@ const elements = {
     overlayOperation: document.getElementById("overlay-operation"),
     overlayExpiry: document.getElementById("overlay-expiry"),
     takeBack: document.getElementById("take-back"),
+    install: document.getElementById("install-button"),
 };
 
 const toolbarButtons = {
@@ -229,6 +230,7 @@ function render() {
             button.title = manageable ? "Stop emulator" : "Physical devices are never shut down by this extension";
         }
     }
+    renderInstallButton(state, booted, disabled);
 
     const copy = poweredOffCopy();
     elements.poweredOffTitle.textContent = copy.title;
@@ -497,7 +499,68 @@ function reconnectStream() {
     ensureStream();
 }
 
+/**
+ * The Install button is deliberately fussy about when it is available: building
+ * onto a device another session is driving would install over their run.
+ */
+function renderInstallButton(deviceState, booted, controlBlocked) {
+    const button = elements.install;
+    if (!button) {
+        return;
+    }
+    const plan = deviceState.build ?? null;
+    const install = deviceState.install ?? null;
+    const sharing = deviceState.sharing ?? null;
+    const running = install?.state === "running";
+
+    let reason = null;
+    if (controlBlocked) {
+        reason = "An agent is driving this device.";
+    } else if (!plan?.available) {
+        reason = plan?.reason ?? "No Gradle project was found in this session's working directory.";
+    } else if (!booted) {
+        reason = "The device is not booted.";
+    } else if (sharing?.heldByOtherSession) {
+        reason =
+            `${sharing.holderLabel} is using this device` +
+            `${sharing.holderReason ? ` (${sharing.holderReason})` : ""}. Wait for it to finish.`;
+    }
+
+    button.disabled = Boolean(reason) || running;
+    button.dataset.busy = String(running);
+    button.setAttribute("aria-busy", String(running));
+
+    if (running) {
+        button.title = install.message ?? "Building…";
+    } else if (reason) {
+        button.title = reason;
+    } else {
+        button.title = `Build, install and launch (./gradlew ${plan.task})`;
+    }
+
+    // Report the outcome once, rather than on every state push that follows it.
+    const stamp = install ? `${install.state}:${install.finishedAt ?? install.startedAt}` : "";
+    if (install && stamp !== lastInstallStamp) {
+        lastInstallStamp = stamp;
+        if (install.state === "running") {
+            setNotice(install.message ?? "Building…");
+        } else if (install.state === "succeeded") {
+            setNotice(install.message ?? "Installed");
+        } else if (install.state === "failed") {
+            setNotice(install.message ?? "The build failed.", true);
+        }
+    }
+}
+
+let lastInstallStamp = "";
+
 function bindToolbar() {
+    elements.install?.addEventListener("click", (event) => {
+        event.preventDefault();
+        setNotice("Starting the build…");
+        void fetchJson("api/install", {}).catch((error) => setNotice(error.message, true));
+    });
+
     for (const [action, button] of Object.entries(buttonActions)) {
         const element = document.querySelector(`[data-action="${action}"]`);
         element?.addEventListener("click", (event) => {

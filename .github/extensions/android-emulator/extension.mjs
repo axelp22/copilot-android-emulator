@@ -315,6 +315,21 @@ const canvas = createCanvas({
                 ),
         },
         {
+            name: "build_install_launch",
+            description:
+                "Build the app in this session's working directory with Gradle, install it on the device, and launch it. " +
+                "Refuses while another Copilot session is using the device.",
+            inputSchema: actionSchemas.buildInstallLaunch,
+            handler: async (ctx) =>
+                withCanvasError(() =>
+                    manager.buildInstallLaunch({
+                        deviceId: ctx.input.deviceId,
+                        task: ctx.input.task,
+                        launch: ctx.input.launch !== false,
+                    }),
+                ),
+        },
+        {
             name: "queue_status",
             description:
                 "Show which Copilot session is using each device and who is waiting behind it. " +

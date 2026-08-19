@@ -119,6 +119,7 @@ never boots or shuts them down.
 | `get_device_state` | Get state, lease, and metadata for a device. |
 | `acquire_control` | Acquire an exclusive, time-limited control lease. Pass `waitSeconds` to queue for a busy device, or `deviceId: "any"` to take the first free one. |
 | `queue_status` | Show which session is using each device and who is waiting behind it. |
+| `build_install_launch` | Build the app in this session's working directory with Gradle, install it, and launch it. |
 | `renew_control` | Renew an active control lease. |
 | `release_control` | Release an active control lease. |
 | `capture_screen` | Capture a PNG screenshot as a session artifact without acquiring control. |
@@ -170,6 +171,37 @@ Claims are cooperative, so they only reveal sessions running this extension. Cap
 started by anything else — Android Studio, `scrcpy`, a bare `adb screenrecord` — is
 detected separately by comparing the device's `screenrecord` processes against the
 ones this extension started, and shown as *In use elsewhere*.
+
+## Installing your app
+
+The header has an **Install** button, next to the device picker and the stream
+controls. It builds the app in this session's working directory with Gradle,
+installs it on the selected device, and launches it — the loop you would otherwise
+run by hand every time you want to see a change on screen.
+
+It runs `./gradlew installDebug`, with `ANDROID_SERIAL` set to the selected device
+so the app lands on the device you are looking at rather than whichever one `adb`
+picks. The application id is read from the `output-metadata.json` that AGP writes
+beside the APK, which is how the app is launched afterwards. Gradle's output is
+streamed to the canvas, and the button stays busy until the build finishes.
+
+Override the defaults with a config file at the root of the working directory,
+named `.android-emulator.json`, `android-emulator.json` or
+`.github/android-emulator.json`:
+
+```json
+{
+  "gradleTask": ":app:installDebug",
+  "packageName": "com.example.app",
+  "activity": ".MainActivity"
+}
+```
+
+The button is disabled, with the reason on hover, when there is no Gradle wrapper
+in the working directory, when the device is not booted, when an agent holds a
+control lease, and — the case this shares with everything else here — when
+**another Copilot session is using the device**. Agents get the same thing as
+`build_install_launch`, and the same refusal.
 
 ## Taking turns on a shared device
 
@@ -225,6 +257,7 @@ node scripts/verify/stream-decode.mjs
 node scripts/verify/boot-lifecycle.mjs
 node scripts/verify/cross-session-claims.mjs
 node scripts/verify/device-queue.mjs
+node scripts/verify/app-install.mjs
 node scripts/verify/rendered-canvas.mjs "<canvas url>"
 ```
 

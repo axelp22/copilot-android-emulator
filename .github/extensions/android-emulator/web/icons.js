@@ -1,4 +1,9 @@
 const icons = {
+    install: [
+        ["path", { d: "M12 3v10" }],
+        ["path", { d: "m8 9 4 4 4-4" }],
+        ["path", { d: "M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" }],
+    ],
     shutdown: [
         ["path", { d: "M12 2v10" }],
         ["path", { d: "M18.4 6.6a9 9 0 1 1-12.8 0" }],

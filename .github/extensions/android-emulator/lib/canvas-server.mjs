@@ -127,6 +127,14 @@ export async function createCanvasServer({
 
     subscribeToDevice();
 
+    // Another session taking or freeing the device happens outside this process,
+    // so it can only be noticed by looking. Cheap: one small file read.
+    const sharingTimer = setInterval(() => {
+        void manager.refreshSharing(deviceId).catch(() => {});
+    }, 6_000);
+    sharingTimer.unref?.();
+    void manager.refreshSharing(deviceId).catch(() => {});
+
     async function cancelPointer() {
         if (!deviceId) {
             return;
@@ -410,6 +418,17 @@ export async function createCanvasServer({
                 return;
             }
 
+            if (route === "/api/install") {
+                // Deliberately not awaited: a Gradle build can take minutes, and the
+                // canvas follows its progress over SSE rather than a hanging request.
+                const target = requireDevice();
+                void manager
+                    .buildInstallLaunch({ deviceId: target, task: body?.task })
+                    .catch((error) => diagnostic(`install failed: ${error.message}`));
+                json(res, 202, { started: true });
+                return;
+            }
+
             if (route === "/api/toolbar/rotate") {
                 const result = await runManualOperation(() =>
                     manager.rotateDevice({ deviceId: target, direction: body?.direction }),
@@ -590,9 +609,18 @@ export async function createCanvasServer({
             deviceId = nextDeviceId;
             acceptingManualInput = true;
             subscribeToDevice();
+
+    // Another session taking or freeing the device happens outside this process,
+    // so it can only be noticed by looking. Cheap: one small file read.
+    const sharingTimer = setInterval(() => {
+        void manager.refreshSharing(deviceId).catch(() => {});
+    }, 6_000);
+    sharingTimer.unref?.();
+    void manager.refreshSharing(deviceId).catch(() => {});
             writeStateEvent();
         },
         async close() {
+            clearInterval(sharingTimer);
             unsub?.();
             unsub = null;
             unregisterManualInputStop?.();

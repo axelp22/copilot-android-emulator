@@ -132,6 +132,20 @@ export const actionSchemas = {
         required: ["deviceId"],
     },
     queueStatus: { type: "object", additionalProperties: false, properties: {} },
+    buildInstallLaunch: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+            deviceId: { type: "string", minLength: 1 },
+            task: {
+                type: "string",
+                minLength: 1,
+                description: 'Gradle task to run instead of the configured default, e.g. ":app:installDebug".',
+            },
+            launch: { type: "boolean", description: "Launch the app after installing it. Defaults to true." },
+        },
+        required: ["deviceId"],
+    },
     renewControl: {
         type: "object",
         additionalProperties: false,

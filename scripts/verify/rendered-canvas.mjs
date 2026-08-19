@@ -262,11 +262,12 @@ if (view.leaseActive) {
         expiry: document.getElementById("overlay-expiry").textContent,
         busy: document.getElementById("viewport").getAttribute("aria-busy"),
         disabled: [...document.querySelectorAll(".floating-toolbar .icon-button")].filter((b) => b.disabled).length,
+        total: document.querySelectorAll(".floating-toolbar .icon-button").length,
         pickerDisabled: document.getElementById("device-picker-button").disabled,
     }))()`);
     report.assert(/\d+s remaining/.test(overlay.expiry), "overlay shows the lease countdown", overlay.expiry);
     report.assert(overlay.busy === "true", "viewport marked aria-busy under lease");
-    report.assert(overlay.disabled === 8, "toolbar disabled under lease", `${overlay.disabled}/8`);
+    report.assert(overlay.disabled === overlay.total, "toolbar disabled under lease", `${overlay.disabled}/${overlay.total}`);
     report.assert(overlay.pickerDisabled === true, "device picker disabled under lease");
 
     const before = await screenHash();
@@ -279,6 +280,7 @@ if (view.leaseActive) {
     const released = await evaluate(`(() => ({
         hidden: document.getElementById("overlay").classList.contains("hidden"),
         disabled: [...document.querySelectorAll(".floating-toolbar .icon-button")].filter((b) => b.disabled).length,
+        total: document.querySelectorAll(".floating-toolbar .icon-button").length,
     }))()`);
     report.assert(released.hidden === true, "overlay hidden after taking back control");
     report.assert(released.disabled === 0, "toolbar re-enabled after taking back control");
@@ -286,21 +288,96 @@ if (view.leaseActive) {
     report.skip("lease overlay checks", "no agent lease is currently held");
 }
 
-// Manual pointer input through the rendered UI. Start from the launcher so the
-// gesture has a visible effect.
+// Manual pointer input through the rendered UI. Pulling the notification shade
+// down is used as the observable because it is binary and latched: the shade is
+// either focused or it is not. Earlier versions dragged a scrollable list and
+// compared pixels, which made a working gesture look broken whenever the list
+// bounced back or had nothing left to scroll.
+async function focusedWindow() {
+    return adb(["shell", "dumpsys window | grep mCurrentFocus"]).catch(() => "");
+}
+async function waitForFocus(matcher, timeoutMs = 15_000) {
+    const deadline = Date.now() + timeoutMs;
+    let focus = "";
+    while (Date.now() < deadline) {
+        const current = await focusedWindow();
+        // Focus reads as null mid-animation; that is "not settled yet", not an
+        // answer, so keep the last real value rather than reporting null.
+        if (current.includes("mCurrentFocus=null")) {
+            await sleep(500);
+            continue;
+        }
+        focus = current;
+        if (matcher(focus)) {
+            return focus;
+        }
+        await sleep(500);
+    }
+    return focus;
+}
+
+// Wait for the shade to actually be closed rather than assuming it is: a run that
+// ended with it open would otherwise fail the next run for no reason.
 await adb(["shell", "input", "keyevent", "3"]);
-await sleep(2500);
-const atHome = await screenHash();
+const shadeClosed = await waitForFocus((focus) => !focus.includes("NotificationShade"));
+report.assert(!shadeClosed.includes("NotificationShade"), "the notification shade starts closed", shadeClosed.trim().slice(0, 70));
+
 await evaluate("window.__pointerLog = []");
-await drag(dragX, dragFrom, dragTo);
-const afterDrag = await waitForScreenChange(atHome);
+// Few, long steps on purpose. A manual drag is approximated by chaining
+// `input swipe` segments, and only the first segment starts inside the status
+// bar, so it is the one that has to travel far enough to latch the shade open.
+await drag(dragX, Math.round(geometry.top + geometry.h * 0.03), Math.round(geometry.top + geometry.h * 0.85), 3);
+const shadeOpen = await waitForFocus((focus) => focus.includes("NotificationShade"));
 const pointerLog = await evaluate("window.__pointerLog.join(',')");
 report.assert(pointerLog.includes("pointerdown") && pointerLog.includes("pointerup"), "canvas received real pointer events");
-report.assert(atHome !== afterDrag, "manual drag changed the device screen", `${atHome} -> ${afterDrag}`);
+report.assert(
+    shadeOpen.includes("NotificationShade"),
+    "manual drag reached the device and pulled the shade down",
+    shadeOpen.trim().slice(0, 70),
+);
 
+// Assert against what the device says is focused rather than against pixels: a
+// hash comparison here races the redraw and reports a working button as broken.
 await clickElement('[data-action="home"]');
-const afterHome = await waitForScreenChange(afterDrag);
-report.assert(afterDrag !== afterHome, "toolbar Home button changed the device screen", `${afterDrag} -> ${afterHome}`);
+const afterHome = await waitForFocus((focus) => focus.length > 0 && !focus.includes("NotificationShade"));
+report.assert(
+    afterHome.length > 0 && !afterHome.includes("NotificationShade"),
+    "toolbar Home button dismissed the shade",
+    afterHome.trim().slice(0, 70),
+);
+
+// --- the Install button --------------------------------------------------------
+// It must be present, and it must refuse to run when there is nothing to build or
+// when another session is using the device -- that is the whole point of it.
+const install = await evaluate(`(() => {
+    // It lives in the header, beside the device picker and stream controls.
+    const button = document.querySelector('.toolbar .stream-actions [data-action="install"]');
+    if (!button) {
+        return { present: false };
+    }
+    return {
+        present: true,
+        rendered: button.querySelector("svg") !== null,
+        label: (button.textContent || "").trim(),
+        disabled: button.disabled,
+        title: button.title,
+    };
+})()`);
+report.assert(install.present === true, "the header has an Install button beside the stream controls");
+report.assert(install.rendered === true, "the Install button renders its icon");
+report.assert(install.label === "Install", "the Install button is labelled", install.label);
+report.assert(
+    typeof install.title === "string" && install.title.length > 0,
+    "the Install button explains itself on hover",
+    install.title,
+);
+// This repository is not a Gradle project, so the button must be off and say why.
+report.assert(install.disabled === true, "Install is disabled without a Gradle project", String(install.disabled));
+report.assert(
+    /gradle/i.test(install.title),
+    "the disabled Install button says a Gradle project is missing",
+    install.title,
+);
 
 const shot = await send("Page.captureScreenshot", { format: "png" });
 const shotPath = "/tmp/android-emulator-verify-canvas.png";
