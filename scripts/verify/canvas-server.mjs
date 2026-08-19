@@ -83,14 +83,18 @@ report.assert(streamResponse.ok, "stream endpoint opens", String(streamResponse.
 const reader = streamResponse.body.getReader();
 const push = createFrameReader();
 const tags = [];
-const deadline = Date.now() + 5000;
+const deadline = Date.now() + 8000;
+// A swipe may land on a screen that does not visibly change; alternating Home and
+// Recents forces a full-screen transition so the encoder always has work to do.
+let motionStep = 0;
 const motion = setInterval(() => {
-    void fetch(`${root}api/input/swipe`, {
+    motionStep += 1;
+    void fetch(`${root}api/toolbar/button`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ startX: 0.5, startY: 0.75, endX: 0.5, endY: 0.3, durationMs: 200 }),
+        body: JSON.stringify({ button: motionStep % 2 === 0 ? "home" : "recents" }),
     }).catch(() => {});
-}, 900);
+}, 800);
 while (Date.now() < deadline) {
     const { value, done } = await reader.read();
     if (done) break;

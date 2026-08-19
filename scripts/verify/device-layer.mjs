@@ -12,7 +12,20 @@ const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "d
 const { FRAME_TAGS } = await import(path.join(extensionRoot, "lib", "h264-stream.mjs"));
 
 const report = createReporter("DEVICE LAYER");
-const manager = new DeviceSessionManager({ onDiagnostic: (message) => report.note(message) });
+/**
+ * Restart events are timestamped as they happen, from the child's exit handler.
+ * Polling a counter instead would race: the replacement child's keyframe lands
+ * ~500ms after the exit, so a late observation folds it into the "before" baseline.
+ */
+const restartEvents = [];
+const manager = new DeviceSessionManager({
+    onDiagnostic: (message) => {
+        if (message.includes("screenrecord restart")) {
+            restartEvents.push(Date.now());
+        }
+        report.note(message);
+    },
+});
 manager.setArtifactsRoot(config.artifactsRoot);
 
 // --- toolchain ---------------------------------------------------------------
@@ -115,17 +128,20 @@ async function sampleStream({ seconds, timeLimitSeconds }) {
             observed.push({ tag: frame.tag, size: frame.payload.length, at: Date.now() });
         }
     });
-    // A still screen produces almost no frames, so keep the display busy.
+    // A still screen produces almost no frames. Alternating Home and Recents forces
+    // a full-screen transition, so the encoder always has something to send.
+    let step = 0;
     const motion = setInterval(() => {
-        void adb(["shell", "input", "swipe", String(expectedX), String(Math.round(state.screen.height * 0.75)), String(expectedX), String(Math.round(state.screen.height * 0.3)), "200"]).catch(() => {});
-    }, 900);
+        step += 1;
+        void adb(["shell", "input", "keyevent", step % 2 === 0 ? "3" : "187"]).catch(() => {});
+    }, 800);
     await sleep(seconds * 1000);
     clearInterval(motion);
     stream.kill();
     return { observed, restarts: stream.restartCountValue() };
 }
 
-const live = await sampleStream({ seconds: 4 });
+const live = await sampleStream({ seconds: 6 });
 const tags = live.observed.map((entry) => entry.tag);
 const configIndex = tags.indexOf(FRAME_TAGS.config);
 const keyIndex = tags.indexOf(FRAME_TAGS.keyframe);
@@ -140,47 +156,60 @@ report.assert(
 );
 
 // `screenrecord` hard-stops at 180s; force a short limit to prove the respawn is
-// seamless. Rather than counting restarts inside a fixed window — which is
-// sensitive to machine load — wait for a restart and then require that frames
-// keep arriving after the child that produced them has exited.
+// seamless. Every unit is timestamped and compared against the restart timestamp,
+// so nothing here depends on when a poll happens to observe the restart.
 const restartStream = await manager.createH264Stream({ deviceId, fps: 30, resolution: 50, timeLimitSeconds: 3 });
 const restartPush = createFrameReader();
-let framesSeen = 0;
-let keyframesSeen = 0;
-let lastFrameAt = 0;
+const observed = [];
 restartStream.stdout.on("data", (chunk) => {
     for (const frame of restartPush(chunk)) {
-        framesSeen += 1;
-        lastFrameAt = Date.now();
-        if (frame.tag === FRAME_TAGS.keyframe) {
-            keyframesSeen += 1;
-        }
+        observed.push({ tag: frame.tag, at: Date.now() });
     }
 });
+let restartStep = 0;
 const restartMotion = setInterval(() => {
-    void adb(["shell", "input", "swipe", String(expectedX), String(Math.round(state.screen.height * 0.75)), String(expectedX), String(Math.round(state.screen.height * 0.3)), "200"]).catch(() => {});
-}, 900);
+    restartStep += 1;
+    void adb(["shell", "input", "keyevent", restartStep % 2 === 0 ? "3" : "187"]).catch(() => {});
+}, 800);
 
-const restartDeadline = Date.now() + 30_000;
-while (restartStream.restartCountValue() < 1 && Date.now() < restartDeadline) {
-    await sleep(500);
-}
-const restartedAt = Date.now();
-const framesBeforeRestart = framesSeen;
-const keyframesBeforeRestart = keyframesSeen;
-report.assert(restartStream.restartCountValue() >= 1, "screenrecord child exited and was respawned", `${restartStream.restartCountValue()} restarts`);
+const after = (timestamp, tag) => observed.find((entry) => entry.at > timestamp && entry.tag === tag);
+const restartDeadline = Date.now() + 45_000;
 
-// Frames arriving now can only come from the replacement child.
-while (framesSeen <= framesBeforeRestart && Date.now() < restartedAt + 15_000) {
-    await sleep(500);
+// Wait until the first respawn generation is closed by a second restart. Evaluating
+// a completed window removes the race entirely: every unit that generation produced
+// has already been observed, so nothing depends on polling timing.
+while (restartEvents.length < 2 && Date.now() < restartDeadline) {
+    await sleep(250);
 }
 clearInterval(restartMotion);
-await sleep(1500);
 restartStream.kill();
 
-report.assert(framesSeen > framesBeforeRestart, "frames continue after the child exits", `${framesBeforeRestart} -> ${framesSeen}`);
-report.assert(keyframesSeen > keyframesBeforeRestart, "parameter sets re-emitted after the respawn", `${keyframesBeforeRestart} -> ${keyframesSeen} keyframes`);
-report.assert(lastFrameAt > restartedAt, "stream outlived the child process", `last frame ${lastFrameAt - restartedAt}ms after the restart`);
+const restartedAt = restartEvents[0] ?? 0;
+const generationEnd = restartEvents[1] ?? Date.now();
+const configAfter = restartedAt > 0 ? after(restartedAt, FRAME_TAGS.config) : null;
+const keyframeAfter = restartedAt > 0 ? after(restartedAt, FRAME_TAGS.keyframe) : null;
+const framesAfter = observed.filter((entry) => entry.at > restartedAt).length;
+const inGeneration = (entry) => Boolean(entry) && entry.at > restartedAt && entry.at <= generationEnd;
+
+report.assert(restartEvents.length >= 1, "screenrecord child exited and was respawned", `${restartEvents.length} restarts`);
+report.assert(framesAfter > 0, "frames continue after the child exits", `${framesAfter} frames after the restart`);
+report.assert(
+    inGeneration(configAfter),
+    "parameter sets re-emitted by the replacement child",
+    configAfter ? `config +${configAfter.at - restartedAt}ms of a ${generationEnd - restartedAt}ms generation` : "no config observed",
+);
+report.assert(
+    inGeneration(keyframeAfter),
+    "replacement child delivers a keyframe",
+    keyframeAfter ? `keyframe +${keyframeAfter.at - restartedAt}ms of a ${generationEnd - restartedAt}ms generation` : "no keyframe observed",
+);
+// A keyframe the client has no configuration for is undecodable, which is the
+// failure class the truncated-parameter-set bug produced.
+report.assert(
+    inGeneration(configAfter) && inGeneration(keyframeAfter) && configAfter.at <= keyframeAfter.at,
+    "config precedes the keyframe after the respawn",
+    configAfter && keyframeAfter ? `+${configAfter.at - restartedAt}ms then +${keyframeAfter.at - restartedAt}ms` : "missing frames",
+);
 
 await manager.dispose();
 report.finish();

@@ -41,6 +41,13 @@ It verifies WebCodecs decoding, live video, pointer input and toolbar buttons in
 real browser. If the agent happens to hold a control lease it also checks the
 overlay and the "Take back control" affordance; otherwise those checks skip.
 
+## What these suites do not cover
+
+See the "Known gaps" section of the top-level [README](../../README.md): the
+screenshot fallback for runtimes without WebCodecs, tablet and landscape chrome,
+canvas binding persistence, and `session.shutdown` teardown are all implemented but
+unexercised.
+
 ## Notes
 
 - `boot-lifecycle.mjs` skips if its target AVD is already running, because it would
@@ -48,3 +55,7 @@ overlay and the "Take back control" affordance; otherwise those checks skip.
 - The suites move the device around (taps, swipes, Home) by design. Point them at a
   scratch emulator rather than a device mid-task.
 - `device-layer.mjs` briefly sets `user_rotation`, then resets it to 0.
+- Assertions about the restart loop compare timestamps within a completed respawn
+  generation rather than polling counters. Polling raced: the replacement child's
+  keyframe lands roughly 600ms after the exit, so a late observation folded it into
+  the "before" baseline and the check failed about one run in four.

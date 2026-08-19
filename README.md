@@ -123,6 +123,28 @@ node scripts/verify/rendered-canvas.mjs "<canvas url>"
 See [`scripts/verify/README.md`](scripts/verify/README.md) for prerequisites and the
 environment variables that select which device to target.
 
+## Known gaps
+
+Everything below is implemented but has **not** been exercised against real
+hardware, so treat it as unproven rather than working:
+
+- **Screenshot fallback for runtimes without WebCodecs.** The canvas falls back to
+  polling `api/frame.png` when `VideoDecoder` is missing, and a watchdog switches to
+  it if nothing paints. Every browser used during verification had WebCodecs, so
+  neither path has been seen to run.
+- **Tablet and landscape device chrome.** The frame adapts to tablet metrics and to
+  a landscape display, but only a portrait phone has been rendered. Rotation is also
+  refused by any app that pins its orientation, so landscape is hard to reach.
+- **Canvas binding persistence.** Bindings are written under the session workspace so
+  a reopened canvas reattaches to the same device; reattachment after a restart has
+  not been verified.
+- **Teardown on `session.shutdown`.** Stream children, leases and servers are closed
+  on shutdown, but the handler has not been observed firing.
+
+What *is* verified against a real emulator and a connected device is listed above
+under [Verifying](#verifying); the suites in `scripts/verify/` are the source of
+truth, not this list.
+
 ## License
 
 MIT
