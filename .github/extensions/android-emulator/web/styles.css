@@ -371,6 +371,7 @@ button:hover:not(:disabled) {
 }
 
 .icon-button svg,
+.header-action-icon svg,
 .device-action svg {
     width: 18px;
     height: 18px;
@@ -880,13 +881,13 @@ button:hover:not(:disabled) {
 .header-action-icon {
     display: inline-grid;
     place-items: center;
-    width: 15px;
-    height: 15px;
+    width: 16px;
+    height: 16px;
 }
 
 .header-action-icon svg {
-    width: 15px;
-    height: 15px;
+    width: 16px;
+    height: 16px;
 }
 
 /* A build takes minutes, so the button has to look like it is still working. */

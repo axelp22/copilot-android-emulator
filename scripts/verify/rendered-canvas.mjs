@@ -296,6 +296,23 @@ if (view.leaseActive) {
 async function focusedWindow() {
     return adb(["shell", "dumpsys window | grep mCurrentFocus"]).catch(() => "");
 }
+/**
+ * Closes the notification shade and waits until it really is closed. Neither
+ * `cmd statusbar collapse` nor Home is reliable on its own, so this asks
+ * repeatedly rather than assuming the first attempt worked.
+ */
+async function closeShade(attempts = 5) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        await adb(["shell", "cmd", "statusbar", "collapse"]).catch(() => {});
+        await adb(["shell", "input", "keyevent", "3"]).catch(() => {});
+        const focus = await waitForFocus((current) => !current.includes("NotificationShade"), 4000);
+        if (focus.length > 0 && !focus.includes("NotificationShade")) {
+            return focus;
+        }
+    }
+    return focusedWindow();
+}
+
 async function waitForFocus(matcher, timeoutMs = 15_000) {
     const deadline = Date.now() + timeoutMs;
     let focus = "";
@@ -316,18 +333,25 @@ async function waitForFocus(matcher, timeoutMs = 15_000) {
     return focus;
 }
 
-// Wait for the shade to actually be closed rather than assuming it is: a run that
-// ended with it open would otherwise fail the next run for no reason.
-await adb(["shell", "input", "keyevent", "3"]);
-const shadeClosed = await waitForFocus((focus) => !focus.includes("NotificationShade"));
+// A run that ended with the shade open must not fail the next one.
+const shadeClosed = await closeShade();
 report.assert(!shadeClosed.includes("NotificationShade"), "the notification shade starts closed", shadeClosed.trim().slice(0, 70));
 
 await evaluate("window.__pointerLog = []");
 // Few, long steps on purpose. A manual drag is approximated by chaining
 // `input swipe` segments, and only the first segment starts inside the status
 // bar, so it is the one that has to travel far enough to latch the shade open.
-await drag(dragX, Math.round(geometry.top + geometry.h * 0.03), Math.round(geometry.top + geometry.h * 0.85), 3);
-const shadeOpen = await waitForFocus((focus) => focus.includes("NotificationShade"));
+// Whether it does depends on how the pointer moves happened to be coalesced, so
+// allow a second attempt: a broken input path fails both, a marginal fling does
+// not. This is the documented segmentation limitation, not flakiness in the path.
+let shadeOpen = "";
+for (let attempt = 0; attempt < 2; attempt += 1) {
+    await drag(dragX, Math.round(geometry.top + geometry.h * 0.03), Math.round(geometry.top + geometry.h * 0.85), 3);
+    shadeOpen = await waitForFocus((focus) => focus.includes("NotificationShade"), 8000);
+    if (shadeOpen.includes("NotificationShade")) {
+        break;
+    }
+}
 const pointerLog = await evaluate("window.__pointerLog.join(',')");
 report.assert(pointerLog.includes("pointerdown") && pointerLog.includes("pointerup"), "canvas received real pointer events");
 report.assert(
@@ -336,13 +360,18 @@ report.assert(
     shadeOpen.trim().slice(0, 70),
 );
 
-// Assert against what the device says is focused rather than against pixels: a
-// hash comparison here races the redraw and reports a working button as broken.
+// The Home button is checked by leaving an app, which is what Home reliably does.
+// Dismissing the shade is not: the key event is inconsistent about it.
+await closeShade();
+await adb(["shell", "am", "start", "-n", "com.android.settings/.Settings"]).catch(() => {});
+const inApp = await waitForFocus((focus) => focus.includes("com.android.settings"));
+report.assert(inApp.includes("com.android.settings"), "an app is in the foreground before pressing Home", inApp.trim().slice(0, 70));
+
 await clickElement('[data-action="home"]');
-const afterHome = await waitForFocus((focus) => focus.length > 0 && !focus.includes("NotificationShade"));
+const afterHome = await waitForFocus((focus) => focus.length > 0 && !focus.includes("com.android.settings"));
 report.assert(
-    afterHome.length > 0 && !afterHome.includes("NotificationShade"),
-    "toolbar Home button dismissed the shade",
+    afterHome.length > 0 && !afterHome.includes("com.android.settings"),
+    "toolbar Home button left the app",
     afterHome.trim().slice(0, 70),
 );
 
@@ -359,6 +388,15 @@ const install = await evaluate(`(() => {
         present: true,
         rendered: button.querySelector("svg") !== null,
         label: (button.textContent || "").trim(),
+        icon: (() => {
+            const svg = button.querySelector("svg");
+            if (!svg) {
+                return null;
+            }
+            const style = getComputedStyle(svg);
+            const box = svg.getBoundingClientRect();
+            return { fill: style.fill, stroke: style.stroke, width: Math.round(box.width), height: Math.round(box.height) };
+        })(),
         disabled: button.disabled,
         title: button.title,
     };
@@ -366,6 +404,18 @@ const install = await evaluate(`(() => {
 report.assert(install.present === true, "the header has an Install button beside the stream controls");
 report.assert(install.rendered === true, "the Install button renders its icon");
 report.assert(install.label === "Install", "the Install button is labelled", install.label);
+// Without the shared stroke styling the paths render as filled blobs, which reads
+// as a clipped or broken icon rather than a missing style.
+report.assert(
+    install.icon?.fill === "none" && install.icon?.stroke !== "none",
+    "the Install icon is stroked rather than filled",
+    JSON.stringify(install.icon),
+);
+report.assert(
+    install.icon?.width > 0 && install.icon?.width === install.icon?.height,
+    "the Install icon is square and laid out",
+    `${install.icon?.width}x${install.icon?.height}`,
+);
 report.assert(
     typeof install.title === "string" && install.title.length > 0,
     "the Install button explains itself on hover",
