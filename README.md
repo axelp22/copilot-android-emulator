@@ -17,6 +17,26 @@ Android SDK platform tools expose everything required.
 
 ## Installation
 
+### Install from the plugin marketplace
+
+This repository is also a plugin marketplace, which is the least fiddly way to
+install and the easiest to update later:
+
+```sh
+copilot plugin marketplace add axelp22/copilot-android-emulator
+copilot plugin install android-emulator@copilot-android-emulator
+```
+
+Restart GitHub Copilot afterwards. A newly installed plugin's extensions are picked
+up when the app next starts, so reloading extensions is not enough on its own.
+
+Update it later with `copilot plugin update android-emulator`, and remove it with
+`copilot plugin uninstall android-emulator`.
+
+The plugin ships one copy of the extension: `extensions/android-emulator/` is a shim
+that loads the canonical source under `.github/extensions/`, so a marketplace install
+and a repository install run identical code.
+
 ### Install directly from a local checkout
 
 In GitHub Copilot App, paste this prompt:
@@ -51,11 +71,12 @@ cp -R copilot-android-emulator/.github/extensions/android-emulator \
 
 Reload extensions in GitHub Copilot after copying. No package install step is required.
 
-The copy is a snapshot, so re-copy it to pick up later changes. Note that if a
-repository *also* carries this extension under `.github/extensions/`, both are loaded
-and share a canvas id, so opening the canvas there needs an explicit `extensionId`
-(`user:android-emulator` or `project:android-emulator`). That only affects working
-inside this repository; elsewhere the user-scope copy is unambiguous.
+The copy is a snapshot, so re-copy it to pick up later changes.
+
+Installing the same extension more than one way loads it more than once. The copies
+share a canvas id, so opening the canvas then needs an explicit `extensionId`
+(`plugin:android-emulator`, `user:android-emulator` or `project:android-emulator`).
+Pick one installation method unless you are deliberately testing another.
 
 ## Usage
 
