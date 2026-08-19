@@ -70,6 +70,13 @@ const H264_WATCHDOG_MS = 10_000;
 /** A stream that paints and then dies must also fall back, not freeze. */
 const H264_STALL_TIMEOUT_MS = 15_000;
 const H264_STALL_POLL_MS = 3_000;
+/**
+ * An emulator's capture path slows down the longer it runs — measured dropping from
+ * ~25fps to single digits — which looks like a bug in this canvas. Surface it, with
+ * the fix, instead of leaving the user to guess.
+ */
+const SLOW_CAPTURE_WINDOW_MS = 8_000;
+const SLOW_CAPTURE_FPS = 8;
 
 let state = null;
 let pending = false;
@@ -82,6 +89,7 @@ let h264Watchdog = null;
 let h264StallTimer = null;
 let lastVideoFrameAt = 0;
 let pngFallbackGeneration = 0;
+let recentFrameTimes = [];
 
 function agentControlUnavailable(currentState = state) {
     return currentState?.lease?.active === true || currentState?.controlPending === true;
@@ -334,12 +342,21 @@ function fallBackToScreenshots(reason) {
  */
 function startH264StallWatchdog() {
     clearInterval(h264StallTimer);
+    recentFrameTimes = [];
     h264StallTimer = setInterval(() => {
         if (state?.state !== "Booted" || screenError || !lastVideoFrameAt) {
             return;
         }
         if (Date.now() - lastVideoFrameAt > H264_STALL_TIMEOUT_MS) {
             fallBackToScreenshots("Video stalled; streaming screenshots instead");
+            return;
+        }
+
+        const since = Date.now() - SLOW_CAPTURE_WINDOW_MS;
+        recentFrameTimes = recentFrameTimes.filter((at) => at >= since);
+        const windowFps = recentFrameTimes.length / (SLOW_CAPTURE_WINDOW_MS / 1000);
+        if (state.kind === "emulator" && recentFrameTimes.length > 0 && windowFps < SLOW_CAPTURE_FPS) {
+            setScreenStatus("Emulator capture is slow. Restarting the emulator usually restores it.");
         }
     }, H264_STALL_POLL_MS);
 }
@@ -434,6 +451,7 @@ function drawVideoFrame(frame) {
     clearTimeout(h264Watchdog);
     h264Watchdog = null;
     lastVideoFrameAt = Date.now();
+    recentFrameTimes.push(lastVideoFrameAt);
     const width = frame.displayWidth || frame.codedWidth || frame.width;
     const height = frame.displayHeight || frame.codedHeight || frame.height;
     if (width && height && (elements.h264Screen.width !== width || elements.h264Screen.height !== height)) {

@@ -64,12 +64,20 @@ never boots or shuts them down.
   that never leaves a small radius is sent as a tap instead.
 - **Frame rate is approximate.** `screenrecord` has no frame-rate flag, so the FPS
   control tunes the bit-rate and capture size rather than setting a hard frame rate.
-- **Emulators are much less smooth than physical devices.** An emulator encodes in
-  software on the host, and its virtual display pipeline caps out around 25 frames
-  per second: measured on a Pixel 10 Pro XL AVD it delivers ~25fps with ~110ms
-  between frames, against ~52fps and ~20ms on a connected Pixel 8 Pro. That gap is
-  what makes an emulator feel laggy, and no setting removes it. Emulators therefore
-  default to a 50% capture, which measured fastest — larger overloads the software
+- **Emulators are much less smooth than physical devices, and get worse over time.**
+  A connected Pixel 8 Pro holds ~50fps with ~20ms between frames. A Pixel 10 Pro XL
+  AVD on the same code path starts around 25fps and degrades with sustained capture —
+  measured falling to 12fps, then 6fps, then below 1fps, recovering only on restart.
+  Neither guest CPU (idle) nor host CPU (one core) is saturated, and the GPU is
+  hardware accelerated, so this is a limitation of the emulator's capture path rather
+  than a resource shortage or a setting.
+
+  **If you want a smooth interactive canvas, use a physical device.** Emulators are
+  still fine for agent-driven automation, where frame rate does not matter. When an
+  emulator does get sluggish, restarting it restores capture speed; the canvas says
+  so when it detects the slowdown.
+
+  Emulators default to a 50% capture, which measured fastest — larger overloads the
   encoder, and smaller does not help, because pixel count is not the limit. Physical
   devices default to 100%. Either can be changed from the canvas toolbar.
 - **Input costs roughly 50-190ms per action** on both emulators and devices, because
