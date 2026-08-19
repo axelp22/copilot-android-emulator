@@ -106,6 +106,23 @@ Tools that control a device require a lease acquired with `acquire_control`;
 See [`docs/SPEC.md`](docs/SPEC.md) for the architecture, the `adb` capability mapping,
 and the H.264 streaming design (including the `screenrecord` 180-second restart loop).
 
+## Verifying
+
+The suites in [`scripts/verify/`](scripts/verify/) run against real hardware — there is
+no mocking. They cover the device layer, the canvas server and its security posture,
+stream decodability, emulator cold boot, and the rendered canvas in a real browser.
+
+```sh
+node scripts/verify/device-layer.mjs
+node scripts/verify/canvas-server.mjs
+node scripts/verify/stream-decode.mjs
+node scripts/verify/boot-lifecycle.mjs
+node scripts/verify/rendered-canvas.mjs "<canvas url>"
+```
+
+See [`scripts/verify/README.md`](scripts/verify/README.md) for prerequisites and the
+environment variables that select which device to target.
+
 ## License
 
 MIT
