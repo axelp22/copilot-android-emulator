@@ -120,12 +120,18 @@ export class InputDispatcher {
         return await adbShell(serial, command, { timeout: 30_000 });
     }
 
+    /**
+     * Normalized coordinates are only meaningful against real device metrics, so a
+     * fallback-sized screen is replaced with a live capture before mapping input.
+     */
     async inputGeometry(deviceId) {
         const screen = this.state.getDeviceOrThrow(deviceId).screen;
-        if (screen?.width && screen?.height) {
+        if (screen?.width && screen?.height && screen.source !== "fallback") {
             return { width: screen.width, height: screen.height };
         }
-        return await this.screenSize(deviceId);
+        const size = await this.screenSize(deviceId);
+        this.state.updateScreenMetrics(deviceId, size, "screenshot");
+        return size;
     }
 
     async ensureInputReady(deviceId) {

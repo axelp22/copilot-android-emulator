@@ -106,10 +106,20 @@ export function sortDevices(devices) {
     });
 }
 
-/** Even dimensions keep the device encoder happy; clamp to a sane streaming envelope. */
+/**
+ * Encoder sizes must be even, and very large surfaces exceed what the device
+ * encoder will accept. Scale both axes by the same factor so the aspect ratio of
+ * a tall phone display survives the clamp.
+ */
+export const MAX_ENCODER_DIMENSION = 1920;
+
 export function clampEncoderSize(width, height) {
-    const evenWidth = Math.max(160, Math.min(1920, Math.round(width / 2) * 2));
-    const evenHeight = Math.max(160, Math.min(1920, Math.round(height / 2) * 2));
+    const safeWidth = Math.max(1, width);
+    const safeHeight = Math.max(1, height);
+    const longest = Math.max(safeWidth, safeHeight);
+    const scale = longest > MAX_ENCODER_DIMENSION ? MAX_ENCODER_DIMENSION / longest : 1;
+    const evenWidth = Math.max(160, Math.round((safeWidth * scale) / 2) * 2);
+    const evenHeight = Math.max(160, Math.round((safeHeight * scale) / 2) * 2);
     return { width: evenWidth, height: evenHeight };
 }
 

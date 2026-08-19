@@ -54,6 +54,24 @@ time-limited lease so they cannot conflict with manual input.
 Physical devices are supported for screen, input, and screenshots, but the extension
 never boots or shuts them down.
 
+## Known limitations
+
+- **Manual dragging is approximated.** `adb shell input` has no down/move/up primitive,
+  so pointer moves are coalesced into chained `input swipe` segments. Scrolling and
+  flinging feel close to native, but each segment is a separate gesture on the device,
+  so gestures that depend on a single continuous touch — drag-and-drop, pinch, or
+  long-press-then-drag — will not behave the way they do on real hardware. A pointer
+  that never leaves a small radius is sent as a tap instead.
+- **Frame rate is approximate.** `screenrecord` has no frame-rate flag, so the FPS
+  control tunes the bit-rate and capture size rather than setting a hard frame rate.
+- **Rotation depends on the app.** Rotating writes `user_rotation`, which the window
+  manager may ignore when the foreground app pins its orientation. `rotate_device`
+  reports whether the rotation was actually applied.
+- **Streams restart every 180 seconds.** `screenrecord` hard-stops at that point. The
+  child is respawned transparently and parameter sets are re-sent, so the canvas keeps
+  its last frame across the seam instead of dropping the video.
+- **Recording is capped at 180 seconds** for the same reason.
+
 ## Agent tools
 
 | Tool | Description |
@@ -67,18 +85,18 @@ never boots or shuts them down.
 | `capture_screen` | Capture a PNG screenshot as a session artifact without acquiring control. |
 | `start_video_recording` | Start a lease-bound H.264 recording while agent input continues. |
 | `stop_video_recording` | Finalize an active recording as a session artifact. |
-| `boot_device` | Boot an AVD and wait until `sys.boot_completed`. |
-| `shutdown_device` | Shut down a running emulator. |
-| `restart_device` | Shut down and boot an emulator. |
-| `rotate_device` | Rotate the device left or right. |
+| `boot_device` | Boot an AVD and wait until `sys.boot_completed`. Emulators only. |
+| `shutdown_device` | Shut down a running emulator. Emulators only. |
+| `restart_device` | Shut down and boot an emulator. Emulators only. |
+| `rotate_device` | Rotate the device left or right, reporting whether the app allowed it. |
 | `press_button` | Press home, back, recents, power, or volume buttons. |
 | `tap` | Tap at normalized coordinates by default, or explicit point coordinates. |
 | `swipe` | Swipe using normalized coordinates by default, or explicit point coordinates. |
-| `send_key` | Send an Android key event. |
+| `send_key` | Send an Android key event by keycode, `KEYCODE_*` name, or browser key code. |
 | `send_text` | Send text input. |
-| `perform_inputs` | Run an ordered input sequence under one lease. |
-| `install_apk` | Install an APK onto the selected device. |
-| `launch_app` | Launch an installed package. |
+| `perform_inputs` | Run an ordered input sequence (tap, swipe, key, text, button, wait) under one lease. |
+| `install_apk` | Install an APK from this machine onto the selected device. |
+| `launch_app` | Launch an installed package, optionally targeting a specific activity. |
 
 Tools that control a device require a lease acquired with `acquire_control`;
 `capture_screen` does not.

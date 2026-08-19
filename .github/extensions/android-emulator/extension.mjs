@@ -352,6 +352,12 @@ const canvas = createCanvas({
             const deviceId = preferred ? await manager.resolveDeviceId(preferred) : null;
             const autoBoot = Boolean(deviceId) && ctx.input?.autoBoot !== false && ctx.input?.bootAfterOpen !== true;
 
+            // Resolve real screen metrics up front so the frame paints at the right
+            // aspect ratio instead of briefly using the placeholder geometry.
+            if (deviceId && manager.getCachedDeviceState(deviceId).state === "Booted") {
+                await manager.refreshDeviceGeometry(deviceId).catch(() => {});
+            }
+
             if (existing && existing.deviceId !== deviceId) {
                 await closeInstance(ctx.instanceId);
             }
