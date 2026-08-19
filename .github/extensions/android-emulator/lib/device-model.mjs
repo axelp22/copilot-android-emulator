@@ -132,10 +132,22 @@ export function streamSizeFor(screen, resolutionPercent) {
 
 /**
  * `screenrecord` has no frame-rate flag, so perceived smoothness is approximated
- * through bit-rate: a higher target keeps more detail at 60 fps motion.
+ * through bit-rate. UI content is mostly flat colour and text, so it encodes well
+ * below video rates: over-provisioning here costs latency rather than buying
+ * quality, badly so on emulators, which encode in software.
  */
 export function streamBitRateFor(size, fps) {
     const pixels = size.width * size.height;
-    const base = Math.round(pixels * (fps === 60 ? 5.5 : 3.5));
-    return Math.max(800_000, Math.min(20_000_000, base));
+    const base = Math.round(pixels * (fps === 60 ? 2 : 1.4));
+    return Math.max(600_000, Math.min(8_000_000, base));
+}
+
+/**
+ * Emulators encode in software on the host, and cost scales with pixel count: a
+ * full-size stream measured ~436ms from input to wire with spikes beyond a second,
+ * against ~200ms at half size. Physical devices have hardware encoders and stay at
+ * full size. Either can be changed from the canvas.
+ */
+export function defaultStreamResolution(kind) {
+    return kind === "emulator" ? 50 : 100;
 }

@@ -64,6 +64,16 @@ never boots or shuts them down.
   that never leaves a small radius is sent as a tap instead.
 - **Frame rate is approximate.** `screenrecord` has no frame-rate flag, so the FPS
   control tunes the bit-rate and capture size rather than setting a hard frame rate.
+- **Emulators are much less smooth than physical devices.** An emulator encodes in
+  software on the host, and its virtual display pipeline caps out around 25 frames
+  per second: measured on a Pixel 10 Pro XL AVD it delivers ~25fps with ~110ms
+  between frames, against ~52fps and ~20ms on a connected Pixel 8 Pro. That gap is
+  what makes an emulator feel laggy, and no setting removes it. Emulators therefore
+  default to a 50% capture, which measured fastest — larger overloads the software
+  encoder, and smaller does not help, because pixel count is not the limit. Physical
+  devices default to 100%. Either can be changed from the canvas toolbar.
+- **Input costs roughly 50-190ms per action** on both emulators and devices, because
+  every `adb shell input` starts a new process on the device.
 - **Rotation depends on the app.** Rotating writes `user_rotation`, which the window
   manager may ignore when the foreground app pins its orientation. `rotate_device`
   reports whether the rotation was actually applied.

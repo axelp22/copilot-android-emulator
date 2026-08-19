@@ -3,6 +3,7 @@ import { AppError } from "./errors.mjs";
 import {
     androidVersionLabel,
     clampTtlSeconds,
+    defaultStreamResolution,
     DEVICE_STATES,
     deviceFamily,
     fallbackScreen,
@@ -122,7 +123,7 @@ export class DeviceRegistry {
             canManageLifecycle: device.kind === "emulator",
             screen: device.screen?.width ? device.screen : fallbackScreen(device),
             orientation: device.orientation ?? "portrait",
-            stream: { codec: "h264", fps: 60, resolution: 100 },
+            stream: { codec: "h264", fps: 60, resolution: defaultStreamResolution(device.kind ?? "emulator") },
             lastSeenAt: nowIso(),
             lease: null,
             leaseReservation: null,
