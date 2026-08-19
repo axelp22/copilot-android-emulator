@@ -54,10 +54,18 @@ export class DeviceRegistry {
     }
 
     updateFromList(devices) {
+        // Snapshot before mutating so only genuinely changed devices notify. Discovery
+        // runs on many paths, and every notify fans out to SSE clients.
+        const before = new Map();
+        for (const [deviceId, device] of this.devices) {
+            if (this.subscribers.has(deviceId)) {
+                before.set(deviceId, JSON.stringify(this.snapshot(deviceId)));
+            }
+        }
+
         const seen = new Set();
         for (const device of devices) {
-            const entry = this.upsertDevice(device);
-            seen.add(entry.id);
+            seen.add(this.upsertDevice(device).id);
         }
         for (const [deviceId, device] of this.devices) {
             if (!seen.has(deviceId) && device.state !== DEVICE_STATES.booting) {
@@ -65,8 +73,14 @@ export class DeviceRegistry {
                 device.serial = null;
             }
         }
+
         for (const deviceId of this.devices.keys()) {
-            this.notify(deviceId);
+            if (!this.subscribers.has(deviceId)) {
+                continue;
+            }
+            if (before.get(deviceId) !== JSON.stringify(this.snapshot(deviceId))) {
+                this.notify(deviceId);
+            }
         }
     }
 
@@ -113,6 +127,7 @@ export class DeviceRegistry {
             lease: null,
             leaseReservation: null,
             leaseTimer: null,
+            activeOperations: new Set(),
             instanceIds: new Set(),
         };
         created.deviceFamily = deviceFamily(created);
@@ -366,14 +381,29 @@ export class DeviceRegistry {
         const device = this.assertLease({ deviceId, leaseId });
         device.lease.currentOperation = operation;
         this.notify(deviceId);
+        // Tracked so revocation can wait for work that has already started: an
+        // install or lifecycle action cannot be cancelled mid-flight.
+        const pending = Promise.resolve().then(fn);
+        device.activeOperations ??= new Set();
+        device.activeOperations.add(pending);
         try {
-            return await fn();
+            return await pending;
         } finally {
+            device.activeOperations.delete(pending);
             const latest = this.devices.get(deviceId);
             if (latest?.lease && latest.lease.leaseId === leaseId) {
                 latest.lease.currentOperation = null;
                 this.notify(deviceId);
             }
+        }
+    }
+
+    /** Resolves once any agent operation that had already started has settled. */
+    async settleActiveOperations(deviceId) {
+        const device = this.devices.get(deviceId);
+        const pending = Array.from(device?.activeOperations ?? []);
+        if (pending.length > 0) {
+            await Promise.allSettled(pending);
         }
     }
 

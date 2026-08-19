@@ -66,21 +66,17 @@ export class VideoRecordingService {
 
             recording.serial = serial;
             recording.devicePath = `/sdcard/copilot-recording-${recordingId}.mp4`;
+            recording.pidPath = `/sdcard/copilot-recording-${recordingId}.pid`;
             recording.artifactPath = path.join(dir, `recording-${timestampName()}.mp4`);
             recording.startedAt = nowIso();
-            recording.child = await spawnAdb([
-                "-s",
-                serial,
-                "shell",
-                "screenrecord",
-                "--bit-rate",
-                String(bitRate),
-                "--size",
-                `${size.width}x${size.height}`,
-                "--time-limit",
-                String(durationSeconds),
-                recording.devicePath,
-            ]);
+            // Record the device-side PID so this recording can be stopped without
+            // signalling every `screenrecord` on the device — the live canvas stream
+            // is very often one of them.
+            const recorderCommand =
+                `screenrecord --bit-rate ${bitRate} --size ${size.width}x${size.height} ` +
+                `--time-limit ${durationSeconds} '${recording.devicePath}' & ` +
+                `echo $! > '${recording.pidPath}'; wait $!`;
+            recording.child = await spawnAdb(["-s", serial, "shell", recorderCommand]);
             recording.child.stderr?.on("data", (chunk) => {
                 recording.stderr = `${recording.stderr}${chunk}`.slice(-16_384);
             });
@@ -167,7 +163,9 @@ export class VideoRecordingService {
             if (this.active.get(recording.deviceId) === recording) {
                 this.active.delete(recording.deviceId);
             }
-            await adbShell(recording.serial, ["rm", "-f", recording.devicePath], { timeout: 15_000 }).catch(() => {});
+            await adbShell(recording.serial, ["rm", "-f", recording.devicePath, recording.pidPath ?? ""], {
+                timeout: 15_000,
+            }).catch(() => {});
         }
 
         const file = await stat(recording.artifactPath).catch((error) => {
@@ -178,7 +176,12 @@ export class VideoRecordingService {
             );
         });
         if (file.size === 0) {
-            throw new AppError("recording_finalize_failed", "Video recording produced an empty file.", 502);
+            throw new AppError(
+                "recording_empty",
+                "Video recording produced no frames. `screenrecord` only encodes when the screen changes, " +
+                    "so a very short recording of a still screen can be empty. Record for longer, or while the device is in use.",
+                502,
+            );
         }
 
         const stoppedAt = nowIso();
@@ -201,23 +204,44 @@ export class VideoRecordingService {
         return metadata;
     }
 
+    /**
+     * SIGINT lets `screenrecord` write the MP4 trailer. It must reach only this
+     * recording: signalling by process name would also stop the canvas video stream,
+     * and any other recording on the same device.
+     */
     async interruptDeviceRecorder(recording) {
         if (recording.child?.exitCode !== null || recording.child?.signalCode !== null) {
             return;
         }
-        const attempts = [
-            ["pkill", "-INT", "screenrecord"],
-            ["killall", "-INT", "screenrecord"],
-        ];
-        for (const command of attempts) {
+
+        const pid = await this.readRecorderPid(recording);
+        if (pid) {
             try {
-                await adbShell(recording.serial, command, { timeout: 15_000 });
+                await adbShell(recording.serial, ["kill", "-INT", pid], { timeout: 15_000 });
                 return;
             } catch {
-                // Try the next available signal helper.
+                // Fall through to closing our own adb child.
             }
         }
+        // Never signal by name; losing the trailer is better than killing the canvas.
         recording.child?.kill("SIGINT");
+    }
+
+    async readRecorderPid(recording) {
+        if (!recording.pidPath) {
+            return null;
+        }
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+            const raw = await adbShell(recording.serial, ["cat", recording.pidPath], { timeout: 10_000 }).catch(
+                () => "",
+            );
+            const pid = raw.trim().split(/\s+/)[0];
+            if (/^\d+$/.test(pid)) {
+                return pid;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        return null;
     }
 
     waitForExit(recording) {

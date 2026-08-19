@@ -40,7 +40,10 @@ export function createH264StreamController({ onFrame, onError }) {
     let timestamp = 0;
     let failed = false;
     let currentDescription = null;
+    let lastGoodDescription = null;
     let awaitingKeyframe = false;
+    let recoveryAttempts = 0;
+    let recoveryWindowStartedAt = 0;
 
     function stop() {
         abortController?.abort();
@@ -67,8 +70,10 @@ export function createH264StreamController({ onFrame, onError }) {
     }
 
     /**
-     * A corrupt sample must not blank the canvas for good: drop the decoder and
-     * resume from the next keyframe instead of tearing the stream down.
+     * A corrupt sample must not blank the canvas for good. Rebuild the decoder from
+     * the last known-good configuration straight away and resume at the next
+     * keyframe: waiting for the stream to re-send parameter sets would freeze the
+     * picture until the next `screenrecord` restart, up to 180 seconds away.
      */
     function recoverDecoder() {
         if (decoder) {
@@ -81,9 +86,24 @@ export function createH264StreamController({ onFrame, onError }) {
         decoder = null;
         currentDescription = null;
         awaitingKeyframe = true;
+
+        // Bound the retries: a decoder that fails immediately every time would
+        // otherwise recurse. The caller's watchdog takes over from here.
+        const now = Date.now();
+        if (now - recoveryWindowStartedAt > 10_000) {
+            recoveryWindowStartedAt = now;
+            recoveryAttempts = 0;
+        }
+        recoveryAttempts += 1;
+        if (recoveryAttempts > 3) {
+            return;
+        }
+        if (lastGoodDescription) {
+            configureDecoder(lastGoodDescription, { recovering: true });
+        }
     }
 
-    function configureDecoder(description) {
+    function configureDecoder(description, { recovering = false } = {}) {
         if (!supportsVideoDecoder()) {
             throw new Error("This canvas runtime does not expose WebCodecs VideoDecoder.");
         }
@@ -130,7 +150,9 @@ export function createH264StreamController({ onFrame, onError }) {
         }
         timestamp = 0;
         currentDescription = description.slice();
-        awaitingKeyframe = false;
+        lastGoodDescription = currentDescription;
+        // After a decode error, wait for a keyframe before feeding deltas again.
+        awaitingKeyframe = recovering;
         decoder = next;
     }
 

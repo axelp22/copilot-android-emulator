@@ -28,6 +28,12 @@ import { ScreenService } from "./screen-service.mjs";
 import { VideoRecordingService } from "./video-recording-service.mjs";
 
 const BOOT_TIMEOUT_MS = 180_000;
+/**
+ * Discovery spawns several adb/emulator processes. Refresh runs on many paths, so
+ * results are shared for a short window and concurrent callers are deduplicated.
+ */
+const DISCOVERY_TTL_MS = 750;
+const AVD_LIST_TTL_MS = 10_000;
 const BOOT_POLL_INTERVAL_MS = 2_000;
 const SHUTDOWN_TIMEOUT_MS = 45_000;
 
@@ -50,6 +56,12 @@ export class DeviceSessionManager {
         this.artifactsRoot = null;
         this.manualInputStops = new Map();
         this.deviceMetaCache = new Map();
+        this.discoveryInFlight = null;
+        this.bootOperations = new Map();
+        this.discoveryCompletedAt = 0;
+        this.lastDiscovery = null;
+        this.avdListCache = null;
+        this.avdListFetchedAt = 0;
         this.onDiagnostic = onDiagnostic ?? (() => {});
         this.screen = new ScreenService({
             state: this.state,
@@ -143,14 +155,21 @@ export class DeviceSessionManager {
         return meta;
     }
 
+    async listAvdsCached() {
+        if (this.avdListCache && Date.now() - this.avdListFetchedAt < AVD_LIST_TTL_MS) {
+            return this.avdListCache;
+        }
+        const avds = await listAvds().catch((error) => {
+            this.onDiagnostic(`AVD listing unavailable: ${error.message}`);
+            return this.avdListCache ?? [];
+        });
+        this.avdListCache = avds;
+        this.avdListFetchedAt = Date.now();
+        return avds;
+    }
+
     async discoverDevices() {
-        const [attached, avds] = await Promise.all([
-            listAttached(),
-            listAvds().catch((error) => {
-                this.onDiagnostic(`AVD listing unavailable: ${error.message}`);
-                return [];
-            }),
-        ]);
+        const [attached, avds] = await Promise.all([listAttached(), this.listAvdsCached()]);
 
         const discovered = [];
         const bootedAvdNames = new Set();
@@ -210,10 +229,37 @@ export class DeviceSessionManager {
         return discovered;
     }
 
-    async refreshDevices() {
-        const discovered = await this.discoverDevices();
-        this.state.updateFromList(discovered);
-        return discovered;
+    /**
+     * Deduplicates concurrent refreshes and serves a very recent result rather than
+     * re-running discovery. Concurrent refreshes could also apply out of order.
+     */
+    async refreshDevices({ force = false } = {}) {
+        if (!force && this.lastDiscovery && Date.now() - this.discoveryCompletedAt < DISCOVERY_TTL_MS) {
+            return this.lastDiscovery;
+        }
+        if (this.discoveryInFlight) {
+            return await this.discoveryInFlight;
+        }
+
+        this.discoveryInFlight = (async () => {
+            const discovered = await this.discoverDevices();
+            this.state.updateFromList(discovered);
+            this.lastDiscovery = discovered;
+            this.discoveryCompletedAt = Date.now();
+            return discovered;
+        })();
+
+        try {
+            return await this.discoveryInFlight;
+        } finally {
+            this.discoveryInFlight = null;
+        this.bootOperations = new Map();
+        }
+    }
+
+    /** Lifecycle changes must observe the device immediately, not a cached list. */
+    refreshDevicesNow() {
+        return this.refreshDevices({ force: true });
     }
 
     async listDevices() {
@@ -358,7 +404,7 @@ export class DeviceSessionManager {
     }
 
     async bootDevice(deviceId) {
-        await this.refreshDevices();
+        await this.refreshDevicesNow();
         this.assertLifecycleAllowed(deviceId);
         const device = this.state.getDeviceOrThrow(deviceId);
         if (device.state === DEVICE_STATES.booted && device.serial) {
@@ -368,7 +414,26 @@ export class DeviceSessionManager {
         return await this.completePreparedBoot(deviceId);
     }
 
-    async completePreparedBoot(deviceId) {
+    /**
+     * Two canvases, or a canvas and an agent action, can ask for the same AVD at
+     * once. Without this they would each spawn `emulator -avd`, producing a second
+     * instance of the same device.
+     */
+    completePreparedBoot(deviceId) {
+        const pending = this.bootOperations.get(deviceId);
+        if (pending) {
+            return pending;
+        }
+        const promise = this.runBoot(deviceId).finally(() => {
+            if (this.bootOperations.get(deviceId) === promise) {
+                this.bootOperations.delete(deviceId);
+            }
+        });
+        this.bootOperations.set(deviceId, promise);
+        return promise;
+    }
+
+    async runBoot(deviceId) {
         const device = this.assertLifecycleAllowed(deviceId);
         if (!device.avdName) {
             throw new AppError("unknown_avd", `No AVD is associated with ${deviceId}.`, 409);
@@ -392,7 +457,7 @@ export class DeviceSessionManager {
             throw error;
         }
 
-        await this.refreshDevices();
+        await this.refreshDevicesNow();
         await this.refreshDeviceGeometry(deviceId).catch(() => {});
         this.state.notify(deviceId);
         return this.state.snapshot(deviceId);
@@ -435,7 +500,7 @@ export class DeviceSessionManager {
     }
 
     async shutdownDevice(deviceId) {
-        await this.refreshDevices();
+        await this.refreshDevicesNow();
         const device = this.assertLifecycleAllowed(deviceId);
         if (!device.serial) {
             return this.state.snapshot(deviceId);
@@ -459,7 +524,7 @@ export class DeviceSessionManager {
         }
 
         this.deviceMetaCache.delete(serial);
-        await this.refreshDevices();
+        await this.refreshDevicesNow();
         this.state.setDeviceState(deviceId, DEVICE_STATES.shutdown);
         this.state.setSerial(deviceId, null);
         return this.state.snapshot(deviceId);
@@ -503,7 +568,11 @@ export class DeviceSessionManager {
     }
 
     async revokeLease(deviceId) {
-        return this.state.revokeLease(deviceId);
+        // Drop the lease first so nothing new can start, then wait for work already
+        // in flight before handing the device back to the user.
+        const snapshot = this.state.revokeLease(deviceId);
+        await this.state.settleActiveOperations(deviceId);
+        return snapshot;
     }
 
     async withLeaseOperation(input, fn) {

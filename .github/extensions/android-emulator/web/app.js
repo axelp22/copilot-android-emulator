@@ -67,6 +67,9 @@ const useVideoDecoder = supportsVideoDecoder();
 const PNG_FALLBACK_INTERVAL_MS = 600;
 /** If nothing has painted by now, stop waiting on WebCodecs and poll screenshots. */
 const H264_WATCHDOG_MS = 10_000;
+/** A stream that paints and then dies must also fall back, not freeze. */
+const H264_STALL_TIMEOUT_MS = 15_000;
+const H264_STALL_POLL_MS = 3_000;
 
 let state = null;
 let pending = false;
@@ -76,6 +79,9 @@ let eventSource = null;
 let screenError = null;
 let pngFallbackTimer = null;
 let h264Watchdog = null;
+let h264StallTimer = null;
+let lastVideoFrameAt = 0;
+let pngFallbackGeneration = 0;
 
 function agentControlUnavailable(currentState = state) {
     return currentState?.lease?.active === true || currentState?.controlPending === true;
@@ -301,27 +307,80 @@ function streamUrl() {
 }
 
 function stopPngFallback() {
-    clearInterval(pngFallbackTimer);
+    // Bumping the generation cancels any capture already in flight.
+    pngFallbackGeneration += 1;
+    clearTimeout(pngFallbackTimer);
     pngFallbackTimer = null;
 }
 
 function stopH264Watchdog() {
     clearTimeout(h264Watchdog);
     h264Watchdog = null;
+    clearInterval(h264StallTimer);
+    h264StallTimer = null;
 }
 
-/** Used when the canvas runtime has no WebCodecs decoder: poll `screencap` instead. */
+function fallBackToScreenshots(reason) {
+    stopH264Watchdog();
+    h264Stream.stop();
+    setScreenStatus(reason);
+    startPngFallback();
+}
+
+/**
+ * The first-frame watchdog only covers startup. Video can also stop part way
+ * through — a decoder that cannot recover, or a stalled stream — and the canvas
+ * would otherwise sit on a stale frame indefinitely.
+ */
+function startH264StallWatchdog() {
+    clearInterval(h264StallTimer);
+    h264StallTimer = setInterval(() => {
+        if (state?.state !== "Booted" || screenError || !lastVideoFrameAt) {
+            return;
+        }
+        if (Date.now() - lastVideoFrameAt > H264_STALL_TIMEOUT_MS) {
+            fallBackToScreenshots("Video stalled; streaming screenshots instead");
+        }
+    }, H264_STALL_POLL_MS);
+}
+
+/**
+ * Used when the canvas runtime has no WebCodecs decoder, or video has failed.
+ * Each capture is scheduled only after the previous image settles: `screencap`
+ * takes a second or more on a large display, so a fixed interval would stack
+ * overlapping captures on the device.
+ */
 function startPngFallback() {
     stopPngFallback();
     setScreenMode("png");
-    const refreshFrame = () => {
-        if (state?.state !== "Booted") {
+    const generation = ++pngFallbackGeneration;
+
+    const stale = () => generation !== pngFallbackGeneration || state?.state !== "Booted";
+    const scheduleNext = () => {
+        if (stale()) {
             return;
         }
-        elements.screen.src = apiUrl(`api/frame.png?r=${Date.now()}`).toString();
+        pngFallbackTimer = setTimeout(refreshFrame, PNG_FALLBACK_INTERVAL_MS);
     };
+    const refreshFrame = () => {
+        if (stale()) {
+            return;
+        }
+        const image = new Image();
+        image.addEventListener("load", () => {
+            if (stale()) {
+                return;
+            }
+            elements.screen.src = image.src;
+            elements.screen.classList.add("has-frame");
+            elements.screenWindow.classList.add("has-frame");
+            scheduleNext();
+        });
+        image.addEventListener("error", scheduleNext);
+        image.src = apiUrl(`api/frame.png?r=${Date.now()}`).toString();
+    };
+
     refreshFrame();
-    pngFallbackTimer = setInterval(refreshFrame, PNG_FALLBACK_INTERVAL_MS);
 }
 
 function ensureStream() {
@@ -374,6 +433,7 @@ function drawVideoFrame(frame) {
     }
     clearTimeout(h264Watchdog);
     h264Watchdog = null;
+    lastVideoFrameAt = Date.now();
     const width = frame.displayWidth || frame.codedWidth || frame.width;
     const height = frame.displayHeight || frame.codedHeight || frame.height;
     if (width && height && (elements.h264Screen.width !== width || elements.h264Screen.height !== height)) {
@@ -406,10 +466,10 @@ function startH264Stream(fps) {
             return;
         }
         // Never leave the canvas blank because video decoding failed.
-        h264Stream.stop();
-        setScreenStatus("Video unavailable; streaming screenshots instead");
-        startPngFallback();
+        fallBackToScreenshots("Video unavailable; streaming screenshots instead");
     }, H264_WATCHDOG_MS);
+    lastVideoFrameAt = 0;
+    startH264StallWatchdog();
     void h264Stream.start({ url: streamUrl(), fps });
 }
 

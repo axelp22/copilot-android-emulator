@@ -1,6 +1,7 @@
+import { randomBytes } from "node:crypto";
 import { PassThrough } from "node:stream";
 import { AppError } from "./errors.mjs";
-import { screencapPng, spawnAdb } from "./adb.mjs";
+import { adb, screencapPng, spawnAdb } from "./adb.mjs";
 
 /** Wire tags shared with `web/h264-stream.js`. */
 export const FRAME_TAGS = {
@@ -24,7 +25,10 @@ const RESTART_BACKOFF_MS = 250;
  * A still screen stops producing frames, which would leave the newest picture
  * stranded behind an undelimited NAL unit. Rather than guess that a partial unit
  * is complete — a truncated sample makes the decoder reject the stream — the
- * current screen is re-sent as a PNG seed frame while the encoder is quiet.
+ * current screen is sent once as a PNG seed frame after the encoder goes quiet.
+ *
+ * Exactly one seed is sent per motion-to-idle transition. Re-capturing on a timer
+ * would cost a ~2MB `screencap` every interval for a screen that is not changing.
  */
 const IDLE_REFRESH_MS = 800;
 
@@ -33,10 +37,34 @@ const IDLE_REFRESH_MS = 800;
  * covers the tag byte plus the payload.
  */
 export function frame(tag, payload) {
-    const header = Buffer.alloc(5);
-    header.writeUInt32BE(payload.length + 1, 0);
-    header.writeUInt8(tag, 4);
-    return Buffer.concat([header, payload]);
+    const out = Buffer.allocUnsafe(payload.length + 5);
+    out.writeUInt32BE(payload.length + 1, 0);
+    out.writeUInt8(tag, 4);
+    payload.copy(out, 5);
+    return out;
+}
+
+/**
+ * Prefix each NAL unit with its 4-byte length and wrap the result in one framed
+ * packet. Building both in a single allocation avoids copying every frame twice
+ * on the hot path.
+ */
+export function frameAvccSample(tag, nalUnits) {
+    let payloadLength = 0;
+    for (const nal of nalUnits) {
+        payloadLength += nal.length + 4;
+    }
+    const out = Buffer.allocUnsafe(payloadLength + 5);
+    out.writeUInt32BE(payloadLength + 1, 0);
+    out.writeUInt8(tag, 4);
+    let offset = 5;
+    for (const nal of nalUnits) {
+        out.writeUInt32BE(nal.length, offset);
+        offset += 4;
+        nal.copy(out, offset);
+        offset += nal.length;
+    }
+    return out;
 }
 
 /** Build an `avcC` decoder configuration record from raw SPS/PPS NAL units. */
@@ -190,6 +218,10 @@ export async function createH264Stream({
     onDiagnostic,
 }) {
     const stdout = new PassThrough({ highWaterMark: 1 << 20 });
+    // Destroying the stream with an error is how failures propagate, so guarantee a
+    // listener exists: an unhandled 'error' here would take down the extension host
+    // if the consumer had not attached one yet.
+    stdout.on("error", () => {});
     const listeners = { error: new Set(), exit: new Set() };
 
     let child = null;
@@ -203,23 +235,34 @@ export async function createH264Stream({
     let pendingPrefix = [];
     let restartCount = 0;
     let idleTimer = null;
+    // Killing the local adb process does not reliably stop the device-side
+    // `screenrecord`. Orphans hold an encoder slot, and enough of them wedge the
+    // device so every later stream returns nothing, so the PID is recorded and
+    // signalled explicitly on teardown.
+    const pidPath = `/data/local/tmp/copilot-stream-${randomBytes(6).toString("hex")}.pid`;
+    let reapPromise = null;
     let seedInFlight = false;
+    let idleSeedSent = false;
+    let videoGeneration = 0;
+    let backpressured = false;
+    let drainListenerAttached = false;
 
     const parser = createAnnexBParser(handleNalUnit);
 
     function scheduleIdleRefresh() {
         clearTimeout(idleTimer);
+        idleTimer = null;
+        // One seed per quiet period: re-armed by the next byte of video.
+        if (stopped || idleSeedSent || seedInFlight || backpressured) {
+            return;
+        }
         idleTimer = setTimeout(() => {
             idleTimer = null;
-            if (stopped || seedInFlight) {
+            if (stopped || idleSeedSent || seedInFlight || backpressured) {
                 return;
             }
-            // The encoder has gone quiet; paint the live screen instead of waiting.
-            void sendSeedFrame().finally(() => {
-                if (!stopped) {
-                    scheduleIdleRefresh();
-                }
-            });
+            idleSeedSent = true;
+            void sendSeedFrame();
         }, IDLE_REFRESH_MS);
         idleTimer.unref?.();
     }
@@ -234,18 +277,30 @@ export async function createH264Stream({
         }
     }
 
+    /**
+     * A slow consumer must throttle every producer, not just the encoder: a queued
+     * PNG seed is megabytes, and one `drain` listener per failed write would pile up.
+     */
     function write(buffer) {
         if (stopped || stdout.destroyed || stdout.writableEnded) {
             return;
         }
-        if (!stdout.write(buffer) && child?.stdout) {
-            child.stdout.pause();
-            stdout.once("drain", () => {
-                if (!stopped) {
-                    child?.stdout?.resume();
-                }
-            });
+        if (stdout.write(buffer)) {
+            return;
         }
+        backpressured = true;
+        child?.stdout?.pause();
+        if (drainListenerAttached) {
+            return;
+        }
+        drainListenerAttached = true;
+        stdout.once("drain", () => {
+            drainListenerAttached = false;
+            backpressured = false;
+            if (!stopped) {
+                child?.stdout?.resume();
+            }
+        });
     }
 
     function sendConfig({ force = false } = {}) {
@@ -293,17 +348,26 @@ export async function createH264Stream({
         // In-band parameter sets on every keyframe keep decoding recoverable after a restart.
         const units = isKeyframe && sps && pps ? [sps, pps, ...pendingPrefix, nal] : [...pendingPrefix, nal];
         pendingPrefix = [];
-        write(frame(isKeyframe ? FRAME_TAGS.keyframe : FRAME_TAGS.delta, toAvccSample(units)));
+        write(frameAvccSample(isKeyframe ? FRAME_TAGS.keyframe : FRAME_TAGS.delta, units));
     }
 
-    async function sendSeedFrame() {
+    /**
+     * The connect-time seed is sent unconditionally so the canvas paints before the
+     * first decodable frame, as the streaming design requires; at worst it is
+     * overwritten by the next video frame a few milliseconds later. An idle seed
+     * instead guards on the video generation, because there a stale still would
+     * replace a newer decoded frame for as long as the screen stays quiet.
+     */
+    async function sendSeedFrame({ initial = false } = {}) {
         if (seedInFlight) {
             return;
         }
         seedInFlight = true;
+        const generation = videoGeneration;
         try {
             const png = await screencapPng(serial);
-            if (!stopped) {
+            const superseded = !initial && generation !== videoGeneration;
+            if (!stopped && !superseded) {
                 write(frame(FRAME_TAGS.seed, png));
             }
         } catch (error) {
@@ -314,10 +378,7 @@ export async function createH264Stream({
     }
 
     function screenrecordArgs() {
-        const args = [
-            "-s",
-            serial,
-            "exec-out",
+        const flags = [
             "screenrecord",
             "--output-format=h264",
             "--size",
@@ -326,19 +387,39 @@ export async function createH264Stream({
             String(bitRate),
         ];
         if (timeLimitSeconds) {
-            args.push("--time-limit", String(Math.max(1, Math.min(180, Math.round(timeLimitSeconds)))));
+            flags.push("--time-limit", String(Math.max(1, Math.min(180, Math.round(timeLimitSeconds)))));
         }
-        args.push("-");
-        return args;
+        flags.push("-");
+        // The PID goes to a file, so stdout stays a clean Annex-B byte stream.
+        return ["-s", serial, "exec-out", `${flags.join(" ")} & echo $! > '${pidPath}'; wait $!`];
+    }
+
+    /**
+     * Reap the device-side recorder and its PID file. The returned promise must be
+     * awaited during teardown: if the host process exits first the recorder survives
+     * as an orphan holding an encoder slot.
+     */
+    function reapDeviceRecorder() {
+        reapPromise = adb(
+            ["-s", serial, "shell", `kill -INT $(cat '${pidPath}' 2>/dev/null) 2>/dev/null; rm -f '${pidPath}'`],
+            { timeout: 10_000 },
+        )
+            .then(() => {})
+            .catch(() => {});
+        return reapPromise;
     }
 
     async function spawnOnce() {
         const startedAt = Date.now();
+        let producedOutput = false;
         const next = await spawnAdb(screenrecordArgs());
         child = next;
 
         next.stdout.on("data", (chunk) => {
-            consecutiveFailures = 0;
+            producedOutput = true;
+            // The screen is moving again: allow the next quiet period to seed once.
+            videoGeneration += 1;
+            idleSeedSent = false;
             parser.push(chunk);
             scheduleIdleRefresh();
         });
@@ -367,15 +448,22 @@ export async function createH264Stream({
             }
 
             const ranLongEnough = Date.now() - startedAt >= HEALTHY_RUN_MS;
-            if (!ranLongEnough && code !== 0 && signal == null) {                consecutiveFailures += 1;
+            if (ranLongEnough && producedOutput) {
+                // Only a genuinely healthy run clears the counter. Resetting on the
+                // first output byte would let a child that emits a header and then
+                // crashes respawn forever.
+                consecutiveFailures = 0;
+            } else if (!producedOutput || (code !== 0 && signal == null)) {
+                // A device whose media encoder is stuck exits cleanly having written
+                // nothing. Without counting that, the loop would respawn for ever and
+                // the canvas would sit blank with no explanation.
+                consecutiveFailures += 1;
                 if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                    fail(
-                        new AppError(
-                            "stream_failed",
-                            stderrText.trim() || `screenrecord exited with code ${code}.`,
-                            502,
-                        ),
-                    );
+                    const detail = producedOutput
+                        ? stderrText.trim() || `screenrecord exited with code ${code}.`
+                        : stderrText.trim() ||
+                          "screenrecord produced no video. The device encoder may be stuck; restart the emulator or device.";
+                    fail(new AppError("stream_failed", detail, 502));
                     return;
                 }
             }
@@ -408,6 +496,7 @@ export async function createH264Stream({
         clearTimeout(idleTimer);
         child?.kill("SIGTERM");
         child = null;
+        reapDeviceRecorder();
         emit("error", error);
         stdout.destroy(error);
         emit("exit", 1, null);
@@ -415,7 +504,7 @@ export async function createH264Stream({
 
     await spawnOnce();
     if (seed) {
-        void sendSeedFrame();
+        void sendSeedFrame({ initial: true });
     }
 
     return {
@@ -425,6 +514,8 @@ export async function createH264Stream({
         },
         stderrText: () => stderrText.trim(),
         restartCountValue: () => restartCount,
+        /** Resolves once the device-side recorder has been signalled. */
+        whenReaped: () => reapPromise ?? Promise.resolve(),
         on(event, handler) {
             listeners[event]?.add(handler);
             return this;
@@ -445,6 +536,7 @@ export async function createH264Stream({
             const current = child;
             child = null;
             current?.kill("SIGTERM");
+            reapDeviceRecorder();
             if (!stdout.writableEnded) {
                 stdout.end();
             }

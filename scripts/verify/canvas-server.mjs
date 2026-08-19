@@ -96,9 +96,14 @@ const motion = setInterval(() => {
     }).catch(() => {});
 }, 800);
 while (Date.now() < deadline) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    for (const frame of push(value)) {
+    // read() can block past the deadline if the stream goes quiet, so race it.
+    const next = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 2_000)),
+    ]);
+    if (next.timedOut) continue;
+    if (next.done) break;
+    for (const frame of push(next.value)) {
         tags.push(frame.tag);
     }
 }

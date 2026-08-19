@@ -182,18 +182,23 @@ export async function createCanvasServer({
         await stopManualTouches();
     }
 
-    function stopActiveConnections({ blockManualInput = false } = {}) {
+    async function stopActiveConnections({ blockManualInput = false } = {}) {
         if (blockManualInput) {
             acceptingManualInput = false;
         }
         streamGeneration += 1;
+        const reaped = [];
         for (const child of streamChildren) {
             if (!child.killed) {
                 child.kill();
             }
+            // Wait for the device-side recorder to be signalled: abandoning it leaves
+            // an orphan that holds an encoder slot on the device.
+            reaped.push(child.whenReaped?.() ?? Promise.resolve());
         }
         streamChildren.clear();
-        return blockManualInput ? stopManualInput() : stopManualTouches();
+        await (blockManualInput ? stopManualInput() : stopManualTouches());
+        await Promise.allSettled(reaped);
     }
 
     function startBootAfterOpen() {
