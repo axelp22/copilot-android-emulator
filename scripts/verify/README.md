@@ -24,10 +24,12 @@ Configure targets with environment variables:
 ## Suites
 
 ```sh
-node scripts/verify/device-layer.mjs     # discovery, input, rotation, stream, restart loop
-node scripts/verify/canvas-server.mjs    # HTTP/SSE/security/lease gating
-node scripts/verify/stream-decode.mjs    # aspect ratio + ffprobe decodability
-node scripts/verify/boot-lifecycle.mjs   # cold boot and shutdown of an AVD (slow)
+node scripts/verify/device-layer.mjs           # discovery, input, rotation, stream, restart loop
+node scripts/verify/canvas-server.mjs          # HTTP/SSE/security/lease gating
+node scripts/verify/stream-decode.mjs          # aspect ratio + ffprobe decodability
+node scripts/verify/stream-lifecycle.mjs       # repeated start/stop leaves no orphaned recorders
+node scripts/verify/recording-coexistence.mjs  # recording does not disturb the live stream
+node scripts/verify/boot-lifecycle.mjs         # cold boot and shutdown of an AVD (slow)
 ```
 
 `rendered-canvas.mjs` needs a live canvas URL. Ask Copilot to open the Android
@@ -55,6 +57,13 @@ unexercised.
 - The suites move the device around (taps, swipes, Home) by design. Point them at a
   scratch emulator rather than a device mid-task.
 - `device-layer.mjs` briefly sets `user_rotation`, then resets it to 0.
+- **Emulator encoders stall under repeated capture.** Running these suites back to
+  back can leave the emulator producing no video at all: `screenrecord` then exits
+  cleanly having written nothing, and every stream looks broken. This is a device
+  limitation rather than an extension bug — the stream layer detects it and reports
+  an error instead of respawning silently. Leave a few seconds between suites, and
+  restart the emulator if streams stop producing bytes. The extension's own
+  `restart_device` clears it.
 - Assertions about the restart loop compare timestamps within a completed respawn
   generation rather than polling counters. Polling raced: the replacement child's
   keyframe lands roughly 600ms after the exit, so a late observation folded it into

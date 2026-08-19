@@ -23,7 +23,15 @@ stream.stdout.on("data", () => {
     chunks += 1;
 });
 
-await sleep(2500);
+// `screenrecord` only encodes when the screen changes, so keep the display busy for
+// the whole run: a still screen is indistinguishable from a broken stream.
+let step = 0;
+const motion = setInterval(() => {
+    step += 1;
+    void adb(["shell", "input", "keyevent", step % 2 === 0 ? "3" : "187"]).catch(() => {});
+}, 800);
+
+await sleep(3000);
 const chunksBefore = chunks;
 const restartsBefore = stream.restartCountValue();
 report.assert(chunksBefore > 0, "live stream is running before the recording starts", `${chunksBefore} chunks`);
@@ -39,15 +47,7 @@ const recording = await manager.startVideoRecording({
     leaseId: lease.lease.leaseId,
     maxDurationSeconds: 20,
 });
-// `screenrecord` only encodes when the screen changes, so a recording of a still
-// screen can legitimately contain nothing. Keep the display busy.
-let step = 0;
-const motion = setInterval(() => {
-    step += 1;
-    void adb(["shell", "input", "keyevent", step % 2 === 0 ? "3" : "187"]).catch(() => {});
-}, 800);
 await sleep(6000);
-clearInterval(motion);
 
 const metadata = await manager.stopVideoRecording({
     deviceId,
@@ -56,6 +56,7 @@ const metadata = await manager.stopVideoRecording({
 });
 await sleep(2500);
 
+clearInterval(motion);
 report.assert(metadata.byteSize > 0, "recording finalized with content", `${metadata.byteSize} bytes`);
 report.assert(
     stream.restartCountValue() === restartsBefore,

@@ -70,6 +70,10 @@ never boots or shuts them down.
 - **Streams restart every 180 seconds.** `screenrecord` hard-stops at that point. The
   child is respawned transparently and parameter sets are re-sent, so the canvas keeps
   its last frame across the seam instead of dropping the video.
+- **Emulator encoders can stall under heavy repeated capture.** After many streams have
+  been started and stopped, an emulator may return no video at all. The extension
+  detects this and reports an error rather than retrying silently; restarting the
+  emulator clears it.
 - **Recording is capped at 180 seconds** for the same reason.
 
 ## Agent tools
