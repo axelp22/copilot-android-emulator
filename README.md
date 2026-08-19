@@ -33,13 +33,29 @@ When prompted, choose an installation scope:
 
 ### Install manually
 
+For a single repository:
+
 ```sh
 mkdir -p <target-repository>/.github/extensions
 cp -R copilot-android-emulator/.github/extensions/android-emulator \
   <target-repository>/.github/extensions/android-emulator
 ```
 
+For every project, install it at user scope:
+
+```sh
+mkdir -p ~/.copilot/extensions
+cp -R copilot-android-emulator/.github/extensions/android-emulator \
+  ~/.copilot/extensions/android-emulator
+```
+
 Reload extensions in GitHub Copilot after copying. No package install step is required.
+
+The copy is a snapshot, so re-copy it to pick up later changes. Note that if a
+repository *also* carries this extension under `.github/extensions/`, both are loaded
+and share a canvas id, so opening the canvas there needs an explicit `extensionId`
+(`user:android-emulator` or `project:android-emulator`). That only affects working
+inside this repository; elsewhere the user-scope copy is unambiguous.
 
 ## Usage
 

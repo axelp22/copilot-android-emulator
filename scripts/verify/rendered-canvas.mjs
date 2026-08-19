@@ -209,7 +209,13 @@ report.assert(view.canvasSize !== "0x0" && view.canvasSize !== "300x150", "video
 report.assert(view.hasFrame, "a decoded frame was drawn");
 report.assert(view.distinctColours > 20, "decoded frame has real image content", `${view.distinctColours} colours sampled`);
 report.assert(view.nonBlackSamples > 50, "frame is not a black screen", `${view.nonBlackSamples} non-black samples`);
-report.assert(view.status === "Device display ready", "status reports display ready", view.status);
+// A slow-capture notice is a healthy state too: the canvas is painting and saying
+// the emulator, not the extension, is the reason it looks sluggish.
+report.assert(
+    view.status === "Device display ready" || view.status.startsWith("Emulator capture is slow"),
+    "status reports a healthy stream",
+    view.status,
+);
 report.assert(
     view.toolbar === "back,home,recents,rotate-right,volume-up,volume-down,power,shutdown",
     "Android toolbar rendered",
