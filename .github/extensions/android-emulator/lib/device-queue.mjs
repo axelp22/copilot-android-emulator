@@ -22,6 +22,11 @@ const TICKET_TTL_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const POLL_INTERVAL_MS = 1_000;
 
+/** Two reads of the same acquisition, rather than a replacement. */
+function sameRecord(a, b) {
+    return a.token && b.token ? a.token === b.token : a.acquiredAt === b.acquiredAt && a.sessionId === b.sessionId;
+}
+
 function safeName(value) {
     return String(value).replace(/[^A-Za-z0-9._-]/g, "_");
 }
@@ -101,7 +106,13 @@ export class DeviceQueue {
             return null;
         }
         if (!isLive(record)) {
-            await unlink(file).catch(() => {});
+            // Re-read before deleting: between the read and the unlink another
+            // session may have taken the device, and removing their holder would
+            // hand the same device to two sessions.
+            const current = await this.readJson(file);
+            if (current && sameRecord(current, record) && !isLive(current)) {
+                await unlink(file).catch(() => {});
+            }
             return null;
         }
         return record;
@@ -176,6 +187,10 @@ export class DeviceQueue {
         const record = {
             deviceId,
             reason,
+            // Identifies this acquisition, not just this session. Renewal, release
+            // and stale cleanup all check it, so an in-flight write from a hold we
+            // have already given up cannot resurrect or clobber somebody else's.
+            token: randomUUID(),
             sessionId: this.owner.sessionId,
             sessionLabel: this.owner.sessionLabel,
             pid: this.owner.pid,
@@ -261,6 +276,12 @@ export class DeviceQueue {
         if (holder && holder.sessionId !== this.owner.sessionId && isLive(holder)) {
             return false;
         }
+        // If the file on disk is a different acquisition than ours, it belongs to
+        // whoever took the device after us. Deleting it would free a device that
+        // is in use.
+        if (holder && record && holder.token && record.token && holder.token !== record.token && isLive(holder)) {
+            return false;
+        }
         await unlink(this.holderPath(deviceId)).catch(() => {});
         if (this.held.size === 0 && this.tickets.size === 0) {
             this.stopHeartbeat();
@@ -314,15 +335,37 @@ export class DeviceQueue {
         this.heartbeat.unref?.();
     }
 
+    /**
+     * Renews only records we still own. Writing unconditionally would let a beat
+     * that was already in flight when we released recreate the holder file, or
+     * overwrite the record of the session that took the device next.
+     */
     async beat() {
         const now = Date.now();
         await Promise.all([
             ...Array.from(this.held.entries()).map(async ([deviceId, record]) => {
+                const current = await this.readJson(this.holderPath(deviceId));
+                if (!current || current.token !== record.token) {
+                    // Somebody else owns it now, or it is already gone.
+                    this.held.delete(deviceId);
+                    return;
+                }
+                if (this.held.get(deviceId) !== record) {
+                    return;
+                }
                 record.expiresAt = new Date(now + HOLDER_TTL_MS).toISOString();
                 await writeFile(this.holderPath(deviceId), `${JSON.stringify(record)}\n`, "utf8").catch(() => {});
             }),
             ...Array.from(this.tickets.values()).map(async (ticket) => {
+                const key = `${ticket.deviceId}:${ticket.ticketId}`;
+                if (!this.tickets.has(key)) {
+                    return;
+                }
                 ticket.expiresAt = new Date(now + TICKET_TTL_MS).toISOString();
+                // Withdrawn between the check and the write: do not recreate it.
+                if (!this.tickets.has(key)) {
+                    return;
+                }
                 await writeFile(
                     this.ticketPath(ticket.deviceId, ticket.ticketId),
                     `${JSON.stringify(ticket)}\n`,

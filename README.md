@@ -234,6 +234,12 @@ across sessions and across separate extension processes:
   the queue.
 - Holders and tickets carry a heartbeat and process id. A session that crashes while
   holding a device is reclaimed rather than blocking everyone behind it.
+- Each acquisition carries a token, and renewal, release and stale cleanup all check
+  it. A write still in flight from a hold that has since been given up cannot
+  resurrect it or overwrite the session that took the device next.
+- A device is given up when the last reason to hold it goes. Control leases are
+  meant to lapse rather than be released, so a lapsed lease frees the device — but
+  not while a build this session started is still installing.
 
 The queue is cooperative in the same way claims are: it coordinates sessions running
 this extension, not other tools on the machine.

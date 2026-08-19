@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, constants } from "node:fs/promises";
 import { AppError } from "./errors.mjs";
 import {
@@ -73,6 +74,13 @@ export class DeviceSessionManager {
         this.buildPlan = null;
         // Whether another session holds a device, cached so snapshots stay synchronous.
         this.sharingCache = new Map();
+        // Reasons this session is holding each device. The device is only given up
+        // when the last one goes, so a lease lapsing mid-build cannot hand the
+        // device to another session while Gradle is still installing.
+        this.holdRefs = new Map();
+        this.state.onLeaseExpired = (deviceId) => {
+            void this.onLeaseExpired(deviceId);
+        };
         this.foreignClaimCache = new Map();
         this.foreignCaptureCache = new Map();
         this.foreignCaptureCheckedAt = 0;
@@ -222,36 +230,83 @@ export class DeviceSessionManager {
         return sharing;
     }
 
+    /** Records another reason this session is holding a device. */
+    addHoldRef(deviceId, ref) {
+        const refs = this.holdRefs.get(deviceId) ?? new Set();
+        refs.add(ref);
+        this.holdRefs.set(deviceId, refs);
+    }
+
+    /** Gives the device up once nothing is holding it any more. */
+    async dropHoldRef(deviceId, ref) {
+        const refs = this.holdRefs.get(deviceId);
+        if (!refs) {
+            return;
+        }
+        refs.delete(ref);
+        if (refs.size > 0) {
+            return;
+        }
+        this.holdRefs.delete(deviceId);
+        await this.queue.release(deviceId).catch(() => {});
+    }
+
     /**
-     * Runs `fn` with this session holding the device, so a build cannot install
-     * over another session's run. An existing hold from this session is left
-     * alone: releasing it here would strip a lease the agent still depends on.
+     * Takes the device for `ref`, or notes another reason to keep holding one this
+     * session already has.
      */
+    async takeHold(deviceIds, ref, { reason = null, timeoutMs = 0 } = {}) {
+        const candidates = Array.isArray(deviceIds) ? deviceIds : [deviceIds];
+        const alreadyHeld = candidates.find((deviceId) => (this.holdRefs.get(deviceId)?.size ?? 0) > 0);
+        if (alreadyHeld) {
+            this.addHoldRef(alreadyHeld, ref);
+            return { deviceId: alreadyHeld, waitedMs: 0 };
+        }
+
+        const granted = await this.queue.acquire(candidates, { reason, timeoutMs });
+        if (!granted) {
+            return null;
+        }
+        this.addHoldRef(granted.deviceId, ref);
+        return { deviceId: granted.deviceId, waitedMs: granted.waitedMs };
+    }
+
+    busyError(candidates, status) {
+        return new AppError(
+            "device_busy",
+            status?.holder
+                ? `${status.holder.sessionLabel} is using this device` +
+                  `${status.holder.reason ? ` (${status.holder.reason})` : ""}.` +
+                  ` ${status.waiting.length} session(s) waiting. Pass waitSeconds to queue for it.`
+                : "The device could not be taken. Pass waitSeconds to queue for it.",
+            409,
+            { queue: status ?? null },
+        );
+    }
+
+    /** Runs `fn` while this session holds the device, so a build cannot install over another session's run. */
     async withDeviceHold(deviceId, reason, fn) {
-        const [status] = await this.queue.status([deviceId]).catch(() => []);
-        let acquired = false;
-        if (status?.holder?.isMine !== true) {
-            const granted = await this.queue.acquire(deviceId, { reason, timeoutMs: 0 });
-            if (!granted) {
-                const [current] = await this.queue.status([deviceId]);
-                throw new AppError(
-                    "device_busy",
-                    current?.holder
-                        ? `${current.holder.sessionLabel} is using this device` +
-                          `${current.holder.reason ? ` (${current.holder.reason})` : ""}.`
-                        : "The device is in use by another session.",
-                    409,
-                );
-            }
-            acquired = true;
+        const ref = `op:${randomUUID()}`;
+        const held = await this.takeHold(deviceId, ref, { reason, timeoutMs: 0 });
+        if (!held) {
+            const [status] = await this.queue.status([deviceId]).catch(() => []);
+            throw this.busyError([deviceId], status);
         }
         try {
             return await fn();
         } finally {
-            if (acquired) {
-                await this.queue.release(deviceId).catch(() => {});
-            }
+            await this.dropHoldRef(deviceId, ref);
         }
+    }
+
+    /** A lapsed lease must not keep the device from every other session. */
+    async onLeaseExpired(deviceId) {
+        await this.downgradeClaim(deviceId).catch(() => {});
+        await this.dropHoldRef(deviceId, "lease");
+    }
+
+    reportInstallFailure(deviceId, message) {
+        this.build.reportFailure(deviceId, message);
     }
 
     /** Builds the app in this session's working directory, installs it, launches it. */
@@ -761,22 +816,13 @@ export class DeviceSessionManager {
             throw new AppError("no_available_device", "No booted device is available to take.", 409);
         }
 
-        const granted = await this.queue.acquire(candidates, {
+        const granted = await this.takeHold(candidates, "lease", {
             reason: input.reason ?? null,
             timeoutMs: Math.max(0, Math.round((input.waitSeconds ?? 0) * 1000)),
         });
         if (!granted) {
             const [status] = await this.queue.status(candidates);
-            throw new AppError(
-                "device_busy",
-                status?.holder
-                    ? `${status.holder.sessionLabel} is using this device` +
-                      `${status.holder.reason ? ` (${status.holder.reason})` : ""}.` +
-                      ` ${status.waiting.length} session(s) waiting. Pass waitSeconds to queue for it.`
-                    : "The device could not be taken. Pass waitSeconds to queue for it.",
-                409,
-                { queue: status ?? null },
-            );
+            throw this.busyError(candidates, status);
         }
 
         const deviceId = granted.deviceId;
@@ -784,7 +830,7 @@ export class DeviceSessionManager {
         try {
             this.state.reserveLease(leaseInput);
         } catch (error) {
-            await this.queue.release(deviceId);
+            await this.dropHoldRef(deviceId, "lease");
             throw error;
         }
 
@@ -795,7 +841,7 @@ export class DeviceSessionManager {
             return { ...snapshot, waitedMs: granted.waitedMs };
         } catch (error) {
             this.state.cancelLeaseReservation(deviceId, input.ownerInstanceId);
-            await this.queue.release(deviceId);
+            await this.dropHoldRef(deviceId, "lease");
             throw error;
         }
     }
@@ -818,7 +864,7 @@ export class DeviceSessionManager {
         const snapshot = this.state.releaseLease(input);
         await this.downgradeClaim(input.deviceId);
         // Hand the device to whoever is next in line.
-        await this.queue.release(input.deviceId).catch(() => {});
+        await this.dropHoldRef(input.deviceId, "lease");
         return snapshot;
     }
 
@@ -828,7 +874,7 @@ export class DeviceSessionManager {
         const snapshot = this.state.revokeLease(deviceId);
         await this.state.settleActiveOperations(deviceId);
         await this.downgradeClaim(deviceId);
-        await this.queue.release(deviceId).catch(() => {});
+        await this.dropHoldRef(deviceId, "lease");
         return snapshot;
     }
 
@@ -1039,6 +1085,9 @@ export class DeviceSessionManager {
     }
 
     async dispose() {
+        // Stop builds before giving up the device: an orphaned Gradle would keep
+        // installing onto a device another session has just been handed.
+        await this.build.stopAll().catch(() => {});
         await this.video.stopAll().catch(() => {});
         this.input.clearTouchSessions();
         // Never leave a device taken, or a queue blocked, by a session that has exited.

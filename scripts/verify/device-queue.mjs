@@ -106,8 +106,56 @@ report.assert(pooledResult?.deviceId === "emulator-two", "a pooled waiter takes 
 await a.release("emulator-two");
 await holderOne.release("emulator-one");
 
+// --- a renewal in flight must not resurrect a hold we gave up --------------------
+// The heartbeat rewrites the holder file. If it can write after a release, it
+// recreates a hold nobody owns, and the device is blocked until that process exits.
+const beater = session("BEAT", "beating");
+await beater.acquire(DEVICE, { reason: "will release mid-beat", timeoutMs: 0 });
+const inFlight = beater.beat();
+await beater.release(DEVICE);
+await inFlight;
+await beater.beat();
+const afterBeat = (await a.status([DEVICE]))[0];
+report.assert(!afterBeat.holder, "a renewal after release does not recreate the hold", JSON.stringify(afterBeat.holder ?? null));
+
+// And a renewal must not overwrite the record of whoever took the device next.
+const firstHolder = session("FIRST", "first-holder");
+const secondHolder = session("SECOND", "second-holder");
+await firstHolder.acquire(DEVICE, { reason: "first", timeoutMs: 0 });
+const staleRecord = firstHolder.held.get(DEVICE);
+await firstHolder.release(DEVICE);
+await secondHolder.acquire(DEVICE, { reason: "second", timeoutMs: 0 });
+firstHolder.held.set(DEVICE, staleRecord); // as if a beat were still queued from before
+await firstHolder.beat();
+const afterStale = (await a.status([DEVICE]))[0];
+report.assert(
+    afterStale.holder?.sessionLabel === "second-holder",
+    "a stale renewal does not overwrite the new holder",
+    String(afterStale.holder?.sessionLabel),
+);
+
+// The same stale owner must not be able to release somebody else's hold.
+await firstHolder.release(DEVICE);
+const afterStaleRelease = (await a.status([DEVICE]))[0];
+report.assert(
+    afterStaleRelease.holder?.sessionLabel === "second-holder",
+    "a stale owner cannot release the new holder's device",
+    String(afterStaleRelease.holder?.sessionLabel),
+);
+await secondHolder.release(DEVICE);
+
 // --- nothing is left behind ----------------------------------------------------
-await Promise.all([a.releaseAll(), b.releaseAll(), c.releaseAll(), jumper.releaseAll(), holderOne.releaseAll(), holderTwo.releaseAll()]);
+await Promise.all([
+    a.releaseAll(),
+    b.releaseAll(),
+    c.releaseAll(),
+    jumper.releaseAll(),
+    holderOne.releaseAll(),
+    holderTwo.releaseAll(),
+    beater.releaseAll(),
+    firstHolder.releaseAll(),
+    secondHolder.releaseAll(),
+]);
 const leftoverTickets = (await readdir(path.join(root, "tickets")).catch(() => [])).length;
 report.assert(leftoverTickets === 0, "no waiting tickets are left behind", `${leftoverTickets} left`);
 

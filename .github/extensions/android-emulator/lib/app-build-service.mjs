@@ -49,6 +49,22 @@ async function readConfig(workingDirectory) {
 async function findApplicationId(gradleRoot, { moduleHint } = {}) {
     const candidates = [];
 
+    // Flavored projects nest as apk/<flavor>/<buildType>/, plain ones as
+    // apk/<buildType>/, so the depth under outputs/apk is not fixed.
+    async function collectMetadata(dir, depth) {
+        if (depth > 3) {
+            return;
+        }
+        const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+            if (entry.isDirectory()) {
+                await collectMetadata(path.join(dir, entry.name), depth + 1);
+            } else if (entry.name === "output-metadata.json") {
+                candidates.push(path.join(dir, entry.name));
+            }
+        }
+    }
+
     async function walk(dir, depth) {
         if (depth > 4) {
             return;
@@ -59,13 +75,7 @@ async function findApplicationId(gradleRoot, { moduleHint } = {}) {
                 continue;
             }
             if (entry.name === "build") {
-                const outputs = path.join(dir, "build", "outputs", "apk");
-                const variants = await readdir(outputs, { withFileTypes: true }).catch(() => []);
-                for (const variant of variants) {
-                    if (variant.isDirectory()) {
-                        candidates.push(path.join(outputs, variant.name, "output-metadata.json"));
-                    }
-                }
+                await collectMetadata(path.join(dir, "build", "outputs", "apk"), 0);
                 continue;
             }
             if (entry.name.startsWith(".") || entry.name === "node_modules") {
@@ -121,6 +131,10 @@ export class AppBuildService {
         this.onDiagnostic = onDiagnostic ?? (() => {});
         this.workingDirectory = process.cwd();
         this.runs = new Map();
+        // Two devices share one project tree, so Gradle runs are serialised by
+        // project rather than by device: concurrent builds of the same tree fight
+        // over the same outputs.
+        this.projectLocks = new Map();
     }
 
     setWorkingDirectory(workingDirectory) {
@@ -167,11 +181,52 @@ export class AppBuildService {
         };
     }
 
+    /** Records a refusal that happened before a run started, so the canvas shows it. */
+    reportFailure(deviceId, message) {
+        this.runs.set(deviceId, {
+            state: "failed",
+            step: "done",
+            message,
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString(),
+            command: null,
+            log: [],
+        });
+        this.publish(deviceId);
+    }
+
     async buildInstallLaunch({ deviceId, task: taskOverride, launch = true } = {}) {
         if (this.isRunning(deviceId)) {
             throw new AppError("build_in_progress", "A build is already running for this device.", 409);
         }
 
+        // Claimed before the first await: two clicks in quick succession would
+        // otherwise both get past the check above and run Gradle twice.
+        const run = {
+            state: "running",
+            step: "prepare",
+            message: "Preparing the build",
+            startedAt: new Date().toISOString(),
+            command: null,
+            log: [],
+            child: null,
+        };
+        this.runs.set(deviceId, run);
+        this.publish(deviceId);
+
+        try {
+            return await this.runBuild({ deviceId, run, taskOverride, launch });
+        } catch (error) {
+            run.state = "failed";
+            run.step = "done";
+            run.finishedAt = new Date().toISOString();
+            run.message = error.message;
+            this.publish(deviceId);
+            throw error instanceof AppError ? error : new AppError("build_failed", error.message, 502);
+        }
+    }
+
+    async runBuild({ deviceId, run, taskOverride, launch }) {
         const plan = await this.describe();
         if (!plan.available) {
             throw new AppError("gradle_not_found", plan.reason, 404);
@@ -181,16 +236,20 @@ export class AppBuildService {
         const task = taskOverride ?? plan.task;
         const gradle = await findGradleRoot(this.workingDirectory);
 
-        const run = {
-            state: "running",
-            step: "build",
-            message: `Running ${task}`,
-            startedAt: new Date().toISOString(),
-            command: `./gradlew ${task}`,
-            log: [],
-        };
-        this.runs.set(deviceId, run);
+        run.step = "build";
+        run.message = `Running ${task}`;
+        run.command = `./gradlew ${task}`;
         this.publish(deviceId);
+
+        const previous = this.projectLocks.get(gradle.root) ?? Promise.resolve();
+        let releaseProject;
+        this.projectLocks.set(
+            gradle.root,
+            previous.then(() => new Promise((resolve) => {
+                releaseProject = resolve;
+            })),
+        );
+        await previous.catch(() => {});
 
         const append = (line) => {
             const text = line.trimEnd();
@@ -209,7 +268,7 @@ export class AppBuildService {
         };
 
         try {
-            await this.runGradle({ gradle, task, serial: device.serial, onLine: append, log: run.log });
+            await this.runGradle({ gradle, task, serial: device.serial, onLine: append, log: run.log, run });
 
             run.step = "launch";
             run.message = "Resolving the installed app";
@@ -234,23 +293,49 @@ export class AppBuildService {
             run.finishedAt = new Date().toISOString();
             this.publish(deviceId);
             return this.statusFor(deviceId);
-        } catch (error) {
-            run.state = "failed";
-            run.step = "done";
-            run.finishedAt = new Date().toISOString();
-            run.message = error.message;
-            this.publish(deviceId);
-            throw error instanceof AppError ? error : new AppError("build_failed", error.message, 502);
+        } finally {
+            releaseProject?.();
         }
     }
 
-    runGradle({ gradle, task, serial, onLine, log }) {
+    /** Stops any Gradle this session started, so a reload cannot install onto a device it no longer holds. */
+    async stopAll() {
+        const running = Array.from(this.runs.values()).filter((run) => run.state === "running" && run.child);
+        await Promise.all(
+            running.map(
+                (run) =>
+                    new Promise((resolve) => {
+                        const child = run.child;
+                        if (!child || child.exitCode !== null) {
+                            resolve();
+                            return;
+                        }
+                        const done = setTimeout(() => {
+                            child.kill("SIGKILL");
+                            resolve();
+                        }, 5_000);
+                        done.unref?.();
+                        child.once("close", () => {
+                            clearTimeout(done);
+                            resolve();
+                        });
+                        child.kill("SIGTERM");
+                    }),
+            ),
+        );
+    }
+
+    runGradle({ gradle, task, serial, onLine, log, run }) {
         return new Promise((resolve, reject) => {
             const child = spawn(gradle.wrapper, [task], {
                 cwd: gradle.root,
                 env: { ...process.env, ANDROID_SERIAL: serial, TERM: "dumb" },
                 stdio: ["ignore", "pipe", "pipe"],
             });
+
+            if (run) {
+                run.child = child;
+            }
 
             let pending = "";
             const consume = (chunk) => {

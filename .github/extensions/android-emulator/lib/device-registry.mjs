@@ -170,6 +170,9 @@ export class DeviceRegistry {
             device.leaseTimer = null;
         }
         device.lease = null;
+        // Leases are meant to lapse without being released, so anything held on a
+        // lease's behalf outside this process has to be let go here too.
+        this.onLeaseExpired?.(device.id);
     }
 
     scheduleLeaseExpiry(device) {

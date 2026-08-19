@@ -133,6 +133,26 @@ report.assert(
 const remaining = (await readdir(root)).filter((name) => name.includes("session-dead"));
 report.assert(remaining.length === 0, "the stale claim file is cleaned up", `${remaining.length} left`);
 
+// --- a lease that simply lapses must free the device --------------------------
+// Leases are designed to expire without being released, so expiry has to give up
+// the cross-session hold too. Otherwise letting a lease run out blocks every
+// other session for as long as this process lives.
+const lapsing = await manager.acquireLease({ deviceId, reason: "will lapse", ownerInstanceId: "a", ttlSeconds: 2 });
+const ttlMs = new Date(lapsing.lease.expiresAt).getTime() - Date.now();
+report.assert(ttlMs < 20_000, "the lease is short enough to observe expiring", `${Math.round(ttlMs / 1000)}s`);
+
+const heldWhileLeased = (await manager.queue.status([deviceId]))[0];
+report.assert(heldWhileLeased.holder?.isMine === true, "the device is held while the lease is active");
+
+await new Promise((resolve) => setTimeout(resolve, ttlMs + 2_000));
+report.assert(manager.snapshot(deviceId).lease.active === false, "the lease has lapsed");
+const afterLapse = (await manager.queue.status([deviceId]))[0];
+report.assert(!afterLapse.holder, "a lapsed lease releases the device for other sessions", JSON.stringify(afterLapse.holder ?? null));
+
+const takenAfterLapse = await otherQueue.acquire(deviceId, { reason: "after lapse", timeoutMs: 2_000 });
+report.assert(takenAfterLapse?.deviceId === deviceId, "another session can take the device after a lease lapses");
+await otherQueue.releaseAll();
+
 // --- capture started outside the extension entirely ---------------------------
 // Claims only reveal sessions that publish one. Android Studio, scrcpy or a plain
 // adb command publish nothing, which is exactly when "is it free?" matters.

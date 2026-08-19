@@ -422,9 +422,12 @@ export async function createCanvasServer({
                 // Deliberately not awaited: a Gradle build can take minutes, and the
                 // canvas follows its progress over SSE rather than a hanging request.
                 const target = requireDevice();
-                void manager
-                    .buildInstallLaunch({ deviceId: target, task: body?.task })
-                    .catch((error) => diagnostic(`install failed: ${error.message}`));
+                void manager.buildInstallLaunch({ deviceId: target, task: body?.task }).catch((error) => {
+                    diagnostic(`install failed: ${error.message}`);
+                    // A refusal happens before any run exists, so record it or the
+                    // canvas would show nothing at all after the click.
+                    manager.reportInstallFailure(target, error.message);
+                });
                 json(res, 202, { started: true });
                 return;
             }
@@ -609,14 +612,9 @@ export async function createCanvasServer({
             deviceId = nextDeviceId;
             acceptingManualInput = true;
             subscribeToDevice();
-
-    // Another session taking or freeing the device happens outside this process,
-    // so it can only be noticed by looking. Cheap: one small file read.
-    const sharingTimer = setInterval(() => {
-        void manager.refreshSharing(deviceId).catch(() => {});
-    }, 6_000);
-    sharingTimer.unref?.();
-    void manager.refreshSharing(deviceId).catch(() => {});
+            // The existing poller reads the current deviceId, so switching device
+            // needs one immediate refresh, not a second interval.
+            void manager.refreshSharing(deviceId).catch(() => {});
             writeStateEvent();
         },
         async close() {
