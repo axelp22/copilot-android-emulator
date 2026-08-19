@@ -28,10 +28,27 @@ copilot plugin install android-emulator@copilot-android-emulator
 ```
 
 Restart GitHub Copilot afterwards. A newly installed plugin's extensions are picked
-up when the app next starts, so reloading extensions is not enough on its own.
+up when the app next starts, so reloading extensions is **not** enough on its own --
+the plugin will show as installed and enabled while its canvas is still missing.
 
-Update it later with `copilot plugin update android-emulator`, and remove it with
-`copilot plugin uninstall android-emulator`.
+To confirm it loaded, run `/extensions` in Copilot after restarting, or ask it to list
+extensions. The entry is sourced from `plugin:`. Seeing more than one entry for this
+canvas means it is installed more than one way; see below.
+
+Keeping it current is the reason to prefer this route:
+
+```sh
+copilot plugin update android-emulator     # pull the latest from main
+copilot plugin uninstall android-emulator  # remove it
+```
+
+A manual copy is a snapshot and goes stale silently, so it has to be re-copied by
+hand every time this repository changes. If you installed it that way first, remove
+the copy once the plugin is confirmed working:
+
+```sh
+rm -rf ~/.copilot/extensions/android-emulator
+```
 
 The plugin ships one copy of the extension: `extensions/android-emulator/` is a shim
 that loads the canonical source under `.github/extensions/`, so a marketplace install
