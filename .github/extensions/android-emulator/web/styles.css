@@ -1,3 +1,19 @@
+/*
+ * Hides the shell until app.js has painted the first real state. This lived in an
+ * inline <style> in index.html; it moved here so the page can carry a strict
+ * `style-src 'self'` Content-Security-Policy with no inline exemption. Both this
+ * sheet and the old inline block are render-blocking in <head>, so there is no
+ * change to when the rule takes effect.
+ */
+html.awaiting-initial-paint,
+html.awaiting-initial-paint body {
+    background: transparent;
+}
+
+html.awaiting-initial-paint .shell {
+    visibility: hidden;
+}
+
 :root {
     color-scheme: light dark;
     --device-host-background: var(--background-color-default, light-dark(#ffffff, #0d1117));

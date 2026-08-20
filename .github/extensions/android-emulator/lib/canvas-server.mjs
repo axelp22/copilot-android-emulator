@@ -110,6 +110,13 @@ export async function createCanvasServer({
     const token = randomBytes(18).toString("hex");
     const basePath = `/${token}`;
     const sseClients = new Set();
+    /**
+     * SSE clients whose socket is full. A reader that stops draining would
+     * otherwise accumulate one buffered event per device change, without bound.
+     * This stream only ever conveys current state, so a saturated client is
+     * skipped and sent the latest state once it drains.
+     */
+    const saturatedClients = new Set();
     const streamChildren = new Set();
     const touchConnections = new Set();
     const manualOperations = new Set();
@@ -128,11 +135,32 @@ export async function createCanvasServer({
         onDiagnostic?.(`${context}: ${error?.message ?? String(error)}`);
     }
 
-    function writeStateEvent() {
+    function stateEventPayload() {
         const state = deviceId ? formatPublicState(manager.snapshot(deviceId)) : unassignedState();
-        const payload = `data: ${JSON.stringify(state)}\n\n`;
+        return `data: ${JSON.stringify(state)}\n\n`;
+    }
+
+    function writeStateEventTo(client, payload) {
+        if (saturatedClients.has(client) || client.destroyed || client.writableEnded) {
+            return;
+        }
+        if (client.write(payload) !== false) {
+            return;
+        }
+        saturatedClients.add(client);
+        client.once("drain", () => {
+            saturatedClients.delete(client);
+            // Send what is true now, not the event that was skipped.
+            if (sseClients.has(client)) {
+                writeStateEventTo(client, stateEventPayload());
+            }
+        });
+    }
+
+    function writeStateEvent() {
+        const payload = stateEventPayload();
         for (const client of sseClients) {
-            safeWrite(client, payload);
+            writeStateEventTo(client, payload);
         }
     }
 
@@ -313,6 +341,7 @@ export async function createCanvasServer({
                 const cleanup = () => {
                     clearInterval(heartbeat);
                     sseClients.delete(res);
+                    saturatedClients.delete(res);
                 };
                 req.on("close", cleanup);
                 res.on("close", cleanup);
@@ -679,6 +708,7 @@ export async function createCanvasServer({
                 client.end();
             }
             sseClients.clear();
+            saturatedClients.clear();
             await stopActiveConnections({ blockManualInput: true });
             await new Promise((resolve) => server.close(() => resolve()));
         },

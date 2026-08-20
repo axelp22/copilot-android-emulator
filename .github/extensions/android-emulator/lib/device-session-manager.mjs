@@ -495,6 +495,15 @@ export class DeviceSessionManager {
         this.discoveryInFlight = (async () => {
             const discovered = await this.discoverDevices();
             this.state.updateFromList(discovered);
+            // A restarted AVD keeps its serial but gets a new pid, gRPC port and
+            // key directory, so a cached control channel for it now points at a
+            // dead endpoint. This is the discovery path that invalidation was
+            // written for; it is a no-op for serials with no cached connection.
+            await Promise.all(
+                discovered
+                    .filter((device) => device.serial)
+                    .map((device) => this.controlPool.invalidateIfReplaced(device.serial).catch(() => {})),
+            );
             this.lastDiscovery = discovered;
             this.discoveryCompletedAt = Date.now();
             return discovered;

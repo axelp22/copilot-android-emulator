@@ -217,6 +217,7 @@ function render() {
     }
 
     const leaseActive = state.lease?.active === true;
+    syncLeaseTicker(leaseActive);
     const controlUnavailable = leaseActive || state.controlPending === true;
     // Another Copilot session holds the device, so the server refuses manual input
     // too. Reflect that here rather than letting every click return an error.
@@ -687,12 +688,20 @@ function bindScreenStatus() {
     });
 }
 
-function startLeaseTicker() {
-    setInterval(() => {
-        if (state?.lease?.active) {
-            render();
-        }
-    }, 1000);
+/**
+ * The lease countdown is the only thing on screen that changes without a server
+ * event, so the ticker runs only while a lease is actually counting down rather
+ * than for the lifetime of the page.
+ */
+let leaseTicker = null;
+
+function syncLeaseTicker(leaseActive) {
+    if (leaseActive && leaseTicker === null) {
+        leaseTicker = setInterval(render, 1000);
+    } else if (!leaseActive && leaseTicker !== null) {
+        clearInterval(leaseTicker);
+        leaseTicker = null;
+    }
 }
 
 function bindResize() {
@@ -751,7 +760,6 @@ async function init() {
         await loadState();
         await devicePicker.refresh();
         connectEvents();
-        startLeaseTicker();
         reconnectStream();
     } catch (error) {
         setNotice(error.message ?? String(error), true);
