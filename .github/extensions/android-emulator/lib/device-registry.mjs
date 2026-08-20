@@ -172,7 +172,7 @@ export class DeviceRegistry {
         device.lease = null;
         // Leases are meant to lapse without being released, so anything held on a
         // lease's behalf outside this process has to be let go here too.
-        this.onLeaseExpired?.(device.id);
+        this.onLeaseDropped?.(device.id);
     }
 
     scheduleLeaseExpiry(device) {
@@ -275,12 +275,20 @@ export class DeviceRegistry {
             return;
         }
         device.instanceIds.delete(instanceId);
-        if (device.leaseReservation?.ownerInstanceId === instanceId) {
+        const droppedReservation = device.leaseReservation?.ownerInstanceId === instanceId;
+        if (droppedReservation) {
             device.leaseReservation = null;
         }
-        if (device.lease && device.lease.ownerInstanceId === instanceId) {
+        const droppedLease = Boolean(device.lease && device.lease.ownerInstanceId === instanceId);
+        if (droppedLease) {
             device.lease = null;
             this.scheduleLeaseExpiry(device);
+        }
+        if (droppedLease || droppedReservation) {
+            // The canvas that owned the lease is gone, so nothing will ever release
+            // it. Without this the device stays taken from every other session until
+            // this one exits.
+            this.onLeaseDropped?.(device.id);
         }
         this.notify(deviceId);
     }

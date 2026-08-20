@@ -31,7 +31,8 @@ node scripts/verify/stream-decode.mjs          # aspect ratio + ffprobe decodabi
 node scripts/verify/stream-lifecycle.mjs       # repeated start/stop leaves no orphaned recorders
 node scripts/verify/recording-coexistence.mjs  # recording does not disturb the live stream
 node scripts/verify/cross-session-claims.mjs   # cross-session claims, refusal and queueing
-node scripts/verify/device-queue.mjs           # FIFO queue semantics (no device needed)
+node scripts/verify/device-queue.mjs         # FIFO queue semantics (no device needed)
+node scripts/verify/lease-holds.mjs          # lease and cross-session hold lifetimes (no device needed)
 node scripts/verify/app-install.mjs            # build, install and launch, and its refusals
 node scripts/verify/boot-lifecycle.mjs         # cold boot and shutdown of an AVD (slow)
 ```

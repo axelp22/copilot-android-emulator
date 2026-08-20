@@ -96,6 +96,15 @@ function agentControlUnavailable(currentState = state) {
     return currentState?.lease?.active === true || currentState?.controlPending === true;
 }
 
+/**
+ * Whether the server would refuse manual input. Broader than an agent lease: it
+ * also covers another Copilot session holding the device. Kept separate so that
+ * switching to a different device stays available precisely when this one is busy.
+ */
+function manualInputBlocked(currentState = state) {
+    return agentControlUnavailable(currentState) || currentState?.sharing?.heldByOtherSession === true;
+}
+
 function hydrateIcons() {
     for (const button of document.querySelectorAll("[data-icon]")) {
         button.innerHTML = renderIcon(button.dataset.icon);
@@ -209,6 +218,9 @@ function render() {
 
     const leaseActive = state.lease?.active === true;
     const controlUnavailable = leaseActive || state.controlPending === true;
+    // Another Copilot session holds the device, so the server refuses manual input
+    // too. Reflect that here rather than letting every click return an error.
+    const heldElsewhere = state.sharing?.heldByOtherSession === true;
     const booted = state.state === "Booted";
     const booting = state.state === "Booting";
     const unassigned = state.state === "Unassigned";
@@ -220,7 +232,7 @@ function render() {
     applyDeviceMetrics(frameElements, state.screen, state.deviceFamily);
     requestAnimationFrame(() => fitDeviceFrame(frameElements));
 
-    const disabled = pending || controlUnavailable;
+    const disabled = pending || controlUnavailable || heldElsewhere;
     for (const [name, button] of Object.entries(toolbarButtons)) {
         if (button) {
             button.disabled = disabled || !booted;
@@ -230,7 +242,7 @@ function render() {
             button.title = manageable ? "Stop emulator" : "Physical devices are never shut down by this extension";
         }
     }
-    renderInstallButton(state, booted, disabled);
+    renderInstallButton(state, booted, pending || controlUnavailable);
 
     const copy = poweredOffCopy();
     elements.poweredOffTitle.textContent = copy.title;
@@ -241,7 +253,7 @@ function render() {
     elements.streamResolution.disabled = disabled || !booted;
     elements.streamFps.value = String(state.stream?.fps ?? 60);
     elements.streamResolution.value = String(state.stream?.resolution ?? 100);
-    if (disabled) {
+    if (controlUnavailable) {
         devicePicker.close();
     }
     devicePicker.render();
@@ -714,7 +726,7 @@ const inputController = createInputController({
     apiUrl,
     fetchJson,
     getState: () => state,
-    isControlUnavailable: agentControlUnavailable,
+    isControlUnavailable: manualInputBlocked,
     setNotice,
     setState: (nextState) => {
         state = nextState;

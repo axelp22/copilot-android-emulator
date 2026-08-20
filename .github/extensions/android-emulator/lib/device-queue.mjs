@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { defaultQueueRoot } from "./device-claims.mjs";
+import { isLive, readRecord, safeName, writeRecordAtomic } from "./fs-coordination.mjs";
 
 /**
  * A cross-session FIFO for devices.
@@ -25,30 +26,6 @@ const POLL_INTERVAL_MS = 1_000;
 /** Two reads of the same acquisition, rather than a replacement. */
 function sameRecord(a, b) {
     return a.token && b.token ? a.token === b.token : a.acquiredAt === b.acquiredAt && a.sessionId === b.sessionId;
-}
-
-function safeName(value) {
-    return String(value).replace(/[^A-Za-z0-9._-]/g, "_");
-}
-
-function processAlive(pid) {
-    if (!Number.isInteger(pid)) {
-        return false;
-    }
-    try {
-        process.kill(pid, 0);
-        return true;
-    } catch (error) {
-        return error?.code === "EPERM";
-    }
-}
-
-function isLive(record) {
-    if (!record) {
-        return false;
-    }
-    const expiresAt = record.expiresAt ? new Date(record.expiresAt).getTime() : 0;
-    return expiresAt > Date.now() && processAlive(record.pid);
 }
 
 export class DeviceQueue {
@@ -91,25 +68,24 @@ export class DeviceQueue {
     }
 
     async readJson(file) {
-        try {
-            return JSON.parse(await readFile(file, "utf8"));
-        } catch {
-            return null;
-        }
+        return (await readRecord(file)).record;
     }
 
     /** Current holder of a device, or null when it is free. Reclaims dead holders. */
     async holderOf(deviceId) {
         const file = this.holderPath(deviceId);
-        const record = await this.readJson(file);
+        const { status, record } = await readRecord(file);
         if (!record) {
-            return null;
+            // An unreadable record is not an absent one. Reporting the device free
+            // on a torn read would let a second session believe it can take a
+            // device somebody already holds.
+            return status === "unreadable" ? { deviceId, unreadable: true } : null;
         }
         if (!isLive(record)) {
             // Re-read before deleting: between the read and the unlink another
             // session may have taken the device, and removing their holder would
             // hand the same device to two sessions.
-            const current = await this.readJson(file);
+            const current = (await readRecord(file)).record;
             if (current && sameRecord(current, record) && !isLive(current)) {
                 await unlink(file).catch(() => {});
             }
@@ -130,7 +106,12 @@ export class DeviceQueue {
         await Promise.all(
             names.map(async (name) => {
                 const file = path.join(this.ticketsDir, name);
-                const record = await this.readJson(file);
+                const { status, record } = await readRecord(file);
+                if (status === "unreadable") {
+                    // Being rewritten by its owner's heartbeat, or truncated. Deleting
+                    // it here would silently cost a live session its place in line.
+                    return;
+                }
                 if (!isLive(record)) {
                     await unlink(file).catch(() => {});
                     return;
@@ -142,12 +123,16 @@ export class DeviceQueue {
         return live;
     }
 
-    async enqueue(deviceId, { reason = null, ticketId = randomUUID() } = {}) {
+    async enqueue(deviceId, { reason = null, ticketId = randomUUID(), candidates = [deviceId] } = {}) {
         await this.ensureDirs();
         const record = {
             deviceId,
             ticketId,
             reason,
+            // Every device this ticket would accept. A waiter for "any" device sits
+            // at the head of several queues but will consume exactly one, so others
+            // need to know it is not really blocked on this particular device.
+            candidates,
             sessionId: this.owner.sessionId,
             sessionLabel: this.owner.sessionLabel,
             pid: this.owner.pid,
@@ -155,7 +140,7 @@ export class DeviceQueue {
             expiresAt: new Date(Date.now() + TICKET_TTL_MS).toISOString(),
         };
         this.tickets.set(`${deviceId}:${ticketId}`, record);
-        await writeFile(this.ticketPath(deviceId, ticketId), `${JSON.stringify(record)}\n`, "utf8");
+        await writeRecordAtomic(this.ticketPath(deviceId, ticketId), record);
         this.startHeartbeat();
         return record;
     }
@@ -163,6 +148,36 @@ export class DeviceQueue {
     async dropTicket(deviceId, ticketId) {
         this.tickets.delete(`${deviceId}:${ticketId}`);
         await unlink(this.ticketPath(deviceId, ticketId)).catch(() => {});
+    }
+
+    /**
+     * Whether an older waiter genuinely needs *this* device, or is a request for
+     * "any" device that another free device can satisfy just as well.
+     *
+     * Without this, one pooled waiter sitting at the head of every queue reserves
+     * the entire pool while it can only ever consume one device, and sessions
+     * asking for a specific free device wait behind a ticket that will never take it.
+     *
+     * "Free" is not enough on its own: a device this waiter cannot actually take,
+     * because an older waiter is queued ahead of it there, is not an alternative.
+     * Treating it as one lets younger waiters overtake the oldest one on every
+     * device it named, and it starves. When in doubt this answers yes, which is
+     * just the strict first-come ordering we would have had anyway.
+     */
+    async blocksThisDevice(ticket, deviceId) {
+        const alternatives = (ticket.candidates ?? [ticket.deviceId]).filter((candidate) => candidate !== deviceId);
+        for (const candidate of alternatives) {
+            if (await this.holderOf(candidate)) {
+                continue;
+            }
+            const [next] = await this.waitersFor(candidate);
+            if (!next || next.ticketId === ticket.ticketId) {
+                // Free, and this waiter is first in line for it, so it will take
+                // that one instead and is not waiting on this device.
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -178,10 +193,14 @@ export class DeviceQueue {
         }
 
         const waiters = await this.waitersFor(deviceId);
-        const next = waiters[0];
-        if (next && next.ticketId !== ticketId) {
-            // Someone asked first; taking it now would jump the queue.
-            return { granted: false, holder: null, blockedBy: next };
+        for (const waiter of waiters) {
+            if (waiter.ticketId === ticketId) {
+                break;
+            }
+            if (await this.blocksThisDevice(waiter, deviceId)) {
+                // Someone asked first; taking it now would jump the queue.
+                return { granted: false, holder: null, blockedBy: waiter };
+            }
         }
 
         const record = {
@@ -235,7 +254,7 @@ export class DeviceQueue {
         }
 
         const ticketId = randomUUID();
-        await Promise.all(candidates.map((deviceId) => this.enqueue(deviceId, { reason, ticketId })));
+        await Promise.all(candidates.map((deviceId) => this.enqueue(deviceId, { reason, ticketId, candidates })));
         const startedAt = Date.now();
 
         try {
@@ -271,7 +290,13 @@ export class DeviceQueue {
     async release(deviceId) {
         const record = this.held.get(deviceId);
         this.held.delete(deviceId);
-        const holder = await this.readJson(this.holderPath(deviceId));
+        const { status, record: holder } = await readRecord(this.holderPath(deviceId));
+        if (status === "unreadable") {
+            // Caught mid-rewrite. Deleting it would free a device whose owner we
+            // could not identify, which is the very thing the sentinel in holderOf
+            // exists to prevent.
+            return false;
+        }
         // Only the owning session may release, or a crashed session's leftovers.
         if (holder && holder.sessionId !== this.owner.sessionId && isLive(holder)) {
             return false;
@@ -306,9 +331,11 @@ export class DeviceQueue {
                     deviceId,
                     holder: holder
                         ? {
-                              sessionLabel: holder.sessionLabel,
-                              reason: holder.reason,
-                              acquiredAt: holder.acquiredAt,
+                              // A torn read means somebody holds it but the record was
+                              // mid-rewrite; say so rather than naming a phantom session.
+                              sessionLabel: holder.unreadable ? "another session" : holder.sessionLabel,
+                              reason: holder.reason ?? null,
+                              acquiredAt: holder.acquiredAt ?? null,
                               isMine: holder.sessionId === this.owner.sessionId,
                           }
                         : null,
@@ -354,7 +381,7 @@ export class DeviceQueue {
                     return;
                 }
                 record.expiresAt = new Date(now + HOLDER_TTL_MS).toISOString();
-                await writeFile(this.holderPath(deviceId), `${JSON.stringify(record)}\n`, "utf8").catch(() => {});
+                await writeRecordAtomic(this.holderPath(deviceId), record).catch(() => {});
             }),
             ...Array.from(this.tickets.values()).map(async (ticket) => {
                 const key = `${ticket.deviceId}:${ticket.ticketId}`;
@@ -366,11 +393,7 @@ export class DeviceQueue {
                 if (!this.tickets.has(key)) {
                     return;
                 }
-                await writeFile(
-                    this.ticketPath(ticket.deviceId, ticket.ticketId),
-                    `${JSON.stringify(ticket)}\n`,
-                    "utf8",
-                ).catch(() => {});
+                await writeRecordAtomic(this.ticketPath(ticket.deviceId, ticket.ticketId), ticket).catch(() => {});
             }),
         ]);
     }

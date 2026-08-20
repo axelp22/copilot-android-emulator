@@ -1,6 +1,7 @@
-import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isLive, readRecord, safeName, writeRecordAtomic } from "./fs-coordination.mjs";
 
 /**
  * Control leases live in memory, so they only coordinate the canvases and agents
@@ -28,23 +29,6 @@ export function defaultClaimsRoot() {
  */
 export function defaultQueueRoot() {
     return path.join(os.homedir(), ".copilot", "android-emulator", "queue");
-}
-
-function safeName(value) {
-    return String(value).replace(/[^A-Za-z0-9._-]/g, "_");
-}
-
-function processAlive(pid) {
-    if (!Number.isInteger(pid)) {
-        return false;
-    }
-    try {
-        // Signal 0 tests for existence without touching the process.
-        process.kill(pid, 0);
-        return true;
-    } catch (error) {
-        return error?.code === "EPERM";
-    }
 }
 
 export class DeviceClaimStore {
@@ -118,7 +102,7 @@ export class DeviceClaimStore {
             updatedAt: new Date().toISOString(),
             expiresAt: new Date(Date.now() + CLAIM_TTL_MS).toISOString(),
         };
-        await writeFile(this.filePath(deviceId), `${JSON.stringify(payload)}\n`, "utf8");
+        await writeRecordAtomic(this.filePath(deviceId), payload);
     }
 
     ensureHeartbeat() {
@@ -148,23 +132,20 @@ export class DeviceClaimStore {
             return byDevice;
         }
 
-        const now = Date.now();
         await Promise.all(
             entries
                 .filter((name) => name.endsWith(".json"))
                 .map(async (name) => {
                     const file = path.join(this.root, name);
-                    let claim;
-                    try {
-                        claim = JSON.parse(await readFile(file, "utf8"));
-                    } catch {
+                    const { status, record: claim } = await readRecord(file);
+                    if (status !== "ok") {
+                        // Missing, or caught mid-rewrite. Not evidence of anything.
                         return;
                     }
                     if (claim.sessionId === this.owner.sessionId) {
                         return;
                     }
-                    const expired = !claim.expiresAt || new Date(claim.expiresAt).getTime() < now;
-                    if (expired || !processAlive(claim.pid)) {
+                    if (!isLive(claim)) {
                         // The owning session is gone; do not let it hold the device forever.
                         await unlink(file).catch(() => {});
                         return;

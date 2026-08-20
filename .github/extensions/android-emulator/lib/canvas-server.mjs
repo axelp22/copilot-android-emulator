@@ -47,6 +47,30 @@ function enforceNoAgentLease(state) {
     }
 }
 
+/**
+ * Devices are exclusive across Copilot sessions, and manual input is no less
+ * disruptive than an agent's. Refusing here keeps a person from tapping through
+ * a device another session's agent is driving, which used to be allowed while
+ * that agent's own tools were refused.
+ *
+ * This is advisory, not exclusive: it reads a cache refreshed on a timer, so a
+ * session taking the device mid-interaction is noticed within a few seconds
+ * rather than instantly. Routes that mutate the device for longer (install,
+ * lifecycle) take a real hold instead and do not need this.
+ */
+function enforceNotHeldElsewhere(state) {
+    const sharing = state?.sharing;
+    if (!sharing?.heldByOtherSession) {
+        return;
+    }
+    throw new AppError(
+        "device_busy",
+        `${sharing.holderLabel ?? "Another session"} is using this device` +
+            `${sharing.holderReason ? ` (${sharing.holderReason})` : ""}. Wait for it to finish.`,
+        409,
+    );
+}
+
 function streamFpsFrom(value, fallback = 60) {
     const parsed = Number(value ?? fallback);
     return parsed === 30 ? 30 : 60;
@@ -407,7 +431,8 @@ export async function createCanvasServer({
             }
 
             const target = requireDevice();
-            enforceNoAgentLease(manager.getCachedDeviceState(target));
+            const targetState = manager.getCachedDeviceState(target);
+            enforceNoAgentLease(targetState);
 
             const toolbarRoutes = {
                 "/api/toolbar/boot": () => manager.bootDevice(target),
@@ -462,11 +487,13 @@ export async function createCanvasServer({
                 "/api/input/text": () => manager.sendText({ deviceId: target, ...body }),
             };
             if (Object.hasOwn(inputRoutes, route)) {
+                enforceNotHeldElsewhere(targetState);
                 json(res, 200, await runManualOperation(inputRoutes[route]));
                 return;
             }
 
             if (route === "/api/input/touch") {
+                enforceNotHeldElsewhere(targetState);
                 const result = await runManualOperation(async () => {
                     const outcome = await manager.touch({ deviceId: target, ...body });
                     fallbackTouchActive = !(body?.phase === "up" || body?.phase === "cancel");
@@ -520,7 +547,9 @@ export async function createCanvasServer({
                     throw new AppError("manual_input_stopped", "Manual device input is no longer active.", 409);
                 }
                 const target = requireDevice();
-                enforceNoAgentLease(manager.getCachedDeviceState(target));
+                const targetState = manager.getCachedDeviceState(target);
+                enforceNoAgentLease(targetState);
+                enforceNotHeldElsewhere(targetState);
                 await manager.prepareTouchStream(target);
 
                 const key = req.headers["sec-websocket-key"];
