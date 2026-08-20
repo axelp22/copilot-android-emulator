@@ -3,7 +3,14 @@ import { PassThrough } from "node:stream";
 import { AppError } from "./errors.mjs";
 import { adb, screencapPng, spawnAdb } from "./adb.mjs";
 
-/** Wire tags shared with `web/h264-stream.js`. */
+/**
+ * Wire tags shared with `web/h264-stream.js`.
+ *
+ * `seed` carries a complete PNG still. The mirror uses it to paint before the
+ * first keyframe and to refresh an idle screen; the emulator's gRPC transport
+ * uses it for *every* frame, which is why a stream may legitimately consist of
+ * nothing but seed frames.
+ */
 export const FRAME_TAGS = {
     config: 0x01,
     keyframe: 0x02,
@@ -509,6 +516,8 @@ export async function createH264Stream({
 
     return {
         stdout,
+        /** Continuously encoded video, so a gap in frames means something is wrong. */
+        transport: "mirror",
         get killed() {
             return stopped;
         },

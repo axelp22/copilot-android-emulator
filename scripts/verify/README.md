@@ -25,6 +25,7 @@ Configure targets with environment variables:
 
 ```sh
 node scripts/verify/device-layer.mjs           # discovery, input, rotation, stream, restart loop
+node scripts/verify/grpc-stream.mjs            # emulator gRPC transport, JWT, PNG frames, pointer input
 node scripts/verify/canvas-server.mjs          # HTTP/SSE/security/lease gating
 node scripts/verify/stream-decode.mjs          # aspect ratio + ffprobe decodability
 node scripts/verify/stream-lifecycle.mjs       # repeated start/stop leaves no orphaned recorders
@@ -67,7 +68,13 @@ unexercised.
   limitation rather than an extension bug — the stream layer detects it and reports
   an error instead of respawning silently. Leave a few seconds between suites, and
   restart the emulator if streams stop producing bytes. The extension's own
-  `restart_device` clears it.
+  `restart_device` clears it. This affects the mirror only; emulators now default to
+  the gRPC transport, which does not touch the device encoder.
+- `grpc-stream.mjs` runs its codec, framing, discovery and JWT checks without any
+  device, then skips the live section when no emulator discovery file is present. Its
+  live checks pin both transports explicitly (`transport: "grpc"` and
+  `transport: "mirror"`) so a silent fallback cannot mask a broken gRPC path — which
+  `canvas-server.mjs`, testing the default selection, deliberately tolerates.
 - Assertions about the restart loop compare timestamps within a completed respawn
   generation rather than polling counters. Polling raced: the replacement child's
   keyframe lands roughly 600ms after the exit, so a late observation folded it into
