@@ -13,7 +13,7 @@
  * `node:crypto` covers all of this, so no dependency is required.
  */
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AppError } from "./errors.mjs";
 
@@ -36,6 +36,46 @@ const TOKEN_REFRESH_MARGIN_SECONDS = 120;
 const base64Url = (value) => Buffer.from(value).toString("base64url");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const KEY_FILE_PREFIX = "copilot-android-emulator-";
+
+/**
+ * Remove keys published by extension processes that are no longer running.
+ *
+ * `dispose` covers the orderly path, but a crash or a hard kill leaves a signing
+ * key the emulator still trusts. The emulator outlives many extension restarts,
+ * so without this these accumulate for as long as it stays up.
+ */
+async function sweepStaleKeys(jwksDir, onDiagnostic) {
+    let names;
+    try {
+        names = await readdir(jwksDir);
+    } catch {
+        return;
+    }
+    for (const name of names) {
+        const match = new RegExp(`^${KEY_FILE_PREFIX}(\\d+)`).exec(name);
+        const pid = match ? Number(match[1]) : null;
+        if (!pid || pid === process.pid) {
+            continue;
+        }
+        try {
+            process.kill(pid, 0);
+            continue; // Still running: its owner will clean up.
+        } catch (error) {
+            // EPERM means the process exists but belongs to another user.
+            if (error?.code === "EPERM") {
+                continue;
+            }
+        }
+        try {
+            await rm(path.join(jwksDir, name), { force: true });
+            onDiagnostic?.(`removed stale gRPC key from pid ${pid}`);
+        } catch {
+            // Another process may be sweeping the same directory.
+        }
+    }
+}
 
 /**
  * Sign an ES256 JWT the emulator will accept.
@@ -88,7 +128,7 @@ export function createEmulatorTokenProvider({ jwksDir, token = null, issuer = AN
     // overlap while one is being disposed, and a shared filename would let the
     // old one's cleanup delete the key the new one just published — leaving it
     // holding a token the emulator no longer trusts.
-    const keyFile = path.join(jwksDir, `copilot-android-emulator-${process.pid}-${kid}.jwk`);
+    const keyFile = path.join(jwksDir, `${KEY_FILE_PREFIX}${process.pid}-${kid}.jwk`);
     const activeFile = path.join(jwksDir, "active.jwk");
 
     let keyPair = null;
@@ -106,6 +146,7 @@ export function createEmulatorTokenProvider({ jwksDir, token = null, issuer = AN
      * our `kid` to appear in `active.jwk` is the only reliable readiness signal.
      */
     async function publishKey() {
+        await sweepStaleKeys(jwksDir, onDiagnostic);
         const { publicKey } = ensureKeyPair();
         const jwk = { ...publicKey.export({ format: "jwk" }), kid, use: "sig", alg: "ES256" };
         await writeFile(keyFile, JSON.stringify({ keys: [jwk] }), "utf8");
