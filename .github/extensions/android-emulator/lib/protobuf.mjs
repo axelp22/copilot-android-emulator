@@ -128,10 +128,12 @@ export function readMessage(buffer, visit) {
         let result = 0n;
         let shift = 0n;
         let bytes = 0;
+        let terminated = false;
         while (offset < buffer.length) {
             const byte = buffer[offset++];
             result |= BigInt(byte & 0x7f) << shift;
             if ((byte & 0x80) === 0) {
+                terminated = true;
                 break;
             }
             // A 64-bit varint is at most ten bytes. Without this ceiling a run of
@@ -143,6 +145,13 @@ export function readMessage(buffer, visit) {
                 return 0;
             }
             shift += 7n;
+        }
+        // Running out of input mid-varint is truncation, not a value. Returning
+        // the partial result would hand the caller a plausible-looking number
+        // decoded from bytes that were never delivered.
+        if (!terminated) {
+            malformed = true;
+            return 0;
         }
         return result <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(result) : result;
     }

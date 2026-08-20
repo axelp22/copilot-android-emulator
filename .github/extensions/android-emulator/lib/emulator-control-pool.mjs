@@ -103,7 +103,17 @@ export class EmulatorControlPool {
      */
     async invalidateIfReplaced(serial) {
         const entry = await this.entries.get(serial)?.catch(() => null);
+        const negative = this.unavailableUntil.get(serial);
         if (!entry) {
+            // A permanently-negative serial has no entry to compare, so nothing
+            // below would run. That verdict was reached against an emulator that
+            // may since have been replaced by one which does expose gRPC, and
+            // without clearing it the device is pinned to adb until this process
+            // exits.
+            if (negative === Infinity && (await findEmulatorBySerial(serial))?.grpcPort) {
+                this.unavailableUntil.delete(serial);
+                this.onDiagnostic(`gRPC endpoint appeared for ${serial}; will retry`);
+            }
             return;
         }
         const current = await findEmulatorBySerial(serial);

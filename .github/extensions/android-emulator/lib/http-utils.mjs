@@ -23,17 +23,23 @@ function isLoopbackHost(value) {
     // Parsed rather than split on ":", which mangles a bracketed IPv6 authority
     // like `[::1]:8080` into "[" and rejects a host that is on the allowlist.
     // A real Host header is only an authority, so anything carrying userinfo or a
-    // path is rejected outright rather than handed to the URL parser.
+    // path is rejected outright. Backslash is rejected explicitly because the URL
+    // parser treats it as a path separator rather than part of the hostname.
     const authority = String(value).trim();
-    if (authority.includes("@") || authority.includes("/")) {
+    if (authority.includes("@") || authority.includes("/") || authority.includes("\\")) {
         return false;
     }
-    let hostname;
+    let parsed;
     try {
-        hostname = new URL(`http://${authority}`).hostname;
+        parsed = new URL(`http://${authority}`);
     } catch {
         return false;
     }
+    // Nothing but a host and an optional port may be present.
+    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+        return false;
+    }
+    const hostname = parsed.hostname;
     const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
     return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }

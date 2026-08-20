@@ -322,7 +322,12 @@ export class InputDispatcher {
             if (!handler) {
                 throw new AppError("unsupported_input_step", `Unsupported input step: ${step.kind}`, 400);
             }
-            results.push(await handler({ deviceId: input.deviceId, ...step.input }));
+            // `deviceId` is pinned after the step, for the same reason the canvas
+            // input routes pin it: a step must drive the device the caller was
+            // authorized for, never one it names itself. The schema forbids a
+            // nested deviceId today, so this defends the boundary rather than a
+            // known hole.
+            results.push(await handler({ ...step.input, deviceId: input.deviceId }));
         }
         return { deviceId: input.deviceId, results };
     }

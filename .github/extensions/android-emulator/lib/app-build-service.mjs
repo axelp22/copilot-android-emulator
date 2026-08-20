@@ -10,10 +10,14 @@ const MAX_LOG_LINES = 400;
 
 /**
  * Gradle reads a leading `-` as an option, and options such as
- * `--init-script=<file>` run arbitrary code before the build starts. Task names
- * never begin with one, so refusing them keeps a hostile
- * `.android-emulator.json` -- or a tool call written by a prompt-injected agent
- * -- from turning "Install" into host code execution.
+ * `--init-script=<file>` run a chosen script before the build starts. Task names
+ * never begin with one.
+ *
+ * This is not a sandbox, and must not be mistaken for one: running any
+ * repository's `gradlew` already executes that repository's build logic. What it
+ * removes is the ability to turn the *task argument itself* -- which arrives
+ * from a tool call or from `.android-emulator.json` -- into a different command
+ * than the build the user asked for.
  */
 function assertSafeTask(task) {
     const value = String(task ?? "").trim();

@@ -332,6 +332,12 @@ export async function createCanvasServer({
                 res.write("\n");
                 writeStateEvent();
                 const heartbeat = setInterval(() => {
+                    // Routed through the same saturation state as state events: a
+                    // heartbeat that ignored it would keep buffering on exactly the
+                    // client the coalescing exists to protect.
+                    if (saturatedClients.has(res)) {
+                        return;
+                    }
                     if (!safeWrite(res, ": ping\n\n")) {
                         clearInterval(heartbeat);
                         sseClients.delete(res);
@@ -472,7 +478,6 @@ export async function createCanvasServer({
                 json(res, 200, formatPublicState(await runManualOperation(toolbarRoutes[route])));
                 return;
             }
-
             if (route === "/api/stream/preferences") {
                 const next = await runManualOperation(() =>
                     manager.setStreamPreferences(target, { fps: body?.fps, resolution: body?.resolution }),
@@ -482,6 +487,7 @@ export async function createCanvasServer({
             }
 
             if (route === "/api/toolbar/button") {
+                enforceNotHeldElsewhere(targetState);
                 await runManualOperation(() => manager.pressButton({ deviceId: target, button: body?.button }));
                 json(res, 200, formatPublicState(manager.snapshot(target)));
                 return;
@@ -506,6 +512,9 @@ export async function createCanvasServer({
             }
 
             if (route === "/api/toolbar/rotate") {
+                // Rotation drives the device just as directly as a tap does, so it
+                // is refused while another session holds it.
+                enforceNotHeldElsewhere(targetState);
                 const result = await runManualOperation(() =>
                     manager.rotateDevice({ deviceId: target, direction: body?.direction }),
                 );
@@ -643,7 +652,15 @@ export async function createCanvasServer({
                                     continue;
                                 }
                                 const currentState = manager.getCachedDeviceState(connection.deviceId);
-                                if (currentState.lease?.active || currentState.controlPending) {
+                                // Re-checked per message, not just at connect: an
+                                // agent lease or another session can take the device
+                                // while this socket is open, and a pointer stream is
+                                // exactly the input that would otherwise keep going.
+                                if (
+                                    currentState.lease?.active ||
+                                    currentState.controlPending ||
+                                    currentState.sharing?.heldByOtherSession
+                                ) {
                                     connection.blocked = true;
                                     await cancelPointer();
                                     socket.end();
