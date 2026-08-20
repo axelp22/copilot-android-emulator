@@ -96,6 +96,15 @@ function agentControlUnavailable(currentState = state) {
     return currentState?.lease?.active === true || currentState?.controlPending === true;
 }
 
+/**
+ * Whether the server would refuse manual input. Broader than an agent lease: it
+ * also covers another Copilot session holding the device. Kept separate so that
+ * switching to a different device stays available precisely when this one is busy.
+ */
+function manualInputBlocked(currentState = state) {
+    return agentControlUnavailable(currentState) || currentState?.sharing?.heldByOtherSession === true;
+}
+
 function hydrateIcons() {
     for (const button of document.querySelectorAll("[data-icon]")) {
         button.innerHTML = renderIcon(button.dataset.icon);
@@ -208,7 +217,11 @@ function render() {
     }
 
     const leaseActive = state.lease?.active === true;
+    syncLeaseTicker(leaseActive);
     const controlUnavailable = leaseActive || state.controlPending === true;
+    // Another Copilot session holds the device, so the server refuses manual input
+    // too. Reflect that here rather than letting every click return an error.
+    const heldElsewhere = state.sharing?.heldByOtherSession === true;
     const booted = state.state === "Booted";
     const booting = state.state === "Booting";
     const unassigned = state.state === "Unassigned";
@@ -220,7 +233,7 @@ function render() {
     applyDeviceMetrics(frameElements, state.screen, state.deviceFamily);
     requestAnimationFrame(() => fitDeviceFrame(frameElements));
 
-    const disabled = pending || controlUnavailable;
+    const disabled = pending || controlUnavailable || heldElsewhere;
     for (const [name, button] of Object.entries(toolbarButtons)) {
         if (button) {
             button.disabled = disabled || !booted;
@@ -230,7 +243,7 @@ function render() {
             button.title = manageable ? "Stop emulator" : "Physical devices are never shut down by this extension";
         }
     }
-    renderInstallButton(state, booted, disabled);
+    renderInstallButton(state, booted, pending || controlUnavailable);
 
     const copy = poweredOffCopy();
     elements.poweredOffTitle.textContent = copy.title;
@@ -241,7 +254,7 @@ function render() {
     elements.streamResolution.disabled = disabled || !booted;
     elements.streamFps.value = String(state.stream?.fps ?? 60);
     elements.streamResolution.value = String(state.stream?.resolution ?? 100);
-    if (disabled) {
+    if (controlUnavailable) {
         devicePicker.close();
     }
     devicePicker.render();
@@ -349,7 +362,7 @@ function startH264StallWatchdog() {
         if (state?.state !== "Booted" || screenError || !lastVideoFrameAt) {
             return;
         }
-        if (Date.now() - lastVideoFrameAt > H264_STALL_TIMEOUT_MS) {
+        if (Date.now() - lastVideoFrameAt > H264_STALL_TIMEOUT_MS && !h264Stream.isStillStream()) {
             fallBackToScreenshots("Video stalled; streaming screenshots instead");
             return;
         }
@@ -357,7 +370,15 @@ function startH264StallWatchdog() {
         const since = Date.now() - SLOW_CAPTURE_WINDOW_MS;
         recentFrameTimes = recentFrameTimes.filter((at) => at >= since);
         const windowFps = recentFrameTimes.length / (SLOW_CAPTURE_WINDOW_MS / 1000);
-        if (state.kind === "emulator" && recentFrameTimes.length > 0 && windowFps < SLOW_CAPTURE_FPS) {
+        // A still-based stream only sends frames when the screen changes, so a low
+        // rate there is an idle device, not a struggling encoder. Warning about it
+        // would tell people to restart a perfectly healthy emulator.
+        if (
+            state.kind === "emulator" &&
+            !h264Stream.isStillStream() &&
+            recentFrameTimes.length > 0 &&
+            windowFps < SLOW_CAPTURE_FPS
+        ) {
             setScreenStatus("Emulator capture is slow. Restarting the emulator usually restores it.");
         }
     }, H264_STALL_POLL_MS);
@@ -463,12 +484,32 @@ function drawVideoFrame(frame) {
     h264CanvasContext().drawImage(frame, 0, 0, elements.h264Screen.width, elements.h264Screen.height);
     clearScreenError();
     elements.screenWindow.classList.add("has-frame");
-    setScreenStatus("Device display ready");
+    setScreenStatus(readyScreenStatus());
 }
 
+/**
+ * An emulator that quietly fell back to mirroring looks identical to one that is
+ * simply slow, which is the confusion this transport work set out to remove. Say
+ * so instead of hiding it behind a generic "ready".
+ */
+function readyScreenStatus() {
+    if (state?.kind === "emulator" && state?.stream?.transport === "mirror") {
+        const reason = state.stream.transportReason;
+        return reason ? `Device display ready (mirrored: ${reason})` : "Device display ready (mirrored)";
+    }
+    return "Device display ready";
+}
+
+/**
+ * A stream that dies mid-session must still leave a usable canvas.
+ *
+ * The stall watchdog cannot cover this for a still-based transport, where
+ * silence is normal, so failures land here instead — and screenshots are always
+ * available regardless of which transport failed.
+ */
 function handleH264StreamError(error) {
-    setScreenStatus("H.264 stream failed.", { error: true });
     setNotice(error.message ?? String(error), true);
+    fallBackToScreenshots("Device stream failed; streaming screenshots instead");
 }
 
 function startH264Stream(fps) {
@@ -478,7 +519,8 @@ function startH264Stream(fps) {
     elements.screen.src = noImageDataUrl;
     elements.screen.classList.remove("has-frame");
     elements.screenWindow.classList.remove("has-frame");
-    setScreenStatus(`Connecting H.264 stream at ${fps} fps`);
+    // The host picks the transport per device, so the status stays neutral.
+    setScreenStatus(`Connecting device stream at ${fps} fps`);
     clearTimeout(h264Watchdog);
     h264Watchdog = setTimeout(() => {
         h264Watchdog = null;
@@ -646,12 +688,20 @@ function bindScreenStatus() {
     });
 }
 
-function startLeaseTicker() {
-    setInterval(() => {
-        if (state?.lease?.active) {
-            render();
-        }
-    }, 1000);
+/**
+ * The lease countdown is the only thing on screen that changes without a server
+ * event, so the ticker runs only while a lease is actually counting down rather
+ * than for the lifetime of the page.
+ */
+let leaseTicker = null;
+
+function syncLeaseTicker(leaseActive) {
+    if (leaseActive && leaseTicker === null) {
+        leaseTicker = setInterval(render, 1000);
+    } else if (!leaseActive && leaseTicker !== null) {
+        clearInterval(leaseTicker);
+        leaseTicker = null;
+    }
 }
 
 function bindResize() {
@@ -685,7 +735,7 @@ const inputController = createInputController({
     apiUrl,
     fetchJson,
     getState: () => state,
-    isControlUnavailable: agentControlUnavailable,
+    isControlUnavailable: manualInputBlocked,
     setNotice,
     setState: (nextState) => {
         state = nextState;
@@ -710,7 +760,6 @@ async function init() {
         await loadState();
         await devicePicker.refresh();
         connectEvents();
-        startLeaseTicker();
         reconnectStream();
     } catch (error) {
         setNotice(error.message ?? String(error), true);

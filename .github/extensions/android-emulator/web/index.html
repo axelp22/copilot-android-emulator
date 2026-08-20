@@ -2,18 +2,12 @@
 <html lang="en" class="awaiting-initial-paint">
     <head>
         <meta charset="utf-8" />
+        <meta
+            http-equiv="Content-Security-Policy"
+            content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'"
+        />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Android Emulator</title>
-        <style>
-            html.awaiting-initial-paint,
-            html.awaiting-initial-paint body {
-                background: transparent;
-            }
-
-            html.awaiting-initial-paint .shell {
-                visibility: hidden;
-            }
-        </style>
         <link rel="stylesheet" href="./styles.css" />
     </head>
     <body>

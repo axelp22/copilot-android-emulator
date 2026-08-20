@@ -30,6 +30,8 @@ import { AppBuildService } from "./app-build-service.mjs";
 import { DeviceRegistry } from "./device-registry.mjs";
 import { InputDispatcher } from "./input-dispatcher.mjs";
 import { ScreenService } from "./screen-service.mjs";
+import { emulatorAccessPath } from "./emulator-access.mjs";
+import { EmulatorControlPool } from "./emulator-control-pool.mjs";
 import { VideoRecordingService } from "./video-recording-service.mjs";
 
 const BOOT_TIMEOUT_MS = 180_000;
@@ -59,6 +61,10 @@ function delay(ms) {
  */
 export class DeviceSessionManager {
     constructor({ onDiagnostic } = {}) {
+        // Assigned before anything that reads it: the build service captured the
+        // no-op fallback when this ran after its construction, and lost every
+        // Gradle diagnostic for the life of the process.
+        this.onDiagnostic = onDiagnostic ?? (() => {});
         this.state = new DeviceRegistry();
         this.artifactsRoot = null;
         this.manualInputStops = new Map();
@@ -70,7 +76,9 @@ export class DeviceSessionManager {
         this.claims = new DeviceClaimStore({});
         // Exclusion and turn-taking across sessions; the claim store only reports.
         this.queue = new DeviceQueue({});
-        this.build = new AppBuildService({ manager: this, onDiagnostic: this.onDiagnostic });
+        // Delegated rather than passed by value, so a sink installed later by
+        // setDiagnosticSink reaches the services built here.
+        this.build = new AppBuildService({ manager: this, onDiagnostic: (message) => this.onDiagnostic(message) });
         this.buildPlan = null;
         // Whether another session holds a device, cached so snapshots stay synchronous.
         this.sharingCache = new Map();
@@ -78,8 +86,12 @@ export class DeviceSessionManager {
         // when the last one goes, so a lease lapsing mid-build cannot hand the
         // device to another session while Gradle is still installing.
         this.holdRefs = new Map();
-        this.state.onLeaseExpired = (deviceId) => {
-            void this.onLeaseExpired(deviceId);
+        // The hold ref standing for each device's current lease. Every acquisition
+        // gets its own token: a shared key would collapse two acquisitions into one
+        // set entry, and a failed second attempt would then release the live one.
+        this.leaseHoldRefs = new Map();
+        this.state.onLeaseDropped = (deviceId) => {
+            void this.onLeaseDropped(deviceId);
         };
         this.foreignClaimCache = new Map();
         this.foreignCaptureCache = new Map();
@@ -88,12 +100,17 @@ export class DeviceSessionManager {
         this.lastDiscovery = null;
         this.avdListCache = null;
         this.avdListFetchedAt = 0;
-        this.onDiagnostic = onDiagnostic ?? (() => {});
+        // Shared emulator gRPC connections, used by both the frame source and
+        // input so a stream restart never disturbs an in-flight gesture.
+        // Given the delegating sink, not this.onDiagnostic by value, so a sink
+        // installed later by setDiagnosticSink reaches it.
+        this.controlPool = new EmulatorControlPool({ onDiagnostic: (message) => this.onDiagnostic(message) });
         this.screen = new ScreenService({
             state: this.state,
             artifactsRoot: () => this.artifactsRoot,
             ensureBooted: (deviceId) => this.ensureBooted(deviceId),
-            onDiagnostic: this.onDiagnostic,
+            onDiagnostic: (message) => this.onDiagnostic(message),
+            controlPool: this.controlPool,
         });
         this.video = new VideoRecordingService({
             state: this.state,
@@ -105,6 +122,7 @@ export class DeviceSessionManager {
             ensureBooted: (deviceId) => this.ensureBooted(deviceId),
             screenSize: (deviceId) => this.screen.screenSize(deviceId),
             refreshScreenMetrics: (deviceId) => this.screen.refreshScreenMetrics(deviceId),
+            controlPool: this.controlPool,
         });
     }
 
@@ -166,8 +184,9 @@ export class DeviceSessionManager {
     }
 
     setDiagnosticSink(onDiagnostic) {
-        this.onDiagnostic = onDiagnostic;
-        this.screen.onDiagnostic = onDiagnostic;
+        // Everything downstream calls through this.onDiagnostic, so one assignment
+        // reaches the build, screen, and any other service built in the constructor.
+        this.onDiagnostic = onDiagnostic ?? (() => {});
     }
 
     subscribe(deviceId, handler) {
@@ -299,10 +318,20 @@ export class DeviceSessionManager {
         }
     }
 
-    /** A lapsed lease must not keep the device from every other session. */
-    async onLeaseExpired(deviceId) {
+    /** A lease that lapsed, was dropped with its canvas, or was otherwise abandoned. */
+    async onLeaseDropped(deviceId) {
         await this.downgradeClaim(deviceId).catch(() => {});
-        await this.dropHoldRef(deviceId, "lease");
+        await this.dropLeaseHold(deviceId);
+    }
+
+    /** Gives up the queue hold taken for a device's current lease, if any. */
+    async dropLeaseHold(deviceId) {
+        const ref = this.leaseHoldRefs.get(deviceId);
+        if (!ref) {
+            return;
+        }
+        this.leaseHoldRefs.delete(deviceId);
+        await this.dropHoldRef(deviceId, ref);
     }
 
     reportInstallFailure(deviceId, message) {
@@ -466,6 +495,15 @@ export class DeviceSessionManager {
         this.discoveryInFlight = (async () => {
             const discovered = await this.discoverDevices();
             this.state.updateFromList(discovered);
+            // A restarted AVD keeps its serial but gets a new pid, gRPC port and
+            // key directory, so a cached control channel for it now points at a
+            // dead endpoint. This is the discovery path that invalidation was
+            // written for; it is a no-op for serials with no cached connection.
+            await Promise.all(
+                discovered
+                    .filter((device) => device.serial)
+                    .map((device) => this.controlPool.invalidateIfReplaced(device.serial).catch(() => {})),
+            );
             this.lastDiscovery = discovered;
             this.discoveryCompletedAt = Date.now();
             return discovered;
@@ -651,8 +689,13 @@ export class DeviceSessionManager {
                 409,
             );
         }
-        this.prepareBoot(deviceId);
-        return await this.completePreparedBoot(deviceId);
+        // Auto-boot takes the device like any other boot. Two sessions reaching
+        // here for the same AVD would otherwise each spawn `emulator -avd`, and
+        // the in-process dedupe below cannot see across processes.
+        return this.withDeviceHold(deviceId, "Booting the device", () => {
+            this.prepareBoot(deviceId);
+            return this.completePreparedBoot(deviceId);
+        });
     }
 
     prepareBoot(deviceId) {
@@ -666,8 +709,12 @@ export class DeviceSessionManager {
         if (device.state === DEVICE_STATES.booted && device.serial) {
             return this.state.snapshot(deviceId);
         }
-        this.prepareBoot(deviceId);
-        return await this.completePreparedBoot(deviceId);
+        // Lifecycle is as destructive as an install, so it takes the device the same
+        // way: a boot or shutdown must not land on a device another session is using.
+        return this.withDeviceHold(deviceId, "Booting the device", () => {
+            this.prepareBoot(deviceId);
+            return this.completePreparedBoot(deviceId);
+        });
     }
 
     /**
@@ -698,10 +745,19 @@ export class DeviceSessionManager {
         try {
             const emulatorPath = await requireEmulatorBinary();
             const before = new Set((await listAttached()).map((entry) => entry.serial));
-            const child = spawn(emulatorPath, ["-avd", device.avdName, "-no-snapshot-save"], {
-                detached: true,
-                stdio: "ignore",
-            });
+            // gRPC is already enabled by default on current emulators; the custom
+            // allowlist exists so this extension can authenticate as itself with
+            // only the methods it needs, instead of borrowing Android Studio's
+            // blanket-access issuer. The bundled list keeps the Android Studio
+            // entry, so Studio can still attach to emulators started here.
+            const child = spawn(
+                emulatorPath,
+                ["-avd", device.avdName, "-no-snapshot-save", "-grpc-allowlist", emulatorAccessPath()],
+                {
+                    detached: true,
+                    stdio: "ignore",
+                },
+            );
             child.unref();
 
             const serial = await this.waitForNewEmulatorSerial(device.avdName, before);
@@ -761,6 +817,14 @@ export class DeviceSessionManager {
         if (!device.serial) {
             return this.state.snapshot(deviceId);
         }
+        return this.withDeviceHold(deviceId, "Shutting the device down", () => this.runShutdown(deviceId));
+    }
+
+    async runShutdown(deviceId) {
+        const device = this.state.getDeviceOrThrow(deviceId);
+        if (!device.serial) {
+            return this.state.snapshot(deviceId);
+        }
 
         const serial = device.serial;
         this.state.setDeviceState(deviceId, DEVICE_STATES.shuttingDown);
@@ -780,6 +844,9 @@ export class DeviceSessionManager {
         }
 
         this.deviceMetaCache.delete(serial);
+        // The gRPC endpoint dies with the emulator, and a later boot of the same
+        // AVD gets a fresh port and key directory, so the cached channel must go.
+        await this.controlPool.release(serial).catch(() => {});
         await this.refreshDevicesNow();
         this.state.setDeviceState(deviceId, DEVICE_STATES.shutdown);
         this.state.setSerial(deviceId, null);
@@ -787,10 +854,15 @@ export class DeviceSessionManager {
     }
 
     async restartDevice(deviceId) {
+        await this.refreshDevicesNow();
         this.assertLifecycleAllowed(deviceId);
-        await this.shutdownDevice(deviceId);
-        this.state.setDeviceState(deviceId, DEVICE_STATES.booting);
-        return await this.completePreparedBoot(deviceId);
+        // One hold spans both halves, so the device cannot be taken by another
+        // session in the gap between shutting it down and booting it again.
+        return this.withDeviceHold(deviceId, "Restarting the device", async () => {
+            await this.runShutdown(deviceId);
+            this.state.setDeviceState(deviceId, DEVICE_STATES.booting);
+            return await this.completePreparedBoot(deviceId);
+        });
     }
 
     // --- Leases ------------------------------------------------------------
@@ -816,7 +888,11 @@ export class DeviceSessionManager {
             throw new AppError("no_available_device", "No booted device is available to take.", 409);
         }
 
-        const granted = await this.takeHold(candidates, "lease", {
+        // Unique per attempt. A shared key would be a single entry in the device's
+        // hold set, so this attempt failing would drop the hold belonging to the
+        // lease that is already running.
+        const ref = `lease:${randomUUID()}`;
+        const granted = await this.takeHold(candidates, ref, {
             reason: input.reason ?? null,
             timeoutMs: Math.max(0, Math.round((input.waitSeconds ?? 0) * 1000)),
         });
@@ -827,10 +903,19 @@ export class DeviceSessionManager {
 
         const deviceId = granted.deviceId;
         const leaseInput = { ...input, deviceId };
+        // Recorded as the device's lease ref from the moment the hold exists, not
+        // once the lease is built. The canvas can detach during the awaits below,
+        // and onLeaseDropped has to be able to find this ref to give the hold up;
+        // otherwise the hold outlives the attempt with nothing tracking it.
+        // Never overwrites: on a device this session already leases, that entry
+        // belongs to the live lease and this attempt is about to be refused.
+        if (!this.leaseHoldRefs.has(deviceId)) {
+            this.leaseHoldRefs.set(deviceId, ref);
+        }
         try {
             this.state.reserveLease(leaseInput);
         } catch (error) {
-            await this.dropHoldRef(deviceId, "lease");
+            await this.abandonLeaseAttempt(deviceId, ref);
             throw error;
         }
 
@@ -841,9 +926,20 @@ export class DeviceSessionManager {
             return { ...snapshot, waitedMs: granted.waitedMs };
         } catch (error) {
             this.state.cancelLeaseReservation(deviceId, input.ownerInstanceId);
-            await this.dropHoldRef(deviceId, "lease");
+            await this.abandonLeaseAttempt(deviceId, ref);
             throw error;
         }
+    }
+
+    /**
+     * Gives up one failed acquisition's hold without disturbing a lease that is
+     * already running on the same device.
+     */
+    async abandonLeaseAttempt(deviceId, ref) {
+        if (this.leaseHoldRefs.get(deviceId) === ref) {
+            this.leaseHoldRefs.delete(deviceId);
+        }
+        await this.dropHoldRef(deviceId, ref);
     }
 
     /** Drops the shared claim back to "open" once the agent is done. */
@@ -864,7 +960,7 @@ export class DeviceSessionManager {
         const snapshot = this.state.releaseLease(input);
         await this.downgradeClaim(input.deviceId);
         // Hand the device to whoever is next in line.
-        await this.dropHoldRef(input.deviceId, "lease");
+        await this.dropLeaseHold(input.deviceId);
         return snapshot;
     }
 
@@ -874,12 +970,42 @@ export class DeviceSessionManager {
         const snapshot = this.state.revokeLease(deviceId);
         await this.state.settleActiveOperations(deviceId);
         await this.downgradeClaim(deviceId);
-        await this.dropHoldRef(deviceId, "lease");
+        await this.dropLeaseHold(deviceId);
         return snapshot;
     }
 
+    /**
+     * Runs a leased action while this session holds the device outright.
+     *
+     * A lease can lapse mid-action — a 180s boot under the default 120s TTL is
+     * enough — and the expiry would otherwise hand the device to the next session
+     * while adb is still working on it. The hold is independent of the lease, so
+     * the device is only released once the action has actually finished.
+     */
     async withLeaseOperation(input, fn) {
-        return await this.state.withLeaseOperation(input, fn);
+        const deviceId = input.deviceId;
+        // Piggybacks on the hold the lease already took. Adding a ref to a device
+        // this session does not hold would make takeHold believe it is ours and
+        // skip the queue entirely, so a device we never took stays unclaimed.
+        const alreadyHeld = (this.holdRefs.get(deviceId)?.size ?? 0) > 0;
+        const ref = alreadyHeld ? `lease-op:${randomUUID()}` : null;
+        if (ref) {
+            this.addHoldRef(deviceId, ref);
+        } else {
+            // Every lease takes a hold, so this means one was created by a path that
+            // did not. Worth saying out loud: the action below runs unprotected, and
+            // the protection silently doing nothing is how this stays hidden.
+            this.onDiagnostic(
+                `${deviceId}: running "${input.operation}" under a lease with no device hold; it is not protected from other sessions.`,
+            );
+        }
+        try {
+            return await this.state.withLeaseOperation(input, fn);
+        } finally {
+            if (ref) {
+                await this.dropHoldRef(deviceId, ref);
+            }
+        }
     }
 
     // --- Diagnostics -------------------------------------------------------
@@ -968,6 +1094,11 @@ export class DeviceSessionManager {
 
     createH264Stream(input) {
         return this.screen.createH264Stream(input);
+    }
+
+    /** Transport-selecting entry point: gRPC for local emulators, mirror otherwise. */
+    createVideoStream(input) {
+        return this.screen.createVideoStream(input);
     }
 
     setStreamPreferences(deviceId, preferences) {
@@ -1069,9 +1200,18 @@ export class DeviceSessionManager {
         if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/.test(String(packageName))) {
             throw new AppError("invalid_package", `Invalid package name: ${packageName}`, 400);
         }
+        // `adb shell` joins its arguments into one string that the device shell
+        // parses, so an unchecked component name is a device-side command
+        // injection -- the same reason `input text` is quoted before it is sent.
+        // `$` is a legal Java identifier character and names a nested class, as
+        // in `.MainActivity$Settings`, so it is accepted here and the component
+        // is single-quoted below to keep the device shell from expanding it.
+        if (activity !== undefined && activity !== null && !/^\.?[A-Za-z][A-Za-z0-9_$]*(\.[A-Za-z0-9_$]+)*$/.test(String(activity))) {
+            throw new AppError("invalid_activity", `Invalid activity name: ${activity}`, 400);
+        }
 
         const stdout = activity
-            ? await adbShell(serial, ["am", "start", "-n", `${packageName}/${activity}`], { timeout: 60_000 })
+            ? await adbShell(serial, ["am", "start", "-n", `'${packageName}/${activity}'`], { timeout: 60_000 })
             : await adbShell(
                   serial,
                   ["monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "1"],
@@ -1090,6 +1230,7 @@ export class DeviceSessionManager {
         await this.build.stopAll().catch(() => {});
         await this.video.stopAll().catch(() => {});
         this.input.clearTouchSessions();
+        await this.controlPool.disposeAll().catch(() => {});
         // Never leave a device taken, or a queue blocked, by a session that has exited.
         await this.claims.releaseAll().catch(() => {});
         await this.queue.releaseAll().catch(() => {});

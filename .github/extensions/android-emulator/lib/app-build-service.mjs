@@ -8,6 +8,29 @@ const CONFIG_FILENAMES = [".android-emulator.json", "android-emulator.json", ".g
 const DEFAULT_TASK = "installDebug";
 const MAX_LOG_LINES = 400;
 
+/**
+ * Gradle reads a leading `-` as an option, and options such as
+ * `--init-script=<file>` run a chosen script before the build starts. Task names
+ * never begin with one.
+ *
+ * This is not a sandbox, and must not be mistaken for one: running any
+ * repository's `gradlew` already executes that repository's build logic. What it
+ * removes is the ability to turn the *task argument itself* -- which arrives
+ * from a tool call or from `.android-emulator.json` -- into a different command
+ * than the build the user asked for.
+ */
+function assertSafeTask(task) {
+    const value = String(task ?? "").trim();
+    if (value.startsWith("-") || !/^:?[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)*$/.test(value)) {
+        throw new AppError(
+            "invalid_gradle_task",
+            `Refusing to run "${value}": expected a Gradle task name such as ":app:installDebug".`,
+            400,
+        );
+    }
+    return value;
+}
+
 /** Walks up from `from` looking for a Gradle wrapper, so nested module dirs work. */
 async function findGradleRoot(from) {
     let dir = path.resolve(from);
@@ -233,7 +256,7 @@ export class AppBuildService {
         }
 
         const device = this.manager.snapshot(deviceId);
-        const task = taskOverride ?? plan.task;
+        const task = assertSafeTask(taskOverride ?? plan.task);
         const gradle = await findGradleRoot(this.workingDirectory);
 
         run.step = "build";
