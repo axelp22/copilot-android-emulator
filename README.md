@@ -262,9 +262,12 @@ across sessions and across separate extension processes:
   not while a build, a boot, or any other action this session started is still
   running against it.
 
-Everything that touches a device takes it the same way: agent actions, installs,
-emulator lifecycle, and manual input from the canvas. Manual input is refused, with
-the holder named, while another session holds the device.
+Agent actions, installs and emulator lifecycle all take the device through this
+queue, so none of them can land on a device another session is using. Manual input
+from the canvas is advisory rather than exclusive: it is refused, with the holder
+named, when the device is known to be held elsewhere, but that knowledge comes from
+a status poll a few seconds old, so a session taking the device mid-interaction is
+noticed shortly afterwards rather than instantly.
 
 The queue is cooperative in the same way claims are: it coordinates sessions running
 this extension, not other tools on the machine.

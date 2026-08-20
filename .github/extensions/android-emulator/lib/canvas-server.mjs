@@ -49,9 +49,14 @@ function enforceNoAgentLease(state) {
 
 /**
  * Devices are exclusive across Copilot sessions, and manual input is no less
- * disruptive than an agent's. Refusing here keeps the rule the same at every
- * entry point: previously a person could tap through a device that another
- * session's agent was driving, while the agent's own tools were refused.
+ * disruptive than an agent's. Refusing here keeps a person from tapping through
+ * a device another session's agent is driving, which used to be allowed while
+ * that agent's own tools were refused.
+ *
+ * This is advisory, not exclusive: it reads a cache refreshed on a timer, so a
+ * session taking the device mid-interaction is noticed within a few seconds
+ * rather than instantly. Routes that mutate the device for longer (install,
+ * lifecycle) take a real hold instead and do not need this.
  */
 function enforceNotHeldElsewhere(state) {
     const sharing = state?.sharing;
@@ -413,7 +418,6 @@ export async function createCanvasServer({
             const target = requireDevice();
             const targetState = manager.getCachedDeviceState(target);
             enforceNoAgentLease(targetState);
-            enforceNotHeldElsewhere(targetState);
 
             const toolbarRoutes = {
                 "/api/toolbar/boot": () => manager.bootDevice(target),
@@ -468,11 +472,13 @@ export async function createCanvasServer({
                 "/api/input/text": () => manager.sendText({ deviceId: target, ...body }),
             };
             if (Object.hasOwn(inputRoutes, route)) {
+                enforceNotHeldElsewhere(targetState);
                 json(res, 200, await runManualOperation(inputRoutes[route]));
                 return;
             }
 
             if (route === "/api/input/touch") {
+                enforceNotHeldElsewhere(targetState);
                 const result = await runManualOperation(async () => {
                     const outcome = await manager.touch({ deviceId: target, ...body });
                     fallbackTouchActive = !(body?.phase === "up" || body?.phase === "cancel");

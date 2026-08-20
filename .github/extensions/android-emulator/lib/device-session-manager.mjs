@@ -671,8 +671,13 @@ export class DeviceSessionManager {
                 409,
             );
         }
-        this.prepareBoot(deviceId);
-        return await this.completePreparedBoot(deviceId);
+        // Auto-boot takes the device like any other boot. Two sessions reaching
+        // here for the same AVD would otherwise each spawn `emulator -avd`, and
+        // the in-process dedupe below cannot see across processes.
+        return this.withDeviceHold(deviceId, "Booting the device", () => {
+            this.prepareBoot(deviceId);
+            return this.completePreparedBoot(deviceId);
+        });
     }
 
     prepareBoot(deviceId) {
@@ -868,26 +873,43 @@ export class DeviceSessionManager {
 
         const deviceId = granted.deviceId;
         const leaseInput = { ...input, deviceId };
+        // Recorded as the device's lease ref from the moment the hold exists, not
+        // once the lease is built. The canvas can detach during the awaits below,
+        // and onLeaseDropped has to be able to find this ref to give the hold up;
+        // otherwise the hold outlives the attempt with nothing tracking it.
+        // Never overwrites: on a device this session already leases, that entry
+        // belongs to the live lease and this attempt is about to be refused.
+        if (!this.leaseHoldRefs.has(deviceId)) {
+            this.leaseHoldRefs.set(deviceId, ref);
+        }
         try {
             this.state.reserveLease(leaseInput);
         } catch (error) {
-            await this.dropHoldRef(deviceId, ref);
+            await this.abandonLeaseAttempt(deviceId, ref);
             throw error;
         }
 
         try {
             await this.stopManualInput(deviceId);
             const snapshot = this.state.acquireLease(leaseInput);
-            // Only now does this ref stand for the device's lease, so releasing the
-            // lease later gives up this hold and no other.
-            this.leaseHoldRefs.set(deviceId, ref);
             await this.claims.claim(deviceId, { mode: "control", reason: input.reason ?? null }).catch(() => {});
             return { ...snapshot, waitedMs: granted.waitedMs };
         } catch (error) {
             this.state.cancelLeaseReservation(deviceId, input.ownerInstanceId);
-            await this.dropHoldRef(deviceId, ref);
+            await this.abandonLeaseAttempt(deviceId, ref);
             throw error;
         }
+    }
+
+    /**
+     * Gives up one failed acquisition's hold without disturbing a lease that is
+     * already running on the same device.
+     */
+    async abandonLeaseAttempt(deviceId, ref) {
+        if (this.leaseHoldRefs.get(deviceId) === ref) {
+            this.leaseHoldRefs.delete(deviceId);
+        }
+        await this.dropHoldRef(deviceId, ref);
     }
 
     /** Drops the shared claim back to "open" once the agent is done. */
@@ -939,6 +961,13 @@ export class DeviceSessionManager {
         const ref = alreadyHeld ? `lease-op:${randomUUID()}` : null;
         if (ref) {
             this.addHoldRef(deviceId, ref);
+        } else {
+            // Every lease takes a hold, so this means one was created by a path that
+            // did not. Worth saying out loud: the action below runs unprotected, and
+            // the protection silently doing nothing is how this stays hidden.
+            this.onDiagnostic(
+                `${deviceId}: running "${input.operation}" under a lease with no device hold; it is not protected from other sessions.`,
+            );
         }
         try {
             return await this.state.withLeaseOperation(input, fn);

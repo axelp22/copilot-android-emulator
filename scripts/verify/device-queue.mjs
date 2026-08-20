@@ -195,6 +195,37 @@ await poolBlocker.releaseAll();
 await pooler.releaseAll();
 await specific.releaseAll();
 
+// A device that is free but spoken for by an older waiter is not an alternative.
+// Treating it as one lets younger waiters overtake the oldest waiter on every
+// device it named, and it starves.
+const STARVE_A = "starve-one";
+const STARVE_B = "starve-two";
+const oldest = session("OLDEST", "oldest-pooled");
+const older = session("OLDER", "older-specific");
+const youngest = session("YOUNGEST", "youngest-specific");
+
+// OLDER queues on A first, then OLDEST asks for either A or B.
+const olderTicket = randomUUID();
+const blockerA = session("BLOCKA", "blocks-a");
+await blockerA.acquire(STARVE_A, { reason: "busy", timeoutMs: 0 });
+await older.enqueue(STARVE_A, { reason: "wants A", ticketId: olderTicket, candidates: [STARVE_A] });
+await sleep(50);
+const oldestTicket = randomUUID();
+await oldest.enqueue(STARVE_A, { reason: "any", ticketId: oldestTicket, candidates: [STARVE_A, STARVE_B] });
+await oldest.enqueue(STARVE_B, { reason: "any", ticketId: oldestTicket, candidates: [STARVE_A, STARVE_B] });
+await sleep(50);
+
+// B frees. A is free too, but OLDEST cannot have it: OLDER is ahead of it there.
+// So OLDEST really is waiting on B, and the youngest session must not take it.
+await blockerA.release(STARVE_A);
+const overtake = await youngest.tryAcquire(STARVE_B, { reason: "wants B" });
+report.assert(
+    overtake.granted === false,
+    "a pooled waiter is not overtaken on a device it cannot avoid",
+    overtake.granted ? "granted" : `blocked by ${overtake.blockedBy?.sessionLabel}`,
+);
+await Promise.all([oldest.releaseAll(), older.releaseAll(), youngest.releaseAll(), blockerA.releaseAll()]);
+
 // --- nothing is left behind ----------------------------------------------------
 await Promise.all([
     a.releaseAll(),

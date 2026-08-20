@@ -157,16 +157,23 @@ export class DeviceQueue {
      * Without this, one pooled waiter sitting at the head of every queue reserves
      * the entire pool while it can only ever consume one device, and sessions
      * asking for a specific free device wait behind a ticket that will never take it.
+     *
+     * "Free" is not enough on its own: a device this waiter cannot actually take,
+     * because an older waiter is queued ahead of it there, is not an alternative.
+     * Treating it as one lets younger waiters overtake the oldest one on every
+     * device it named, and it starves. When in doubt this answers yes, which is
+     * just the strict first-come ordering we would have had anyway.
      */
     async blocksThisDevice(ticket, deviceId) {
         const alternatives = (ticket.candidates ?? [ticket.deviceId]).filter((candidate) => candidate !== deviceId);
-        if (alternatives.length === 0) {
-            return true;
-        }
         for (const candidate of alternatives) {
-            if (!(await this.holderOf(candidate))) {
-                // Another device this waiter accepts is free right now, so it is not
-                // waiting on this one.
+            if (await this.holderOf(candidate)) {
+                continue;
+            }
+            const [next] = await this.waitersFor(candidate);
+            if (!next || next.ticketId === ticket.ticketId) {
+                // Free, and this waiter is first in line for it, so it will take
+                // that one instead and is not waiting on this device.
                 return false;
             }
         }
@@ -283,7 +290,13 @@ export class DeviceQueue {
     async release(deviceId) {
         const record = this.held.get(deviceId);
         this.held.delete(deviceId);
-        const holder = await this.readJson(this.holderPath(deviceId));
+        const { status, record: holder } = await readRecord(this.holderPath(deviceId));
+        if (status === "unreadable") {
+            // Caught mid-rewrite. Deleting it would free a device whose owner we
+            // could not identify, which is the very thing the sentinel in holderOf
+            // exists to prevent.
+            return false;
+        }
         // Only the owning session may release, or a crashed session's leftovers.
         if (holder && holder.sessionId !== this.owner.sessionId && isLive(holder)) {
             return false;
