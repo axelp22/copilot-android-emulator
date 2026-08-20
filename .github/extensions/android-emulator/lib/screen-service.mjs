@@ -14,6 +14,8 @@ export class ScreenService {
         this.onDiagnostic = onDiagnostic ?? (() => {});
         /** Shared emulator gRPC connections; absent means mirror everything. */
         this.controlPool = controlPool;
+        /** Why the last gRPC attempt fell back, surfaced in device state. */
+        this.lastGrpcFailure = null;
     }
 
     async captureScreen(deviceId) {
@@ -116,10 +118,15 @@ export class ScreenService {
         if (transport !== "mirror" && device.kind === "emulator") {
             const stream = await this.#tryGrpcStream({ deviceId, fps, resolution, required: transport === "grpc" });
             if (stream) {
+                this.state.setStreamTransport(deviceId, "grpc");
                 return stream;
             }
         }
-        return await this.createH264Stream({ deviceId, fps, resolution, timeLimitSeconds });
+        const mirror = await this.createH264Stream({ deviceId, fps, resolution, timeLimitSeconds });
+        // Record why, so a gRPC regression is visible rather than looking like the
+        // emulator simply being slow.
+        this.state.setStreamTransport(deviceId, "mirror", device.kind === "emulator" ? this.lastGrpcFailure : null);
+        return mirror;
     }
 
     /**
@@ -131,6 +138,10 @@ export class ScreenService {
         try {
             await this.ensureBooted(deviceId);
             const serial = this.state.requireSerial(deviceId);
+            // A restarted AVD keeps its serial but gets a new pid and port, so
+            // check before borrowing that the cached connection is still the
+            // emulator we think it is.
+            await this.controlPool?.invalidateIfReplaced(serial);
             // Borrow the shared connection rather than opening one per stream: the
             // JWT handshake waits for the emulator to accept a published key, and
             // paying that on every quality change would stall the first frame.
@@ -156,7 +167,8 @@ export class ScreenService {
             if (required) {
                 throw error;
             }
-            this.onDiagnostic(`[${deviceId}] gRPC stream unavailable, mirroring instead: ${error?.message ?? error}`);
+            this.lastGrpcFailure = error?.message ?? String(error);
+            this.onDiagnostic(`[${deviceId}] gRPC stream unavailable, mirroring instead: ${this.lastGrpcFailure}`);
             return null;
         }
     }

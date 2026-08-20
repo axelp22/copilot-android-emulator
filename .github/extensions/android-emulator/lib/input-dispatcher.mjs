@@ -56,6 +56,8 @@ const DRAG_SEGMENT_MAX_MS = 400;
 const GRPC_TOUCH_IDENTIFIER = 0;
 /** Any non-zero value means "in contact"; the emulator does not scale by it. */
 const GRPC_TOUCH_PRESSURE = 1;
+/** How long a failed gRPC gesture keeps a device on the adb input path. */
+const POINTER_RETRY_BACKOFF_MS = 30_000;
 
 /** Resolve a key identifier to an Android keycode. */
 export function resolveKeyCode(code) {
@@ -109,8 +111,8 @@ export class InputDispatcher {
         this.commandQueues = new Map();
         /** Optional emulator gRPC pool; absent means every device uses adb. */
         this.controlPool = controlPool;
-        /** Devices whose gRPC pointer path has failed and fell back to adb. */
-        this.pointerDisabled = new Set();
+        /** Devices whose gRPC pointer path failed, mapped to when to retry it. */
+        this.pointerDisabled = new Map();
     }
 
     /**
@@ -121,8 +123,18 @@ export class InputDispatcher {
      * correctly yields null and keeps the adb path.
      */
     async pointerBackend(deviceId) {
-        if (!this.controlPool || this.pointerDisabled.has(deviceId)) {
+        if (!this.controlPool) {
             return null;
+        }
+        const disabledUntil = this.pointerDisabled.get(deviceId);
+        if (disabledUntil !== undefined) {
+            if (Date.now() < disabledUntil) {
+                return null;
+            }
+            // A failed gesture is usually transient (a restarting emulator, a
+            // momentary timeout). Retrying after a backoff avoids pinning the
+            // device to the slower adb path for the rest of the run.
+            this.pointerDisabled.delete(deviceId);
         }
         const device = this.state.getDeviceOrThrow(deviceId);
         if (device.kind !== "emulator" || !device.serial) {
@@ -154,7 +166,7 @@ export class InputDispatcher {
      * input error — the stream has its own restart and fallback path.
      */
     abandonPointerBackend(deviceId, error) {
-        this.pointerDisabled.add(deviceId);
+        this.pointerDisabled.set(deviceId, Date.now() + POINTER_RETRY_BACKOFF_MS);
         this.touchSessions.delete(deviceId);
         return { deviceId, action: "touch", degraded: true, reason: error?.message ?? String(error) };
     }

@@ -23,6 +23,17 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const RESTART_BACKOFF_MS = 400;
 /** A stream that ran this long before failing counts as healthy, not flapping. */
 const HEALTHY_RUN_MS = 5_000;
+/**
+ * How often to prove the connection is still alive while no frames arrive.
+ *
+ * Silence is normal here — an idle screen produces nothing — so the client's
+ * frame-timeout watchdog is deliberately disabled for this transport. That
+ * removes the only thing that would have noticed a wedged RPC or a half-open
+ * HTTP/2 session, which neither delivers frames nor ends the response. A cheap
+ * `getStatus` on the same channel distinguishes "quiet" from "dead".
+ */
+const LIVENESS_IDLE_MS = 10_000;
+const LIVENESS_TIMEOUT_MS = 8_000;
 
 /**
  * @param {object} options
@@ -52,6 +63,10 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
     let consecutiveFailures = 0;
     let restartCount = 0;
     let lastEmitAt = 0;
+    /** Last time the connection proved itself, by a frame or a successful probe. */
+    let lastActivityAt = Date.now();
+    let livenessTimer = null;
+    let probeInFlight = false;
     let backpressured = false;
     let drainListenerAttached = false;
     let lastError = "";
@@ -95,6 +110,7 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
             return;
         }
         const now = Date.now();
+        lastActivityAt = now;
         if (minFrameIntervalMs && now - lastEmitAt < minFrameIntervalMs) {
             return;
         }
@@ -103,12 +119,41 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
         write(frame(FRAME_TAGS.seed, image.pixels));
     }
 
+    /**
+     * Probe the connection when the picture has been quiet for a while. A silent
+     * stream is usually just an idle screen, so a failed probe — not the silence
+     * itself — is what proves the transport is dead and triggers the caller's
+     * fallback to mirroring.
+     */
+    function startLivenessProbe() {
+        clearInterval(livenessTimer);
+        livenessTimer = setInterval(async () => {
+            if (stopped || probeInFlight || Date.now() - lastActivityAt < LIVENESS_IDLE_MS) {
+                return;
+            }
+            probeInFlight = true;
+            try {
+                await controller.getStatus({ timeoutMs: LIVENESS_TIMEOUT_MS });
+                lastActivityAt = Date.now();
+            } catch (error) {
+                if (!stopped) {
+                    onDiagnostic?.(`gRPC stream failed liveness probe: ${error?.message ?? error}`);
+                    fail(new AppError("grpc_stream_dead", `The emulator stopped responding: ${error?.message ?? error}`, 502));
+                }
+            } finally {
+                probeInFlight = false;
+            }
+        }, LIVENESS_IDLE_MS);
+        livenessTimer.unref?.();
+    }
+
     function fail(error) {
         if (stopped) {
             return;
         }
         stopped = true;
         clearTimeout(restartTimer);
+        clearInterval(livenessTimer);
         abort?.abort();
         emit("error", error);
         stdout.destroy(error);
@@ -166,6 +211,7 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
     }
 
     runStream();
+    startLivenessProbe();
 
     return {
         stdout,
@@ -192,7 +238,9 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
             }
             stopped = true;
             clearTimeout(restartTimer);
+            clearInterval(livenessTimer);
             restartTimer = null;
+            livenessTimer = null;
             abort?.abort();
             if (!stdout.writableEnded) {
                 stdout.end();

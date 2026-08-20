@@ -7,7 +7,7 @@
  * key. Reading these is what lets the extension attach to emulators it did not
  * launch itself — one started from Android Studio, for example.
  */
-import { readdir, readFile } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -93,7 +93,29 @@ function toRecord(entries, pid) {
     };
 }
 
-/** All live emulators that published a discovery file. */
+/**
+ * A discovery file tells us where to connect and which directory to write a
+ * signing key into, so it is only trusted when the current user owns it.
+ *
+ * On Linux the fallback root is the shared system temp directory, where another
+ * user's emulator — or a file planted to look like one — would otherwise be
+ * treated as ours. `lstat` rather than `stat`: a symlink owned by us can point
+ * at a file that is not.
+ */
+async function isOwnedByCurrentUser(target) {
+    if (typeof process.getuid !== "function") {
+        // Windows has no uid; the per-user LOCALAPPDATA root is the boundary there.
+        return true;
+    }
+    try {
+        const stats = await lstat(target);
+        return stats.isSymbolicLink() ? false : stats.uid === process.getuid();
+    } catch {
+        return false;
+    }
+}
+
+/** All live emulators that published a discovery file we trust. */
 export async function listRunningEmulators() {
     const found = [];
     const seen = new Set();
@@ -113,12 +135,23 @@ export async function listRunningEmulators() {
             if (seen.has(pid) || !isProcessAlive(pid)) {
                 continue;
             }
+            const file = path.join(root, name);
+            if (!(await isOwnedByCurrentUser(file))) {
+                continue;
+            }
             try {
-                const record = toRecord(parseDiscoveryIni(await readFile(path.join(root, name), "utf8")), pid);
-                if (record.grpcPort) {
-                    seen.add(pid);
-                    found.push(record);
+                const record = toRecord(parseDiscoveryIni(await readFile(file, "utf8")), pid);
+                if (!record.grpcPort) {
+                    continue;
                 }
+                // The key directory is writable state named by a file we just
+                // read, so it needs the same ownership check rather than
+                // inheriting trust from the discovery file.
+                if (record.jwksDir && !(await isOwnedByCurrentUser(record.jwksDir))) {
+                    continue;
+                }
+                seen.add(pid);
+                found.push(record);
             } catch {
                 // A half-written file during emulator startup is expected; the next
                 // refresh picks it up.

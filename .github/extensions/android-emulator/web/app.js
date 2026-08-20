@@ -471,7 +471,20 @@ function drawVideoFrame(frame) {
     h264CanvasContext().drawImage(frame, 0, 0, elements.h264Screen.width, elements.h264Screen.height);
     clearScreenError();
     elements.screenWindow.classList.add("has-frame");
-    setScreenStatus("Device display ready");
+    setScreenStatus(readyScreenStatus());
+}
+
+/**
+ * An emulator that quietly fell back to mirroring looks identical to one that is
+ * simply slow, which is the confusion this transport work set out to remove. Say
+ * so instead of hiding it behind a generic "ready".
+ */
+function readyScreenStatus() {
+    if (state?.kind === "emulator" && state?.stream?.transport === "mirror") {
+        const reason = state.stream.transportReason;
+        return reason ? `Device display ready (mirrored: ${reason})` : "Device display ready (mirrored)";
+    }
+    return "Device display ready";
 }
 
 /**

@@ -137,6 +137,7 @@ if (!emulator) {
 
 report.assert(Boolean(emulator.grpcPort), "discovery resolves a gRPC port", String(emulator.grpcPort));
 report.assert(emulator.serial === config.serial, "discovery maps console port to adb serial", emulator.serial);
+report.assert(Number.isInteger(emulator.pid) && emulator.pid > 0, "discovery records the emulator pid", String(emulator.pid));
 
 /** Collects framed output until `count` frames arrive or the timeout elapses. */
 async function collectFrames(stream, { count, timeoutMs }) {
@@ -173,6 +174,10 @@ async function collectFrames(stream, { count, timeoutMs }) {
             "gRPC frames carry PNG payloads",
         );
         report.assert(stream.restartCountValue() === 0, "gRPC stream runs without restarts", String(stream.restartCountValue()));
+        // The transport must be visible in state: an emulator that quietly fell
+        // back to mirroring looks exactly like one that is simply slow.
+        const grpcState = await manager.getDeviceState(config.deviceId);
+        report.assert(grpcState.stream.transport === "grpc", "state records the gRPC transport", JSON.stringify(grpcState.stream));
     } finally {
         stream.kill();
     }
@@ -193,9 +198,33 @@ async function collectFrames(stream, { count, timeoutMs }) {
             "mirror transport still produces H.264 config/keyframes",
             [...new Set(frames.map((f) => f.tag))].join(","),
         );
+        const mirrorState = await manager.getDeviceState(config.deviceId);
+        report.assert(mirrorState.stream.transport === "mirror", "state records the mirror transport", JSON.stringify(mirrorState.stream));
     } finally {
         stream.kill();
     }
+}
+
+// A cached connection must not outlive the emulator process it points at: adb
+// reuses a serial when an AVD restarts, but the pid and gRPC port change.
+{
+    const pool = manager.controlPool;
+    const before = await pool.get(config.serial);
+    report.assert(Boolean(before?.controller), "pool opens a connection", before ? `pid ${before.pid}` : "none");
+    await pool.invalidateIfReplaced(config.serial);
+    const after = await pool.get(config.serial);
+    report.assert(after === before, "unchanged emulator keeps its pooled connection");
+
+    // Simulate a replacement by corrupting the recorded identity.
+    const entry = await pool.entries.get(config.serial);
+    entry.pid = -1;
+    await pool.invalidateIfReplaced(config.serial);
+    const replaced = await pool.get(config.serial);
+    report.assert(
+        Boolean(replaced?.controller) && replaced !== before,
+        "replaced emulator gets a fresh connection",
+        replaced ? `pid ${replaced.pid}` : "none",
+    );
 }
 
 // A physical device has no gRPC endpoint, so auto-selection must mirror.

@@ -89,7 +89,28 @@ export class EmulatorControlPool {
         // Prove the credentials before any caller depends on them, so a broken
         // handshake surfaces here rather than mid-gesture.
         await controller.getStatus({ timeoutMs: 10_000 });
-        return { controller, channel, tokens };
+        // The pid and port identify this exact emulator process. adb reuses a
+        // serial when an AVD is restarted, so without them a cached connection
+        // would silently point at a dead endpoint.
+        return { controller, channel, tokens, pid: emulator.pid, grpcPort: emulator.grpcPort };
+    }
+
+    /**
+     * Drop a cached connection if the emulator behind it has been replaced.
+     *
+     * Called on the discovery path rather than on a timer: a restarted AVD keeps
+     * its serial but gets a new pid, gRPC port and key directory.
+     */
+    async invalidateIfReplaced(serial) {
+        const entry = await this.entries.get(serial)?.catch(() => null);
+        if (!entry) {
+            return;
+        }
+        const current = await findEmulatorBySerial(serial);
+        if (!current || current.pid !== entry.pid || current.grpcPort !== entry.grpcPort) {
+            this.onDiagnostic(`gRPC endpoint for ${serial} was replaced; reconnecting`);
+            await this.release(serial);
+        }
     }
 
     /** Forget a device, for example after it disconnects or gRPC starts failing. */
