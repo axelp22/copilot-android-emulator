@@ -433,6 +433,22 @@ export class DeviceRegistry {
         return device.screen;
     }
 
+    /**
+     * Record which transport actually served the last stream.
+     *
+     * Selection is automatic and falls back silently, so without this a
+     * regression in the gRPC path would be indistinguishable from "the emulator
+     * got slow again" — the exact complaint this work set out to fix.
+     */
+    setStreamTransport(deviceId, transport, reason = null) {
+        const device = this.devices.get(deviceId);
+        if (!device) {
+            return;
+        }
+        device.stream = { ...device.stream, transport, transportReason: reason };
+        this.notify(deviceId);
+    }
+
     setStreamPreferences(deviceId, { fps, resolution }) {
         const device = this.getDeviceOrThrow(deviceId);
         const nextFps = fps ?? device.stream.fps;

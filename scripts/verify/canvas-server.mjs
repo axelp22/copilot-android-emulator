@@ -109,9 +109,48 @@ while (Date.now() < deadline) {
 }
 clearInterval(motion);
 void reader.cancel();
-report.assert(tags.includes(0x04), "seed frame delivered");
-report.assert(tags.indexOf(0x01) !== -1 && tags.indexOf(0x01) < tags.indexOf(0x02), "config precedes the keyframe");
-report.assert(tags.filter((tag) => tag === 0x03).length > 10, "delta frames delivered", String(tags.filter((tag) => tag === 0x03).length));
+// Emulators now default to the gRPC transport, which delivers complete PNG
+// stills rather than an AVCC elementary stream, so the assertion depends on
+// which transport the endpoint selected. Both must yield a live picture; the
+// mirror's framing is pinned separately in scripts/verify/grpc-stream.mjs.
+const usedGrpc = tags.length > 0 && tags.every((tag) => tag === 0x04);
+report.assert(tags.length > 0, "stream delivers frames", `${tags.length} frames`);
+if (usedGrpc) {
+    report.note("stream endpoint selected the gRPC transport");
+    report.assert(tags.length > 10, "gRPC transport delivers a sustained frame rate", String(tags.length));
+} else {
+    report.assert(tags.includes(0x04), "seed frame delivered");
+    report.assert(tags.indexOf(0x01) !== -1 && tags.indexOf(0x01) < tags.indexOf(0x02), "config precedes the keyframe");
+    report.assert(
+        tags.filter((tag) => tag === 0x03).length > 10,
+        "delta frames delivered",
+        String(tags.filter((tag) => tag === 0x03).length),
+    );
+}
+
+// Forcing the mirror must keep working regardless of the device's default.
+const mirrorResponse = await fetch(`${root}api/stream.h264?fps=30&resolution=25&transport=mirror`);
+const mirrorReader = mirrorResponse.body.getReader();
+const pushMirror = createFrameReader();
+const mirrorTags = [];
+const mirrorDeadline = Date.now() + 12_000;
+while (Date.now() < mirrorDeadline && !mirrorTags.some((tag) => tag === 0x01 || tag === 0x02)) {
+    const next = await Promise.race([
+        mirrorReader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 2_000)),
+    ]);
+    if (next.timedOut) continue;
+    if (next.done) break;
+    for (const frame of pushMirror(next.value)) {
+        mirrorTags.push(frame.tag);
+    }
+}
+void mirrorReader.cancel();
+report.assert(
+    mirrorTags.some((tag) => tag === 0x01 || tag === 0x02),
+    "transport=mirror forces the H.264 stream",
+    [...new Set(mirrorTags)].join(","),
+);
 
 // --- manual input ------------------------------------------------------------
 const tap = await (await fetch(`${root}api/input/tap`, {

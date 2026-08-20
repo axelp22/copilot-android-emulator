@@ -30,6 +30,8 @@ import { AppBuildService } from "./app-build-service.mjs";
 import { DeviceRegistry } from "./device-registry.mjs";
 import { InputDispatcher } from "./input-dispatcher.mjs";
 import { ScreenService } from "./screen-service.mjs";
+import { emulatorAccessPath } from "./emulator-access.mjs";
+import { EmulatorControlPool } from "./emulator-control-pool.mjs";
 import { VideoRecordingService } from "./video-recording-service.mjs";
 
 const BOOT_TIMEOUT_MS = 180_000;
@@ -89,11 +91,15 @@ export class DeviceSessionManager {
         this.avdListCache = null;
         this.avdListFetchedAt = 0;
         this.onDiagnostic = onDiagnostic ?? (() => {});
+        // Shared emulator gRPC connections, used by both the frame source and
+        // input so a stream restart never disturbs an in-flight gesture.
+        this.controlPool = new EmulatorControlPool({ onDiagnostic: this.onDiagnostic });
         this.screen = new ScreenService({
             state: this.state,
             artifactsRoot: () => this.artifactsRoot,
             ensureBooted: (deviceId) => this.ensureBooted(deviceId),
             onDiagnostic: this.onDiagnostic,
+            controlPool: this.controlPool,
         });
         this.video = new VideoRecordingService({
             state: this.state,
@@ -105,6 +111,7 @@ export class DeviceSessionManager {
             ensureBooted: (deviceId) => this.ensureBooted(deviceId),
             screenSize: (deviceId) => this.screen.screenSize(deviceId),
             refreshScreenMetrics: (deviceId) => this.screen.refreshScreenMetrics(deviceId),
+            controlPool: this.controlPool,
         });
     }
 
@@ -698,10 +705,19 @@ export class DeviceSessionManager {
         try {
             const emulatorPath = await requireEmulatorBinary();
             const before = new Set((await listAttached()).map((entry) => entry.serial));
-            const child = spawn(emulatorPath, ["-avd", device.avdName, "-no-snapshot-save"], {
-                detached: true,
-                stdio: "ignore",
-            });
+            // gRPC is already enabled by default on current emulators; the custom
+            // allowlist exists so this extension can authenticate as itself with
+            // only the methods it needs, instead of borrowing Android Studio's
+            // blanket-access issuer. The bundled list keeps the Android Studio
+            // entry, so Studio can still attach to emulators started here.
+            const child = spawn(
+                emulatorPath,
+                ["-avd", device.avdName, "-no-snapshot-save", "-grpc-allowlist", emulatorAccessPath()],
+                {
+                    detached: true,
+                    stdio: "ignore",
+                },
+            );
             child.unref();
 
             const serial = await this.waitForNewEmulatorSerial(device.avdName, before);
@@ -780,6 +796,9 @@ export class DeviceSessionManager {
         }
 
         this.deviceMetaCache.delete(serial);
+        // The gRPC endpoint dies with the emulator, and a later boot of the same
+        // AVD gets a fresh port and key directory, so the cached channel must go.
+        await this.controlPool.release(serial).catch(() => {});
         await this.refreshDevicesNow();
         this.state.setDeviceState(deviceId, DEVICE_STATES.shutdown);
         this.state.setSerial(deviceId, null);
@@ -970,6 +989,11 @@ export class DeviceSessionManager {
         return this.screen.createH264Stream(input);
     }
 
+    /** Transport-selecting entry point: gRPC for local emulators, mirror otherwise. */
+    createVideoStream(input) {
+        return this.screen.createVideoStream(input);
+    }
+
     setStreamPreferences(deviceId, preferences) {
         return this.state.setStreamPreferences(deviceId, preferences);
     }
@@ -1090,6 +1114,7 @@ export class DeviceSessionManager {
         await this.build.stopAll().catch(() => {});
         await this.video.stopAll().catch(() => {});
         this.input.clearTouchSessions();
+        await this.controlPool.disposeAll().catch(() => {});
         // Never leave a device taken, or a queue blocked, by a session that has exited.
         await this.claims.releaseAll().catch(() => {});
         await this.queue.releaseAll().catch(() => {});

@@ -1,0 +1,30 @@
+{
+    "_comment": "gRPC access policy for emulators this extension launches. It mirrors the SDK's stock allowlist so Android Studio's embedded emulator keeps working against these emulators, and adds a dedicated issuer for this extension. Without this file the extension would have to present itself as 'android-studio', the only stock issuer granted screen access.",
+    "unprotected": [],
+    "allowlist": [
+        {
+            "iss": "android-studio",
+            "allowed": [
+                "/android.emulation.control.EmulatorController/.*",
+                "/android.emulation.control.UiController/.*",
+                "/android.emulation.control.SnapshotService/.*",
+                "/android.emulation.control.incubating.*",
+                "/android.emulation.forwarding.ServiceForwarder/.*"
+            ]
+        },
+        {
+            "_comment": "Least privilege: screen capture and input only. No snapshot, forwarding or UI control.",
+            "iss": "copilot-android-emulator",
+            "allowed": [
+                "/android.emulation.control.EmulatorController/getStatus",
+                "/android.emulation.control.EmulatorController/getScreenshot",
+                "/android.emulation.control.EmulatorController/streamScreenshot",
+                "/android.emulation.control.EmulatorController/sendTouch",
+                "/android.emulation.control.EmulatorController/sendKey",
+                "/android.emulation.control.EmulatorController/sendMouse",
+                "/android.emulation.control.EmulatorController/getPhysicalModel",
+                "/android.emulation.control.EmulatorController/setPhysicalModel"
+            ]
+        }
+    ]
+}
