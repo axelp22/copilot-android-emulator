@@ -88,14 +88,6 @@ function transportFrom(value) {
 
 const EXPECTED_SOCKET_ERROR_CODES = new Set(["ECONNRESET", "EPIPE", "ERR_STREAM_PREMATURE_CLOSE"]);
 
-function safeWrite(stream, chunk) {
-    if (stream.destroyed || stream.writableEnded) {
-        return false;
-    }
-    stream.write(chunk);
-    return true;
-}
-
 export async function createCanvasServer({
     manager,
     instanceId,
@@ -140,27 +132,35 @@ export async function createCanvasServer({
         return `data: ${JSON.stringify(state)}\n\n`;
     }
 
-    function writeStateEventTo(client, payload) {
-        if (saturatedClients.has(client) || client.destroyed || client.writableEnded) {
-            return;
+    /**
+     * Writes one SSE payload, honouring backpressure. Returns false only when
+     * the client is gone; a saturated client is skipped and caught up with
+     * current state once it drains.
+     */
+    function writeSseTo(client, payload) {
+        if (client.destroyed || client.writableEnded) {
+            return false;
         }
-        if (client.write(payload) !== false) {
-            return;
+        if (saturatedClients.has(client)) {
+            return true;
         }
-        saturatedClients.add(client);
-        client.once("drain", () => {
-            saturatedClients.delete(client);
-            // Send what is true now, not the event that was skipped.
-            if (sseClients.has(client)) {
-                writeStateEventTo(client, stateEventPayload());
-            }
-        });
+        if (client.write(payload) === false) {
+            saturatedClients.add(client);
+            client.once("drain", () => {
+                saturatedClients.delete(client);
+                // Send what is true now, not the event that was skipped.
+                if (sseClients.has(client)) {
+                    writeSseTo(client, stateEventPayload());
+                }
+            });
+        }
+        return true;
     }
 
     function writeStateEvent() {
         const payload = stateEventPayload();
         for (const client of sseClients) {
-            writeStateEventTo(client, payload);
+            writeSseTo(client, payload);
         }
     }
 
@@ -332,15 +332,13 @@ export async function createCanvasServer({
                 res.write("\n");
                 writeStateEvent();
                 const heartbeat = setInterval(() => {
-                    // Routed through the same saturation state as state events: a
-                    // heartbeat that ignored it would keep buffering on exactly the
-                    // client the coalescing exists to protect.
-                    if (saturatedClients.has(res)) {
-                        return;
-                    }
-                    if (!safeWrite(res, ": ping\n\n")) {
+                    // Written through the same helper as state events so a
+                    // heartbeat that lands on a full socket marks the client
+                    // saturated instead of buffering without bound.
+                    if (!writeSseTo(res, ": ping\n\n")) {
                         clearInterval(heartbeat);
                         sseClients.delete(res);
+                        saturatedClients.delete(res);
                     }
                 }, 15_000);
                 heartbeat.unref?.();

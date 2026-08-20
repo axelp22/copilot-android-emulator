@@ -111,6 +111,9 @@ export class EmulatorControlPool {
             // without clearing it the device is pinned to adb until this process
             // exits.
             if (negative === Infinity && (await findEmulatorBySerial(serial))?.grpcPort) {
+                // The cached promise resolved to null; leaving it would keep
+                // `get` answering "no gRPC" even after the backoff is cleared.
+                this.entries.delete(serial);
                 this.unavailableUntil.delete(serial);
                 this.onDiagnostic(`gRPC endpoint appeared for ${serial}; will retry`);
             }

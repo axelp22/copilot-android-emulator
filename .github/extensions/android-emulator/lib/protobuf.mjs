@@ -131,6 +131,13 @@ export function readMessage(buffer, visit) {
         let terminated = false;
         while (offset < buffer.length) {
             const byte = buffer[offset++];
+            // The tenth byte of a 64-bit varint carries bit 63 alone, so only
+            // 0x00 and 0x01 are encodable there. Anything larger sets bits the
+            // value cannot hold and is corrupt rather than a wide number.
+            if (shift === 63n && (byte & 0x7f) > 1) {
+                malformed = true;
+                return 0;
+            }
             result |= BigInt(byte & 0x7f) << shift;
             if ((byte & 0x80) === 0) {
                 terminated = true;
