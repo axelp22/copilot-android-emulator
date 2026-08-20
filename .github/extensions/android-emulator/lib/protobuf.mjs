@@ -16,6 +16,9 @@ export const WIRE = {
     fixed32: 5,
 };
 
+/** Ten bytes is the widest a 64-bit varint can be; anything longer is corrupt. */
+const MAX_VARINT_BYTES = 10;
+
 function encodeVarint(value) {
     let remaining = typeof value === "bigint" ? value : BigInt(Math.trunc(value));
     if (remaining < 0n) {
@@ -119,15 +122,25 @@ export class Writer {
  */
 export function readMessage(buffer, visit) {
     let offset = 0;
+    let malformed = false;
 
     function varint() {
         let result = 0n;
         let shift = 0n;
+        let bytes = 0;
         while (offset < buffer.length) {
             const byte = buffer[offset++];
             result |= BigInt(byte & 0x7f) << shift;
             if ((byte & 0x80) === 0) {
                 break;
+            }
+            // A 64-bit varint is at most ten bytes. Without this ceiling a run of
+            // continuation bytes grows `result` without bound, and every shift
+            // reallocates it: 400KB of 0xFF blocks the event loop for ~16 seconds.
+            bytes += 1;
+            if (bytes >= MAX_VARINT_BYTES) {
+                malformed = true;
+                return 0;
             }
             shift += 7n;
         }
@@ -136,13 +149,20 @@ export function readMessage(buffer, visit) {
 
     while (offset < buffer.length) {
         const key = varint();
+        if (malformed) {
+            return;
+        }
         const fieldNo = Number(key) >> 3;
         const wireType = Number(key) & 7;
         if (wireType === WIRE.varint) {
-            visit(fieldNo, varint());
+            const value = varint();
+            if (malformed) {
+                return;
+            }
+            visit(fieldNo, value);
         } else if (wireType === WIRE.bytes) {
             const length = Number(varint());
-            if (offset + length > buffer.length) {
+            if (malformed || offset + length > buffer.length) {
                 return;
             }
             visit(fieldNo, buffer.subarray(offset, offset + length));

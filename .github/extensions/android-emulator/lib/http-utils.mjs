@@ -20,8 +20,22 @@ function isLoopbackHost(value) {
     if (!value) {
         return false;
     }
-    const host = value.split(":")[0]?.toLowerCase();
-    return host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
+    // Parsed rather than split on ":", which mangles a bracketed IPv6 authority
+    // like `[::1]:8080` into "[" and rejects a host that is on the allowlist.
+    // A real Host header is only an authority, so anything carrying userinfo or a
+    // path is rejected outright rather than handed to the URL parser.
+    const authority = String(value).trim();
+    if (authority.includes("@") || authority.includes("/")) {
+        return false;
+    }
+    let hostname;
+    try {
+        hostname = new URL(`http://${authority}`).hostname;
+    } catch {
+        return false;
+    }
+    const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
 export function assertLoopbackRequest(req) {

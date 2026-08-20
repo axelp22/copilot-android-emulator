@@ -33,6 +33,12 @@ const STATUS_NAMES = Object.fromEntries(Object.entries(GRPC_STATUS).map(([name, 
  */
 const WINDOW_SIZE = 32 * 1024 * 1024;
 
+/**
+ * Upper bound on a single decoded message, above the largest frame the emulator
+ * sends but far below the 4GB a `uint32` length prefix can claim.
+ */
+const MAX_GRPC_MESSAGE_BYTES = 128 * 1024 * 1024;
+
 function statusError(status, message, method) {
     const name = STATUS_NAMES[status] ?? `code_${status}`;
     // Auth failures are the ones worth naming precisely: they are the difference
@@ -60,20 +66,53 @@ export function encodeGrpcMessage(payload) {
 /**
  * Incremental reader for the gRPC envelope. Messages routinely straddle HTTP/2
  * DATA frames, and a multi-megabyte screenshot always does.
+ *
+ * Chunks are held unjoined until a whole message has arrived. Concatenating on
+ * every DATA frame recopies everything received so far, which is quadratic in
+ * the message size on exactly the payloads that are largest.
  */
 export function createGrpcMessageParser(onMessage) {
-    let buffer = Buffer.alloc(0);
+    let chunks = [];
+    let buffered = 0;
+
+    /** Reads one byte across the chunk boundaries, so the 5-byte header can be
+     * inspected without joining what may be tens of megabytes behind it. */
+    function byteAt(index) {
+        let remaining = index;
+        for (const chunk of chunks) {
+            if (remaining < chunk.length) {
+                return chunk[remaining];
+            }
+            remaining -= chunk.length;
+        }
+        return 0;
+    }
+
     return function push(chunk) {
-        buffer = buffer.length === 0 ? Buffer.from(chunk) : Buffer.concat([buffer, chunk]);
-        while (buffer.length >= 5) {
-            const length = buffer.readUInt32BE(1);
-            if (buffer.length < 5 + length) {
+        chunks.push(chunk);
+        buffered += chunk.length;
+
+        while (buffered >= 5) {
+            const length = ((byteAt(1) << 24) | (byteAt(2) << 16) | (byteAt(3) << 8) | byteAt(4)) >>> 0;
+            if (length > MAX_GRPC_MESSAGE_BYTES) {
+                // Otherwise a bad length prefix makes this buffer toward 4GB
+                // waiting for a message that will never be completed.
+                throw new AppError(
+                    "grpc_message_too_large",
+                    `gRPC message of ${length} bytes exceeds the ${MAX_GRPC_MESSAGE_BYTES}-byte limit.`,
+                    502,
+                );
+            }
+            if (buffered < 5 + length) {
                 return;
             }
-            const payload = buffer.subarray(5, 5 + length);
-            // Copy: the caller may retain the payload past the next concat.
-            onMessage(Buffer.from(payload));
-            buffer = buffer.subarray(5 + length);
+            const joined = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, buffered);
+            // Copy both halves: the caller may retain the payload, and a subarray
+            // of `joined` would pin the whole backing store behind the remainder.
+            onMessage(Buffer.from(joined.subarray(5, 5 + length)));
+            const rest = joined.subarray(5 + length);
+            chunks = rest.length > 0 ? [Buffer.from(rest)] : [];
+            buffered = rest.length;
         }
     };
 }

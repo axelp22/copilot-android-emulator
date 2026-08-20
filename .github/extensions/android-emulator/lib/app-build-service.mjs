@@ -8,6 +8,25 @@ const CONFIG_FILENAMES = [".android-emulator.json", "android-emulator.json", ".g
 const DEFAULT_TASK = "installDebug";
 const MAX_LOG_LINES = 400;
 
+/**
+ * Gradle reads a leading `-` as an option, and options such as
+ * `--init-script=<file>` run arbitrary code before the build starts. Task names
+ * never begin with one, so refusing them keeps a hostile
+ * `.android-emulator.json` -- or a tool call written by a prompt-injected agent
+ * -- from turning "Install" into host code execution.
+ */
+function assertSafeTask(task) {
+    const value = String(task ?? "").trim();
+    if (value.startsWith("-") || !/^:?[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)*$/.test(value)) {
+        throw new AppError(
+            "invalid_gradle_task",
+            `Refusing to run "${value}": expected a Gradle task name such as ":app:installDebug".`,
+            400,
+        );
+    }
+    return value;
+}
+
 /** Walks up from `from` looking for a Gradle wrapper, so nested module dirs work. */
 async function findGradleRoot(from) {
     let dir = path.resolve(from);
@@ -233,7 +252,7 @@ export class AppBuildService {
         }
 
         const device = this.manager.snapshot(deviceId);
-        const task = taskOverride ?? plan.task;
+        const task = assertSafeTask(taskOverride ?? plan.task);
         const gradle = await findGradleRoot(this.workingDirectory);
 
         run.step = "build";

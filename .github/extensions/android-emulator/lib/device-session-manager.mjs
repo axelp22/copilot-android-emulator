@@ -1191,6 +1191,12 @@ export class DeviceSessionManager {
         if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/.test(String(packageName))) {
             throw new AppError("invalid_package", `Invalid package name: ${packageName}`, 400);
         }
+        // `adb shell` joins its arguments into one string that the device shell
+        // parses, so an unchecked component name is a device-side command
+        // injection -- the same reason `input text` is quoted before it is sent.
+        if (activity !== undefined && activity !== null && !/^\.?[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)*$/.test(String(activity))) {
+            throw new AppError("invalid_activity", `Invalid activity name: ${activity}`, 400);
+        }
 
         const stdout = activity
             ? await adbShell(serial, ["am", "start", "-n", `${packageName}/${activity}`], { timeout: 60_000 })

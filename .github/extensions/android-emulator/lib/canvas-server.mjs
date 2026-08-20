@@ -461,13 +461,17 @@ export async function createCanvasServer({
             if (route === "/api/install") {
                 // Deliberately not awaited: a Gradle build can take minutes, and the
                 // canvas follows its progress over SSE rather than a hanging request.
-                const target = requireDevice();
-                void manager.buildInstallLaunch({ deviceId: target, task: body?.task }).catch((error) => {
-                    diagnostic(`install failed: ${error.message}`);
-                    // A refusal happens before any run exists, so record it or the
-                    // canvas would show nothing at all after the click.
-                    manager.reportInstallFailure(target, error.message);
-                });
+                // The trailing catch matters as much as the first: a throw inside an
+                // unawaited handler is an unhandled rejection, which ends the process.
+                void manager
+                    .buildInstallLaunch({ deviceId: target, task: body?.task })
+                    .catch((error) => {
+                        onDiagnostic?.(`install failed: ${error.message}`);
+                        // A refusal happens before any run exists, so record it or the
+                        // canvas would show nothing at all after the click.
+                        manager.reportInstallFailure(target, error.message);
+                    })
+                    .catch((error) => handleConnectionError(error, "install failure reporting failed"));
                 json(res, 202, { started: true });
                 return;
             }
@@ -480,11 +484,15 @@ export async function createCanvasServer({
                 return;
             }
 
+            // `deviceId` is pinned *after* the body, not before it. Spreading last
+            // let a request name its own device and act on one whose lease and
+            // cross-session hold were never checked -- the checks above all read
+            // `target`.
             const inputRoutes = {
-                "/api/input/tap": () => manager.tap({ deviceId: target, ...body }),
-                "/api/input/swipe": () => manager.swipe({ deviceId: target, ...body }),
-                "/api/input/key": () => manager.sendKey({ deviceId: target, ...body }),
-                "/api/input/text": () => manager.sendText({ deviceId: target, ...body }),
+                "/api/input/tap": () => manager.tap({ ...body, deviceId: target }),
+                "/api/input/swipe": () => manager.swipe({ ...body, deviceId: target }),
+                "/api/input/key": () => manager.sendKey({ ...body, deviceId: target }),
+                "/api/input/text": () => manager.sendText({ ...body, deviceId: target }),
             };
             if (Object.hasOwn(inputRoutes, route)) {
                 enforceNotHeldElsewhere(targetState);
@@ -495,7 +503,7 @@ export async function createCanvasServer({
             if (route === "/api/input/touch") {
                 enforceNotHeldElsewhere(targetState);
                 const result = await runManualOperation(async () => {
-                    const outcome = await manager.touch({ deviceId: target, ...body });
+                    const outcome = await manager.touch({ ...body, deviceId: target });
                     fallbackTouchActive = !(body?.phase === "up" || body?.phase === "cancel");
                     const currentState = manager.getCachedDeviceState(target);
                     if (!acceptingManualInput || currentState.lease?.active || currentState.controlPending) {
