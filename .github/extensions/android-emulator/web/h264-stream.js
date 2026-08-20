@@ -29,10 +29,16 @@ export function supportsVideoDecoder() {
 }
 
 /**
- * Reads the tagged framing produced by `lib/h264-stream.mjs`:
+ * Reads the tagged framing produced by the host.
+ *
  * `[uint32 length][uint8 tag][payload]`, where tag `0x01` is the avcC decoder
- * config, `0x02`/`0x03` are AVCC key/delta samples, and `0x04` is a PNG seed
- * frame that paints the canvas before the first keyframe arrives.
+ * config, `0x02`/`0x03` are AVCC key/delta samples, and `0x04` is a complete PNG
+ * still.
+ *
+ * Both host transports use this framing. The `screenrecord` mirror sends video
+ * samples with the occasional still; the emulator's gRPC transport sends stills
+ * only, so a stream containing no `0x01`-`0x03` frames at all is normal and must
+ * still paint.
  */
 export function createH264StreamController({ onFrame, onError }) {
     let abortController = null;
@@ -44,6 +50,13 @@ export function createH264StreamController({ onFrame, onError }) {
     let awaitingKeyframe = false;
     let recoveryAttempts = 0;
     let recoveryWindowStartedAt = 0;
+    /**
+     * Whether the host announced a still-based transport. Set from the response
+     * header rather than inferred from payload tags: a mirrored stream whose
+     * encoder has stalled also carries nothing but stills, and that case must
+     * still be detected as a stall.
+     */
+    let stillStream = false;
 
     function stop() {
         abortController?.abort();
@@ -58,6 +71,7 @@ export function createH264StreamController({ onFrame, onError }) {
         decoder = null;
         currentDescription = null;
         awaitingKeyframe = false;
+        stillStream = false;
     }
 
     function fail(error) {
@@ -175,8 +189,9 @@ export function createH264StreamController({ onFrame, onError }) {
             const response = await fetch(url, { signal });
             if (!response.ok) {
                 const payload = await response.json().catch(() => ({}));
-                throw new Error(payload?.error?.message ?? `H.264 stream failed (${response.status})`);
+                throw new Error(payload?.error?.message ?? `Device stream failed (${response.status})`);
             }
+            stillStream = response.headers.get("X-Stream-Transport") === "grpc";
             const reader = response.body.getReader();
             let buffer = new Uint8Array(0);
             while (!signal.aborted) {
@@ -235,6 +250,13 @@ export function createH264StreamController({ onFrame, onError }) {
                     buffer = buffer.subarray(offset);
                 }
             }
+            // Reaching here without an abort means the host closed the stream.
+            // A still-based stream is legitimately silent while the screen does
+            // not change, so silence cannot be treated as failure; the body
+            // ending is the only reliable signal that it has actually died.
+            if (!signal.aborted) {
+                fail(new Error("The device stream ended unexpectedly."));
+            }
         } catch (error) {
             if (!signal.aborted) {
                 fail(error);
@@ -242,5 +264,14 @@ export function createH264StreamController({ onFrame, onError }) {
         }
     }
 
-    return { start, stop };
+    return {
+        start,
+        stop,
+        /**
+         * True while the host is sending complete stills rather than encoded
+         * video. Callers use this to suppress frame-rate health warnings, which
+         * only mean something for a continuously encoding source.
+         */
+        isStillStream: () => stillStream,
+    };
 }

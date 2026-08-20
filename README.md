@@ -70,45 +70,87 @@ time-limited lease so they cannot conflict with manual input.
 Physical devices are supported for screen, input, and screenshots, but the extension
 never boots or shuts them down.
 
+## How the screen is streamed
+
+The extension picks a transport per device.
+
+**Emulators use the emulator's own gRPC control plane** (`EmulatorController`), the same
+interface Android Studio's embedded emulator uses. Frames are complete PNG stills pushed
+as the guest produces them, and pointer input is delivered as real multitouch events.
+Nothing goes through `adb` on this path, so none of the `screenrecord` limitations below
+apply.
+
+**Physical devices are mirrored** with `adb exec-out screenrecord`, decoded as H.264 by
+WebCodecs in the canvas. Emulators fall back to this automatically whenever gRPC is not
+usable — most commonly when the emulator runs on another machine, since it is reached
+over an adb tunnel and its discovery file is not present locally. A bandwidth-constrained
+link is exactly where the compressed mirror is the better choice anyway.
+
+Measured on a Pixel 10 Pro XL AVD, gRPC against the mirror:
+
+| Capture | Transport | Latency (p50) | Bandwidth |
+| --- | --- | --- | --- |
+| 25% | gRPC | 7ms | 0.9MB/s |
+| 50% | gRPC | 25ms | 2.2MB/s |
+| 50% | mirror | ~200ms | ~1MB/s |
+| 100% | mirror | ~436ms | ~1MB/s |
+
+Both transports share one wire format, so the canvas needs no knowledge of which is in
+use. You can pin one for diagnosis with `?transport=grpc` or `?transport=mirror` on the
+stream endpoint.
+
+Emulators this extension launches are started with a bundled gRPC allowlist so it can
+authenticate as itself with only the methods it needs, rather than borrowing Android
+Studio's blanket-access identity. The bundled list keeps Android Studio's own entry, so
+Studio can still attach to those emulators. An emulator started elsewhere keeps the
+SDK's stock allowlist, which grants screen access to one issuer only, so the extension
+presents that identity when attaching to it.
+
 ## Known limitations
 
-- **Manual dragging is approximated.** `adb shell input` has no down/move/up primitive,
-  so pointer moves are coalesced into chained `input swipe` segments. Scrolling and
-  flinging feel close to native, but each segment is a separate gesture on the device,
-  so gestures that depend on a single continuous touch — drag-and-drop, pinch, or
-  long-press-then-drag — will not behave the way they do on real hardware. A pointer
-  that never leaves a small radius is sent as a tap instead.
-- **Frame rate is approximate.** `screenrecord` has no frame-rate flag, so the FPS
-  control tunes the bit-rate and capture size rather than setting a hard frame rate.
-- **Emulators are much less smooth than physical devices, and get worse over time.**
-  A connected Pixel 8 Pro holds ~50fps with ~20ms between frames. A Pixel 10 Pro XL
-  AVD on the same code path starts around 25fps and degrades with sustained capture —
-  measured falling to 12fps, then 6fps, then below 1fps, recovering only on restart.
-  Neither guest CPU (idle) nor host CPU (one core) is saturated, and the GPU is
-  hardware accelerated, so this is a limitation of the emulator's capture path rather
-  than a resource shortage or a setting.
+- **Manual dragging is approximated on physical devices.** `adb shell input` has no
+  down/move/up primitive, so pointer moves are coalesced into chained `input swipe`
+  segments. Scrolling and flinging feel close to native, but each segment is a separate
+  gesture on the device, so gestures that depend on a single continuous touch —
+  drag-and-drop, pinch, or long-press-then-drag — will not behave the way they do on
+  real hardware. A pointer that never leaves a small radius is sent as a tap instead.
+  Emulators are not affected: gRPC delivers a genuine continuous touch.
+- **Frame rate is approximate on the mirror.** `screenrecord` has no frame-rate flag, so
+  the FPS control tunes the bit-rate and capture size rather than setting a hard frame
+  rate. On the gRPC transport the FPS control is an upper bound, and frames arrive only
+  when the screen actually changes.
+- **Emulator capture over the mirror is slow, and degrades over time.** A connected
+  Pixel 8 Pro holds ~50fps with ~20ms between frames. The same code path on a Pixel 10
+  Pro XL AVD starts around 25fps and degrades with sustained capture — measured falling
+  to 12fps, then 6fps, then below 1fps, recovering only on restart. This is a limitation
+  of the emulator's `screenrecord` path rather than a resource shortage.
 
-  **If you want a smooth interactive canvas, use a physical device.** Emulators are
-  still fine for agent-driven automation, where frame rate does not matter. When an
-  emulator does get sluggish, restarting it restores capture speed; the canvas says
-  so when it detects the slowdown.
+  This is the main reason the gRPC transport exists, and it is why emulators no longer
+  use the mirror by default. If an emulator has fallen back to mirroring and feels
+  sluggish, restarting it restores capture speed; the canvas says so when it detects the
+  slowdown.
 
-  Emulators default to a 50% capture, which measured fastest — larger overloads the
-  encoder, and smaller does not help, because pixel count is not the limit. Physical
-  devices default to 100%. Either can be changed from the canvas toolbar.
-- **Input costs roughly 50-190ms per action** on both emulators and devices, because
-  every `adb shell input` starts a new process on the device.
+  Emulators default to a 50% capture, which measured fastest on the mirror and keeps
+  gRPC latency at ~25ms. Physical devices default to 100%. Either can be changed from
+  the canvas toolbar.
+- **Input over adb costs roughly 50-190ms per action**, because every `adb shell input`
+  starts a new process on the device. Emulator input over gRPC does not pay this.
 - **Rotation depends on the app.** Rotating writes `user_rotation`, which the window
   manager may ignore when the foreground app pins its orientation. `rotate_device`
   reports whether the rotation was actually applied.
-- **Streams restart every 180 seconds.** `screenrecord` hard-stops at that point. The
-  child is respawned transparently and parameter sets are re-sent, so the canvas keeps
-  its last frame across the seam instead of dropping the video.
-- **Emulator encoders can stall under heavy repeated capture.** After many streams have
-  been started and stopped, an emulator may return no video at all. The extension
-  detects this and reports an error rather than retrying silently; restarting the
-  emulator clears it.
-- **Recording is capped at 180 seconds** for the same reason.
+- **Mirrored streams restart every 180 seconds.** `screenrecord` hard-stops at that
+  point. The child is respawned transparently and parameter sets are re-sent, so the
+  canvas keeps its last frame across the seam instead of dropping the video. The gRPC
+  transport has no such limit.
+- **Emulator encoders can stall under heavy repeated capture.** After many mirrored
+  streams have been started and stopped, an emulator may return no video at all. The
+  extension detects this and reports an error rather than retrying silently; restarting
+  the emulator clears it. The gRPC transport does not use the device encoder.
+- **The emulator gRPC API is experimental.** Its own documentation warns the service
+  definition may change without notice, so every failure on that path falls back to
+  mirroring rather than surfacing an error.
+- **Recording is capped at 180 seconds**, because it uses `screenrecord` on every device
+  class.
 - **Queue order comes from the wall clock.** Waiting sessions are ordered by the
   timestamp they wrote, so the machine's clock stepping backwards can let a newer
   ticket go first, and a large step forwards can expire a live hold early. Strict

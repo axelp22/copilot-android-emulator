@@ -52,6 +52,11 @@ const TAP_SLOP_PX = 12;
 const DRAG_SEGMENT_MIN_MS = 16;
 const DRAG_SEGMENT_MAX_MS = 400;
 
+/** Single-finger slot for canvas pointer input over gRPC. */
+const GRPC_TOUCH_IDENTIFIER = 0;
+/** Any non-zero value means "in contact"; the emulator does not scale by it. */
+const GRPC_TOUCH_PRESSURE = 1;
+
 /** Resolve a key identifier to an Android keycode. */
 export function resolveKeyCode(code) {
     if (typeof code === "number" && Number.isInteger(code)) {
@@ -95,13 +100,63 @@ export function escapeInputText(text) {
 }
 
 export class InputDispatcher {
-    constructor({ state, ensureBooted, screenSize, refreshScreenMetrics }) {
+    constructor({ state, ensureBooted, screenSize, refreshScreenMetrics, controlPool = null }) {
         this.state = state;
         this.ensureBooted = ensureBooted;
         this.screenSize = screenSize;
         this.refreshScreenMetrics = refreshScreenMetrics;
         this.touchSessions = new Map();
         this.commandQueues = new Map();
+        /** Optional emulator gRPC pool; absent means every device uses adb. */
+        this.controlPool = controlPool;
+        /** Devices whose gRPC pointer path has failed and fell back to adb. */
+        this.pointerDisabled = new Set();
+    }
+
+    /**
+     * The emulator's gRPC endpoint, when this device has one.
+     *
+     * Only emulators qualify, and only local ones: discovery reads a file the
+     * emulator writes on this machine, so a device reached over an adb tunnel
+     * correctly yields null and keeps the adb path.
+     */
+    async pointerBackend(deviceId) {
+        if (!this.controlPool || this.pointerDisabled.has(deviceId)) {
+            return null;
+        }
+        const device = this.state.getDeviceOrThrow(deviceId);
+        if (device.kind !== "emulator" || !device.serial) {
+            return null;
+        }
+        const entry = await this.controlPool.get(device.serial);
+        return entry?.controller ?? null;
+    }
+
+    /**
+     * Sends one multitouch sample. A pressure of 0 releases the pointer, and the
+     * emulator will otherwise hold the slot for 120 seconds, so a gesture must
+     * always be closed.
+     */
+    async sendGrpcTouch(deviceId, controller, { x, y, pressure }) {
+        await this.enqueue(deviceId, () =>
+            controller.sendTouch({
+                touches: [{ x, y, identifier: GRPC_TOUCH_IDENTIFIER, pressure }],
+                display: 0,
+            }),
+        );
+    }
+
+    /**
+     * Stops using gRPC for this device's pointer after a failure.
+     *
+     * The connection is deliberately left open. It is shared with the video
+     * stream, and closing it here would take the user's picture down over an
+     * input error — the stream has its own restart and fallback path.
+     */
+    abandonPointerBackend(deviceId, error) {
+        this.pointerDisabled.add(deviceId);
+        this.touchSessions.delete(deviceId);
+        return { deviceId, action: "touch", degraded: true, reason: error?.message ?? String(error) };
     }
 
     /** Serialize adb commands per device so gestures never interleave. */
@@ -300,6 +355,49 @@ export class InputDispatcher {
         await this.ensureInputReady(deviceId);
         const [x, y] = await this.toPixels(deviceId, [input.x, input.y], input.coordinateSpace ?? "normalized");
 
+        // A gesture stays on the transport it started on. Re-deciding per event
+        // could hand a gRPC session to the adb branch, which would read anchor
+        // fields it never had and leave the emulator's touch slot held down.
+        const existing = this.touchSession(deviceId);
+        const useGrpc = existing ? existing.grpc === true : Boolean(await this.pointerBackend(deviceId));
+
+        // Emulators get a true pointer: down, move and up are distinct events on
+        // one touch slot. `adb shell input` has no such primitive, so the fallback
+        // below has to approximate a drag with chained `swipe` calls, each of
+        // which the framework sees as a separate gesture.
+        if (useGrpc) {
+            const controller = existing?.controller ?? (await this.pointerBackend(deviceId));
+            if (!controller) {
+                // The connection disappeared mid-gesture; there is nothing left to
+                // release the slot with, so drop the session and degrade.
+                return this.abandonPointerBackend(deviceId, new Error("gRPC control connection was lost."));
+            }
+            try {
+                if (phase === "down") {
+                    // Hold the controller for the gesture's lifetime so a later
+                    // pool change cannot strand the slot we are about to open.
+                    this.touchSessions.set(deviceId, { grpc: true, controller, startX: x, startY: y });
+                    await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: GRPC_TOUCH_PRESSURE });
+                    return { deviceId, action: "touch", phase, x, y, transport: "grpc" };
+                }
+                if (!existing) {
+                    return { deviceId, action: "touch", phase, ignored: true };
+                }
+                if (phase === "move") {
+                    await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: GRPC_TOUCH_PRESSURE });
+                    return { deviceId, action: "touch", phase, x, y, transport: "grpc" };
+                }
+                // phase === "up": release the slot at the final position.
+                this.touchSessions.delete(deviceId);
+                await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 });
+                return { deviceId, action: "touch", phase, x, y, transport: "grpc" };
+            } catch (error) {
+                // Release the slot on a best-effort basis before giving up on it.
+                await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 }).catch(() => {});
+                return this.abandonPointerBackend(deviceId, error);
+            }
+        }
+
         if (phase === "down") {
             this.touchSessions.set(deviceId, {
                 anchorX: x,
@@ -381,6 +479,21 @@ export class InputDispatcher {
         }
         this.touchSessions.delete(deviceId);
 
+        // A gRPC gesture owns a touch slot that the emulator holds for 120s
+        // unless it is explicitly released, so a cancel must still lift. The
+        // controller is the one captured at `down`, so a pool change in the
+        // meantime cannot leave the finger pressed.
+        if (session.grpc) {
+            if (session.controller) {
+                await this.sendGrpcTouch(deviceId, session.controller, {
+                    x: session.startX,
+                    y: session.startY,
+                    pressure: 0,
+                }).catch(() => {});
+            }
+            return;
+        }
+
         if (cancelled) {
             session.pending = null;
             return;
@@ -421,11 +534,27 @@ export class InputDispatcher {
         return this.notifyTouch(input);
     }
 
+    /**
+     * Drops pointer state, lifting any gRPC finger first.
+     *
+     * Deleting the entry alone would abandon a touch slot the emulator is holding
+     * down, leaving the next session that grabs the device with a stuck pointer
+     * for up to 120 seconds.
+     */
     clearTouchSessions(deviceId) {
-        if (deviceId) {
-            this.touchSessions.delete(deviceId);
-            return;
+        const targets = deviceId ? [deviceId] : [...this.touchSessions.keys()];
+        for (const target of targets) {
+            const session = this.touchSessions.get(target);
+            if (session?.grpc && session.controller) {
+                // Fire and forget: callers tear down synchronously, and a failed
+                // lift must not block shutdown.
+                void this.sendGrpcTouch(target, session.controller, {
+                    x: session.startX,
+                    y: session.startY,
+                    pressure: 0,
+                }).catch(() => {});
+            }
+            this.touchSessions.delete(target);
         }
-        this.touchSessions.clear();
     }
 }

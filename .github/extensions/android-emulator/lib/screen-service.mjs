@@ -4,13 +4,16 @@ import { AppError } from "./errors.mjs";
 import { nowIso, streamBitRateFor, streamSizeFor, timestampName } from "./device-model.mjs";
 import { getWmDensity, getWmSize, parsePngDimensions, screencapPng } from "./adb.mjs";
 import { createH264Stream } from "./h264-stream.mjs";
+import { createGrpcFrameStream } from "./grpc-frame-stream.mjs";
 
 export class ScreenService {
-    constructor({ state, artifactsRoot, ensureBooted, onDiagnostic }) {
+    constructor({ state, artifactsRoot, ensureBooted, onDiagnostic, controlPool = null }) {
         this.state = state;
         this.artifactsRoot = artifactsRoot;
         this.ensureBooted = ensureBooted;
         this.onDiagnostic = onDiagnostic ?? (() => {});
+        /** Shared emulator gRPC connections; absent means mirror everything. */
+        this.controlPool = controlPool;
     }
 
     async captureScreen(deviceId) {
@@ -74,6 +77,12 @@ export class ScreenService {
         return parsePngDimensions(await screencapPng(serial));
     }
 
+    /**
+     * The H.264 mirror, which works for every device class.
+     *
+     * Physical devices always take this path: they have hardware encoders, and
+     * no equivalent of the emulator's control plane exists for them.
+     */
     async createH264Stream({ deviceId, fps, resolution, timeLimitSeconds }) {
         await this.ensureBooted(deviceId);
         const serial = this.state.requireSerial(deviceId);
@@ -87,5 +96,68 @@ export class ScreenService {
             timeLimitSeconds,
             onDiagnostic: (message) => this.onDiagnostic(`[${deviceId}] ${message}`),
         });
+    }
+
+    /**
+     * Picks the best available transport for a device.
+     *
+     * Emulators prefer their own gRPC control plane, which measures far better
+     * than mirroring (~25ms end-to-end at half size against ~200ms) and avoids
+     * the `screenrecord` restart, idle-frame and orphaned-process workarounds
+     * entirely. Everything else mirrors.
+     *
+     * Remote setups need no special handling: discovery reads the emulator's
+     * local discovery file, so an emulator reached over an adb tunnel is simply
+     * never found here and falls through to the mirror, which is what a
+     * bandwidth-constrained link wants anyway.
+     */
+    async createVideoStream({ deviceId, fps, resolution, timeLimitSeconds, transport = "auto" }) {
+        const device = this.state.getDeviceOrThrow(deviceId);
+        if (transport !== "mirror" && device.kind === "emulator") {
+            const stream = await this.#tryGrpcStream({ deviceId, fps, resolution, required: transport === "grpc" });
+            if (stream) {
+                return stream;
+            }
+        }
+        return await this.createH264Stream({ deviceId, fps, resolution, timeLimitSeconds });
+    }
+
+    /**
+     * Returns null when gRPC is unusable so the caller can mirror instead. The
+     * emulator's gRPC surface is documented as experimental, so losing it must
+     * degrade the picture quality, never the session.
+     */
+    async #tryGrpcStream({ deviceId, fps, resolution, required }) {
+        try {
+            await this.ensureBooted(deviceId);
+            const serial = this.state.requireSerial(deviceId);
+            // Borrow the shared connection rather than opening one per stream: the
+            // JWT handshake waits for the emulator to accept a published key, and
+            // paying that on every quality change would stall the first frame.
+            const entry = await this.controlPool?.get(serial);
+            if (!entry?.controller) {
+                if (required) {
+                    throw new AppError(
+                        "grpc_unavailable",
+                        `No local gRPC endpoint was found for ${deviceId}.`,
+                        409,
+                    );
+                }
+                return null;
+            }
+            const device = this.state.getDeviceOrThrow(deviceId);
+            return await createGrpcFrameStream({
+                controller: entry.controller,
+                size: streamSizeFor(device.screen, resolution),
+                fps,
+                onDiagnostic: (message) => this.onDiagnostic(`[${deviceId}] ${message}`),
+            });
+        } catch (error) {
+            if (required) {
+                throw error;
+            }
+            this.onDiagnostic(`[${deviceId}] gRPC stream unavailable, mirroring instead: ${error?.message ?? error}`);
+            return null;
+        }
     }
 }

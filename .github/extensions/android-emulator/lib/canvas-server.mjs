@@ -57,6 +57,11 @@ function streamResolutionFrom(value, fallback = 100) {
     return parsed === 25 || parsed === 50 ? parsed : 100;
 }
 
+/** `auto` picks per device; the explicit values pin one transport for diagnosis. */
+function transportFrom(value) {
+    return value === "mirror" || value === "grpc" ? value : "auto";
+}
+
 const EXPECTED_SOCKET_ERROR_CODES = new Set(["ECONNRESET", "EPIPE", "ERR_STREAM_PREMATURE_CLOSE"]);
 
 function safeWrite(stream, chunk) {
@@ -303,6 +308,10 @@ export async function createCanvasServer({
                 const target = requireDevice();
                 const fps = streamFpsFrom(requestUrl.searchParams.get("fps"));
                 const resolution = streamResolutionFrom(requestUrl.searchParams.get("resolution"));
+                // `auto` prefers the emulator's gRPC control plane and mirrors
+                // otherwise. The override exists so either transport can be
+                // exercised directly when diagnosing a picture problem.
+                const transport = transportFrom(requestUrl.searchParams.get("transport"));
                 const generation = ++streamGeneration;
                 for (const existing of streamChildren) {
                     if (!existing.killed) {
@@ -311,7 +320,7 @@ export async function createCanvasServer({
                 }
                 streamChildren.clear();
 
-                const child = await manager.createH264Stream({ deviceId: target, fps, resolution });
+                const child = await manager.createVideoStream({ deviceId: target, fps, resolution, transport });
                 if (generation !== streamGeneration) {
                     child.kill();
                     res.statusCode = 409;
@@ -320,7 +329,13 @@ export async function createCanvasServer({
                 }
                 streamChildren.add(child);
                 res.statusCode = 200;
-                res.setHeader("Content-Type", "application/vnd.copilot-android-emulator.avcc");
+                // The framing is shared by both transports; the payload tag says
+                // whether a given frame is an AVCC sample or a still.
+                res.setHeader("Content-Type", "application/vnd.copilot-android-emulator.frames");
+                // The client cannot infer this from the payload in time: a stream
+                // of stills is legitimately silent on an idle screen, while a gap
+                // in mirrored video means the capture has stalled.
+                res.setHeader("X-Stream-Transport", child.transport ?? "mirror");
                 res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
                 res.setHeader("Connection", "close");
 
