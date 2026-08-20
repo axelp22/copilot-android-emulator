@@ -33,6 +33,12 @@ const STATUS_NAMES = Object.fromEntries(Object.entries(GRPC_STATUS).map(([name, 
  */
 const WINDOW_SIZE = 32 * 1024 * 1024;
 
+/**
+ * Upper bound on a single decoded message, above the largest frame the emulator
+ * sends but far below the 4GB a `uint32` length prefix can claim.
+ */
+const MAX_GRPC_MESSAGE_BYTES = 128 * 1024 * 1024;
+
 function statusError(status, message, method) {
     const name = STATUS_NAMES[status] ?? `code_${status}`;
     // Auth failures are the ones worth naming precisely: they are the difference
@@ -60,21 +66,75 @@ export function encodeGrpcMessage(payload) {
 /**
  * Incremental reader for the gRPC envelope. Messages routinely straddle HTTP/2
  * DATA frames, and a multi-megabyte screenshot always does.
+ *
+ * Two opposite workloads have to stay cheap, and the obvious implementations are
+ * quadratic in one or the other. Concatenating on every DATA frame recopies the
+ * whole message while a large one is still arriving; joining per message recopies
+ * the whole remainder when one chunk holds many small messages. So chunks are
+ * held unjoined until at least one message is complete, then joined once and
+ * drained with an offset, copying only the trailing remainder.
  */
 export function createGrpcMessageParser(onMessage) {
-    let buffer = Buffer.alloc(0);
-    return function push(chunk) {
-        buffer = buffer.length === 0 ? Buffer.from(chunk) : Buffer.concat([buffer, chunk]);
-        while (buffer.length >= 5) {
-            const length = buffer.readUInt32BE(1);
-            if (buffer.length < 5 + length) {
-                return;
+    let chunks = [];
+    let buffered = 0;
+
+    /** Reads one byte across the chunk boundaries, so the 5-byte header can be
+     * inspected without joining what may be tens of megabytes behind it. */
+    function byteAt(index) {
+        let remaining = index;
+        for (const chunk of chunks) {
+            if (remaining < chunk.length) {
+                return chunk[remaining];
             }
-            const payload = buffer.subarray(5, 5 + length);
-            // Copy: the caller may retain the payload past the next concat.
-            onMessage(Buffer.from(payload));
-            buffer = buffer.subarray(5 + length);
+            remaining -= chunk.length;
         }
+        return 0;
+    }
+
+    function assertLength(length) {
+        if (length > MAX_GRPC_MESSAGE_BYTES) {
+            // Otherwise a bad length prefix makes this buffer toward 4GB waiting
+            // for a message that will never be completed.
+            throw new AppError(
+                "grpc_message_too_large",
+                `gRPC message of ${length} bytes exceeds the ${MAX_GRPC_MESSAGE_BYTES}-byte limit.`,
+                502,
+            );
+        }
+    }
+
+    return function push(chunk) {
+        chunks.push(chunk);
+        buffered += chunk.length;
+        if (buffered < 5) {
+            return;
+        }
+
+        // Peek the first header while still unjoined: a single large message
+        // arriving over many frames must not be recopied on each one.
+        const firstLength = ((byteAt(1) << 24) | (byteAt(2) << 16) | (byteAt(3) << 8) | byteAt(4)) >>> 0;
+        assertLength(firstLength);
+        if (buffered < 5 + firstLength) {
+            return;
+        }
+
+        const joined = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, buffered);
+        let offset = 0;
+        while (buffered - offset >= 5) {
+            const length = joined.readUInt32BE(offset + 1);
+            assertLength(length);
+            if (buffered - offset < 5 + length) {
+                break;
+            }
+            // Copy: the caller may retain the payload, and a subarray of `joined`
+            // would pin the whole backing store behind it.
+            onMessage(Buffer.from(joined.subarray(offset + 5, offset + 5 + length)));
+            offset += 5 + length;
+        }
+
+        const rest = joined.subarray(offset);
+        chunks = rest.length > 0 ? [Buffer.from(rest)] : [];
+        buffered = rest.length;
     };
 }
 
@@ -222,7 +282,16 @@ export function createGrpcChannel({ host = "127.0.0.1", port, authorization = nu
                 }
             });
             req.on("trailers", readStatus);
-            req.on("data", (chunk) => parse(chunk));
+            req.on("data", (chunk) => {
+                // The parser rejects a malformed envelope by throwing, and this is a
+                // raw emitter callback: an escaping throw is an uncaught exception,
+                // which ends the process instead of failing this one RPC.
+                try {
+                    parse(chunk);
+                } catch (error) {
+                    finish(error);
+                }
+            });
             req.on("error", (error) =>
                 finish(new AppError("grpc_transport_error", `${method} failed: ${error.message}`, 502)),
             );

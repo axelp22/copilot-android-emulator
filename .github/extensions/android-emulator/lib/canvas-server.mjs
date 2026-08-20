@@ -88,14 +88,6 @@ function transportFrom(value) {
 
 const EXPECTED_SOCKET_ERROR_CODES = new Set(["ECONNRESET", "EPIPE", "ERR_STREAM_PREMATURE_CLOSE"]);
 
-function safeWrite(stream, chunk) {
-    if (stream.destroyed || stream.writableEnded) {
-        return false;
-    }
-    stream.write(chunk);
-    return true;
-}
-
 export async function createCanvasServer({
     manager,
     instanceId,
@@ -110,6 +102,13 @@ export async function createCanvasServer({
     const token = randomBytes(18).toString("hex");
     const basePath = `/${token}`;
     const sseClients = new Set();
+    /**
+     * SSE clients whose socket is full. A reader that stops draining would
+     * otherwise accumulate one buffered event per device change, without bound.
+     * This stream only ever conveys current state, so a saturated client is
+     * skipped and sent the latest state once it drains.
+     */
+    const saturatedClients = new Set();
     const streamChildren = new Set();
     const touchConnections = new Set();
     const manualOperations = new Set();
@@ -128,11 +127,40 @@ export async function createCanvasServer({
         onDiagnostic?.(`${context}: ${error?.message ?? String(error)}`);
     }
 
-    function writeStateEvent() {
+    function stateEventPayload() {
         const state = deviceId ? formatPublicState(manager.snapshot(deviceId)) : unassignedState();
-        const payload = `data: ${JSON.stringify(state)}\n\n`;
+        return `data: ${JSON.stringify(state)}\n\n`;
+    }
+
+    /**
+     * Writes one SSE payload, honouring backpressure. Returns false only when
+     * the client is gone; a saturated client is skipped and caught up with
+     * current state once it drains.
+     */
+    function writeSseTo(client, payload) {
+        if (client.destroyed || client.writableEnded) {
+            return false;
+        }
+        if (saturatedClients.has(client)) {
+            return true;
+        }
+        if (client.write(payload) === false) {
+            saturatedClients.add(client);
+            client.once("drain", () => {
+                saturatedClients.delete(client);
+                // Send what is true now, not the event that was skipped.
+                if (sseClients.has(client)) {
+                    writeSseTo(client, stateEventPayload());
+                }
+            });
+        }
+        return true;
+    }
+
+    function writeStateEvent() {
+        const payload = stateEventPayload();
         for (const client of sseClients) {
-            safeWrite(client, payload);
+            writeSseTo(client, payload);
         }
     }
 
@@ -304,15 +332,20 @@ export async function createCanvasServer({
                 res.write("\n");
                 writeStateEvent();
                 const heartbeat = setInterval(() => {
-                    if (!safeWrite(res, ": ping\n\n")) {
+                    // Written through the same helper as state events so a
+                    // heartbeat that lands on a full socket marks the client
+                    // saturated instead of buffering without bound.
+                    if (!writeSseTo(res, ": ping\n\n")) {
                         clearInterval(heartbeat);
                         sseClients.delete(res);
+                        saturatedClients.delete(res);
                     }
                 }, 15_000);
                 heartbeat.unref?.();
                 const cleanup = () => {
                     clearInterval(heartbeat);
                     sseClients.delete(res);
+                    saturatedClients.delete(res);
                 };
                 req.on("close", cleanup);
                 res.on("close", cleanup);
@@ -443,7 +476,6 @@ export async function createCanvasServer({
                 json(res, 200, formatPublicState(await runManualOperation(toolbarRoutes[route])));
                 return;
             }
-
             if (route === "/api/stream/preferences") {
                 const next = await runManualOperation(() =>
                     manager.setStreamPreferences(target, { fps: body?.fps, resolution: body?.resolution }),
@@ -453,6 +485,7 @@ export async function createCanvasServer({
             }
 
             if (route === "/api/toolbar/button") {
+                enforceNotHeldElsewhere(targetState);
                 await runManualOperation(() => manager.pressButton({ deviceId: target, button: body?.button }));
                 json(res, 200, formatPublicState(manager.snapshot(target)));
                 return;
@@ -461,18 +494,25 @@ export async function createCanvasServer({
             if (route === "/api/install") {
                 // Deliberately not awaited: a Gradle build can take minutes, and the
                 // canvas follows its progress over SSE rather than a hanging request.
-                const target = requireDevice();
-                void manager.buildInstallLaunch({ deviceId: target, task: body?.task }).catch((error) => {
-                    diagnostic(`install failed: ${error.message}`);
-                    // A refusal happens before any run exists, so record it or the
-                    // canvas would show nothing at all after the click.
-                    manager.reportInstallFailure(target, error.message);
-                });
+                // The trailing catch matters as much as the first: a throw inside an
+                // unawaited handler is an unhandled rejection, which ends the process.
+                void manager
+                    .buildInstallLaunch({ deviceId: target, task: body?.task })
+                    .catch((error) => {
+                        onDiagnostic?.(`install failed: ${error.message}`);
+                        // A refusal happens before any run exists, so record it or the
+                        // canvas would show nothing at all after the click.
+                        manager.reportInstallFailure(target, error.message);
+                    })
+                    .catch((error) => handleConnectionError(error, "install failure reporting failed"));
                 json(res, 202, { started: true });
                 return;
             }
 
             if (route === "/api/toolbar/rotate") {
+                // Rotation drives the device just as directly as a tap does, so it
+                // is refused while another session holds it.
+                enforceNotHeldElsewhere(targetState);
                 const result = await runManualOperation(() =>
                     manager.rotateDevice({ deviceId: target, direction: body?.direction }),
                 );
@@ -480,11 +520,15 @@ export async function createCanvasServer({
                 return;
             }
 
+            // `deviceId` is pinned *after* the body, not before it. Spreading last
+            // let a request name its own device and act on one whose lease and
+            // cross-session hold were never checked -- the checks above all read
+            // `target`.
             const inputRoutes = {
-                "/api/input/tap": () => manager.tap({ deviceId: target, ...body }),
-                "/api/input/swipe": () => manager.swipe({ deviceId: target, ...body }),
-                "/api/input/key": () => manager.sendKey({ deviceId: target, ...body }),
-                "/api/input/text": () => manager.sendText({ deviceId: target, ...body }),
+                "/api/input/tap": () => manager.tap({ ...body, deviceId: target }),
+                "/api/input/swipe": () => manager.swipe({ ...body, deviceId: target }),
+                "/api/input/key": () => manager.sendKey({ ...body, deviceId: target }),
+                "/api/input/text": () => manager.sendText({ ...body, deviceId: target }),
             };
             if (Object.hasOwn(inputRoutes, route)) {
                 enforceNotHeldElsewhere(targetState);
@@ -495,7 +539,7 @@ export async function createCanvasServer({
             if (route === "/api/input/touch") {
                 enforceNotHeldElsewhere(targetState);
                 const result = await runManualOperation(async () => {
-                    const outcome = await manager.touch({ deviceId: target, ...body });
+                    const outcome = await manager.touch({ ...body, deviceId: target });
                     fallbackTouchActive = !(body?.phase === "up" || body?.phase === "cancel");
                     const currentState = manager.getCachedDeviceState(target);
                     if (!acceptingManualInput || currentState.lease?.active || currentState.controlPending) {
@@ -606,7 +650,15 @@ export async function createCanvasServer({
                                     continue;
                                 }
                                 const currentState = manager.getCachedDeviceState(connection.deviceId);
-                                if (currentState.lease?.active || currentState.controlPending) {
+                                // Re-checked per message, not just at connect: an
+                                // agent lease or another session can take the device
+                                // while this socket is open, and a pointer stream is
+                                // exactly the input that would otherwise keep going.
+                                if (
+                                    currentState.lease?.active ||
+                                    currentState.controlPending ||
+                                    currentState.sharing?.heldByOtherSession
+                                ) {
                                     connection.blocked = true;
                                     await cancelPointer();
                                     socket.end();
@@ -671,6 +723,7 @@ export async function createCanvasServer({
                 client.end();
             }
             sseClients.clear();
+            saturatedClients.clear();
             await stopActiveConnections({ blockManualInput: true });
             await new Promise((resolve) => server.close(() => resolve()));
         },

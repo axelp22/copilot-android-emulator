@@ -495,6 +495,15 @@ export class DeviceSessionManager {
         this.discoveryInFlight = (async () => {
             const discovered = await this.discoverDevices();
             this.state.updateFromList(discovered);
+            // A restarted AVD keeps its serial but gets a new pid, gRPC port and
+            // key directory, so a cached control channel for it now points at a
+            // dead endpoint. This is the discovery path that invalidation was
+            // written for; it is a no-op for serials with no cached connection.
+            await Promise.all(
+                discovered
+                    .filter((device) => device.serial)
+                    .map((device) => this.controlPool.invalidateIfReplaced(device.serial).catch(() => {})),
+            );
             this.lastDiscovery = discovered;
             this.discoveryCompletedAt = Date.now();
             return discovered;
@@ -1191,9 +1200,18 @@ export class DeviceSessionManager {
         if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/.test(String(packageName))) {
             throw new AppError("invalid_package", `Invalid package name: ${packageName}`, 400);
         }
+        // `adb shell` joins its arguments into one string that the device shell
+        // parses, so an unchecked component name is a device-side command
+        // injection -- the same reason `input text` is quoted before it is sent.
+        // `$` is a legal Java identifier character and names a nested class, as
+        // in `.MainActivity$Settings`, so it is accepted here and the component
+        // is single-quoted below to keep the device shell from expanding it.
+        if (activity !== undefined && activity !== null && !/^\.?[A-Za-z][A-Za-z0-9_$]*(\.[A-Za-z0-9_$]+)*$/.test(String(activity))) {
+            throw new AppError("invalid_activity", `Invalid activity name: ${activity}`, 400);
+        }
 
         const stdout = activity
-            ? await adbShell(serial, ["am", "start", "-n", `${packageName}/${activity}`], { timeout: 60_000 })
+            ? await adbShell(serial, ["am", "start", "-n", `'${packageName}/${activity}'`], { timeout: 60_000 })
             : await adbShell(
                   serial,
                   ["monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "1"],
