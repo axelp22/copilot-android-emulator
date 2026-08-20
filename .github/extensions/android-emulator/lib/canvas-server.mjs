@@ -47,6 +47,25 @@ function enforceNoAgentLease(state) {
     }
 }
 
+/**
+ * Devices are exclusive across Copilot sessions, and manual input is no less
+ * disruptive than an agent's. Refusing here keeps the rule the same at every
+ * entry point: previously a person could tap through a device that another
+ * session's agent was driving, while the agent's own tools were refused.
+ */
+function enforceNotHeldElsewhere(state) {
+    const sharing = state?.sharing;
+    if (!sharing?.heldByOtherSession) {
+        return;
+    }
+    throw new AppError(
+        "device_busy",
+        `${sharing.holderLabel ?? "Another session"} is using this device` +
+            `${sharing.holderReason ? ` (${sharing.holderReason})` : ""}. Wait for it to finish.`,
+        409,
+    );
+}
+
 function streamFpsFrom(value, fallback = 60) {
     const parsed = Number(value ?? fallback);
     return parsed === 30 ? 30 : 60;
@@ -392,7 +411,9 @@ export async function createCanvasServer({
             }
 
             const target = requireDevice();
-            enforceNoAgentLease(manager.getCachedDeviceState(target));
+            const targetState = manager.getCachedDeviceState(target);
+            enforceNoAgentLease(targetState);
+            enforceNotHeldElsewhere(targetState);
 
             const toolbarRoutes = {
                 "/api/toolbar/boot": () => manager.bootDevice(target),
@@ -505,7 +526,9 @@ export async function createCanvasServer({
                     throw new AppError("manual_input_stopped", "Manual device input is no longer active.", 409);
                 }
                 const target = requireDevice();
-                enforceNoAgentLease(manager.getCachedDeviceState(target));
+                const targetState = manager.getCachedDeviceState(target);
+                enforceNoAgentLease(targetState);
+                enforceNotHeldElsewhere(targetState);
                 await manager.prepareTouchStream(target);
 
                 const key = req.headers["sec-websocket-key"];

@@ -119,8 +119,9 @@ never boots or shuts them down.
   bare `adb` command is detected and shown, but nothing stops it.
 - **A session waiting for "any device" queues on all of them.** It holds a place in
   every candidate's queue until one is granted. That is what makes "give me whichever
-  frees first" work, but a waiter that stalls while still heartbeating keeps those
-  places, which can hold up sessions behind it when devices are scarce.
+  frees first" work. A waiter that stalls no longer reserves the whole pool — a
+  session asking for a specific device may pass it when another of its candidates is
+  free — but it does still hold the last one.
 - **A running build cannot be cancelled from the canvas.** Install runs to completion
   or failure. Closing the canvas does not stop it; only shutting the extension down
   does, which it does before giving the device up.
@@ -246,15 +247,24 @@ across sessions and across separate extension processes:
   racing for a free device cannot both win, because the second create fails.
 - Waiting sessions write a ticket stamped with the time they asked. A device is only
   granted to the oldest waiting ticket, so a session that arrives later cannot jump
-  the queue.
+  the queue. A ticket records every device it would accept, so a waiter for "any"
+  device does not block one it can avoid.
 - Holders and tickets carry a heartbeat and process id. A session that crashes while
   holding a device is reclaimed rather than blocking everyone behind it.
+- Records are replaced by an atomic rename, and a record that cannot be read is left
+  alone rather than reclaimed. A reader catching a heartbeat mid-write must not
+  mistake it for a dead session and take its place in line.
 - Each acquisition carries a token, and renewal, release and stale cleanup all check
   it. A write still in flight from a hold that has since been given up cannot
   resurrect it or overwrite the session that took the device next.
 - A device is given up when the last reason to hold it goes. Control leases are
   meant to lapse rather than be released, so a lapsed lease frees the device — but
-  not while a build this session started is still installing.
+  not while a build, a boot, or any other action this session started is still
+  running against it.
+
+Everything that touches a device takes it the same way: agent actions, installs,
+emulator lifecycle, and manual input from the canvas. Manual input is refused, with
+the holder named, while another session holds the device.
 
 The queue is cooperative in the same way claims are: it coordinates sessions running
 this extension, not other tools on the machine.
@@ -280,6 +290,7 @@ node scripts/verify/recording-coexistence.mjs
 node scripts/verify/boot-lifecycle.mjs
 node scripts/verify/cross-session-claims.mjs
 node scripts/verify/device-queue.mjs
+node scripts/verify/lease-holds.mjs
 node scripts/verify/app-install.mjs
 node scripts/verify/rendered-canvas.mjs "<canvas url>"
 ```

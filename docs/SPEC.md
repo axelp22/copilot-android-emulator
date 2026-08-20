@@ -139,7 +139,12 @@ Keep these behaviors from the reference — they are the reason it feels good to
 - **Control leasing.** Agent-driven input requires an exclusive, time-limited lease
   (`acquire_control` / `renew_control` / `release_control`). Manual canvas input is
   blocked while a lease is active, with a "Take back control" affordance that cancels it.
-  `capture_screen` does **not** require a lease.
+  `capture_screen` does **not** require a lease. A lease holds the device against other
+  Copilot sessions for as long as it lasts, and an action started under a lease keeps
+  holding it until that action finishes, even if the lease lapses first.
+- **One rule at every entry point.** Agent actions, installs, emulator lifecycle and
+  manual canvas input all take the device through the same cross-session queue, so
+  none of them can land on a device another session is using.
 - **Loopback-only canvas server** with a random path token, `assertLoopbackRequest`
   on every route, SSE for state push, WebSocket for touch streaming.
 - **Canvas bindings persisted** under the session workspace so a reopened canvas

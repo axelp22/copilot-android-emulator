@@ -7,7 +7,8 @@
  *
  *   node scripts/verify/device-queue.mjs
  */
-import { mkdtemp, readdir } from "node:fs/promises";
+import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { createReporter, extensionRoot, sleep } from "./_shared.mjs";
@@ -143,6 +144,56 @@ report.assert(
     String(afterStaleRelease.holder?.sessionLabel),
 );
 await secondHolder.release(DEVICE);
+
+// --- a torn read must not evict a live waiter ----------------------------------
+// Records are rewritten by their owner's heartbeat. A reader that catches one
+// mid-write must not conclude the session is gone and delete its ticket, or that
+// session silently loses its place in line.
+const tornSession = session("TORN", "torn-reader");
+const tornTicket = await tornSession.enqueue(DEVICE, { reason: "mid-write" });
+const tornPath = path.join(root, "tickets", `${DEVICE}__${tornTicket.ticketId}.json`);
+await writeFile(tornPath, "", "utf8"); // as if observed part-way through a write
+await a.waitersFor(DEVICE);
+const survived = await readdir(path.join(root, "tickets"));
+report.assert(
+    survived.includes(`${DEVICE}__${tornTicket.ticketId}.json`),
+    "a ticket caught mid-write is not deleted",
+    survived.join(" ") || "none",
+);
+await tornSession.releaseAll();
+
+// --- a pooled waiter must not reserve the whole pool ---------------------------
+// A session asking for "any" device queues on every candidate but consumes one.
+// Sessions after it must still take a device it will not need.
+const POOL_A = "pool-one";
+const POOL_B = "pool-two";
+const pooler = session("POOL", "pooling");
+const specific = session("SPECIFIC", "specific");
+const poolTicket = randomUUID();
+await pooler.enqueue(POOL_A, { reason: "any", ticketId: poolTicket, candidates: [POOL_A, POOL_B] });
+await pooler.enqueue(POOL_B, { reason: "any", ticketId: poolTicket, candidates: [POOL_A, POOL_B] });
+
+// Both free: the pooled waiter can be served by pool-one, so it does not block pool-two.
+const notBlocked = await specific.tryAcquire(POOL_B, { reason: "wants pool-two" });
+report.assert(
+    notBlocked.granted === true,
+    "a pooled waiter does not block a device it can avoid",
+    notBlocked.granted ? "granted" : `blocked by ${notBlocked.blockedBy?.sessionLabel}`,
+);
+await specific.release(POOL_B);
+
+// With its only alternative taken, the pooled waiter really is waiting on this one.
+const poolBlocker = session("POOLBLOCK", "pool-blocker");
+await poolBlocker.acquire(POOL_A, { reason: "busy", timeoutMs: 0 });
+const blockedByPool = await specific.tryAcquire(POOL_B, { reason: "wants pool-two" });
+report.assert(
+    blockedByPool.granted === false,
+    "a pooled waiter with no alternative still holds its place",
+    blockedByPool.granted ? "granted" : `blocked by ${blockedByPool.blockedBy?.sessionLabel}`,
+);
+await poolBlocker.releaseAll();
+await pooler.releaseAll();
+await specific.releaseAll();
 
 // --- nothing is left behind ----------------------------------------------------
 await Promise.all([

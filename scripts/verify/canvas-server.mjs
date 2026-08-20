@@ -16,6 +16,24 @@ const manager = new DeviceSessionManager({ onDiagnostic: (message) => report.not
 manager.setArtifactsRoot(config.artifactsRoot);
 
 const deviceId = await manager.resolveDeviceId(config.deviceId);
+
+// The suite drives a real device, so it takes it the same way any other session
+// would. Without this it races peer Copilot sessions on the same machine: input
+// routes now refuse a device somebody else holds, so a peer taking it mid-run
+// would look like a failure of the code under test.
+const held = await manager.queue.acquire([deviceId], { reason: "canvas-server verification", timeoutMs: 120_000 });
+if (!held) {
+    const [status] = await manager.queue.status([deviceId]);
+    report.note(`${config.deviceId} is held by ${status.holder?.sessionLabel ?? "another session"}; not waiting longer.`);
+    report.skip("canvas server suite", "the device is in use by another session");
+    report.finish();
+}
+await manager.refreshSharing(deviceId);
+// Read the device's real geometry before anything derives expected coordinates
+// from it: a first read can return the fallback size, and a later refresh
+// correcting it would look like the input routes mapping taps wrongly.
+await manager.refreshDeviceGeometry(deviceId).catch(() => {});
+
 const state = await manager.getDeviceState(deviceId);
 
 const server = await createCanvasServer({
