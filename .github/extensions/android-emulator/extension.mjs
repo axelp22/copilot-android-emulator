@@ -330,6 +330,22 @@ const canvas = createCanvas({
                 ),
         },
         {
+            name: "cancel_build",
+            description:
+                "Cancel the build_install_launch running on a device in this session, waiting until Gradle has stopped. " +
+                "If Gradle cannot be confirmed stopped, fails with build_cancel_unconfirmed and the device stays held until it exits. " +
+                "Cannot cancel once the app is being launched, and never affects control leases or other sessions.",
+            inputSchema: actionSchemas.cancelBuild,
+            handler: async (ctx) =>
+                withCanvasError(() =>
+                    manager.cancelBuild({
+                        deviceId: ctx.input.deviceId,
+                        runId: ctx.input.runId,
+                        reason: "Cancelled by the agent.",
+                    }),
+                ),
+        },
+        {
             name: "queue_status",
             description:
                 "Show which Copilot session is using each device and who is waiting behind it. " +
@@ -443,5 +459,13 @@ await copilotSession.log("Android Emulator extension loaded.");
 
 copilotSession.on("session.shutdown", async () => {
     await Promise.allSettled(Array.from(instances.keys(), (instanceId) => closeInstance(instanceId)));
-    await manager.dispose();
+    try {
+        await manager.dispose();
+    } catch (error) {
+        // dispose has released everything it safely could; say what it kept.
+        await Promise.resolve()
+            .then(() => copilotSession.log(`Android Emulator shutdown: ${error.message}`, { level: "error" }))
+            .catch(() => {});
+        throw error;
+    }
 });

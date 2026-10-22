@@ -202,9 +202,52 @@ presents that identity when attaching to it.
   frees first" work. A waiter that stalls no longer reserves the whole pool — a
   session asking for a specific device may pass it when another of its candidates is
   free — but it does still hold the last one.
-- **A running build cannot be cancelled from the canvas.** Install runs to completion
-  or failure. Closing the canvas does not stop it; only shutting the extension down
-  does, which it does before giving the device up.
+- **A build can be cancelled until the app is launched, not after.** Cancel works
+  while the build is being prepared, while it waits behind another build of the same
+  project, and while Gradle runs. Once the launch has been sent to the device it can
+  no longer be taken back, so Cancel is withdrawn. Closing the canvas does not stop a
+  build; shutting the extension down does, before it gives the device up.
+- **Every build runs with `--no-daemon`, and its executor is tracked.** Gradle runs a
+  build in a daemon, not in the `gradlew` client, and a daemon — even the single-use
+  one `--no-daemon` forks — leaves the client's process group, so stopping the client
+  alone does not stop a task already running, an install included. The extension
+  therefore runs `gradlew --no-daemon --init-script <its own script> <task>`: the build
+  never reuses a persistent daemon that may be someone else's, and the process that
+  runs the tasks records its pid, start time and ancestry in
+  `~/.copilot/android-emulator/gradle/executors/` before any task starts. The cost is
+  JVM start-up and configuration on every build (no warm daemon); dependency and
+  build caches are Gradle's usual ones, and no global setting or other daemon is
+  touched.
+- **Cancelling stops exactly this build's processes, then confirms them gone.** On
+  macOS and Linux the wrapper's process group is frozen (`SIGSTOP`), then this build's
+  processes are found — that group, its descendants (the single-use daemon is a child
+  of the client), groups they lead, and the recorded executor, each matched by pid
+  *and* start time so a reused pid is never taken for it — frozen, and killed
+  (`SIGKILL`). The build reports *cancelled*, and releases its device and project, only
+  once a fresh process list shows none of them left; this typically takes well under
+  a second. No other Gradle daemon is ever signalled. A build that ends on its own is
+  likewise only over once its executor has exited (one that lingers past 5 seconds is
+  stopped the same way). With the configuration cache reused, Gradle skips init
+  scripts, so no record is written and the executor is identified by ancestry alone.
+  A build script that deliberately detaches processes from Gradle's tree is not
+  tracked; standard AGP builds do not. On Windows, `taskkill /T /F` stops the tree
+  under the wrapper, and the stop is confirmed only if it succeeded and the recorded
+  executor is no longer running; start times are not checked there, so a live
+  recorded pid is never killed but leaves the stop unconfirmed (below). A forced
+  exit of the host (`SIGKILL` of Copilot itself) skips all of this.
+- **A cancellation that cannot be confirmed is not reported as one.** If the tree is
+  still there after `SIGKILL` — or, on Windows, `taskkill /T /F` fails, even if the
+  wrapper itself exits, since its children can then no longer be found — or the
+  process list cannot be read, Cancel
+  returns promptly with a `build_cancel_unconfirmed` error naming the process id, and
+  the build shows *Cancellation not confirmed*. Until those processes are seen to
+  exit, the build keeps its device hold (even if a control lease on the device ends)
+  and its project's build queue, and no new build starts on that device. The
+  extension keeps checking and releases both once they are gone; end the process
+  yourself if it does not stop. On Windows, once the wrapper has exited after a failed
+  `taskkill`, the exit can no longer be confirmed, so the device stays held until the
+  Copilot session ends. Shutting down in that state fails with
+  `build_stop_unconfirmed`: every other device is released, the affected one is not.
 
 ## Agent tools
 
@@ -216,6 +259,7 @@ presents that identity when attaching to it.
 | `acquire_control` | Acquire an exclusive, time-limited control lease. Pass `waitSeconds` to queue for a busy device, or `deviceId: "any"` to take the first free one. |
 | `queue_status` | Show which session is using each device and who is waiting behind it. |
 | `build_install_launch` | Build the app in this session's working directory with Gradle, install it, and launch it. |
+| `cancel_build` | Cancel this session's running build on a device, waiting until Gradle has stopped. Fails with `build_cancel_unconfirmed`, keeping the device held, if Gradle cannot be confirmed stopped. Pass `runId` to cancel only that build. |
 | `renew_control` | Renew an active control lease. |
 | `release_control` | Release an active control lease. |
 | `capture_screen` | Capture a PNG screenshot as a session artifact without acquiring control. |
@@ -275,11 +319,34 @@ controls. It builds the app in this session's working directory with Gradle,
 installs it on the selected device, and launches it — the loop you would otherwise
 run by hand every time you want to see a change on screen.
 
-It runs `./gradlew installDebug`, with `ANDROID_SERIAL` set to the selected device
-so the app lands on the device you are looking at rather than whichever one `adb`
-picks. The application id is read from the `output-metadata.json` that AGP writes
-beside the APK, which is how the app is launched afterwards. Gradle's output is
-streamed to the canvas, and the button stays busy until the build finishes.
+It runs `./gradlew installDebug` (`gradlew.bat` on Windows), with `ANDROID_SERIAL`
+set to the selected device so the app lands on the device you are looking at rather
+than whichever one `adb` picks. On Windows the batch file is started through
+`cmd.exe` with the wrapper path and task quoted, so project paths with spaces and
+characters such as `&` or `(` work; a path containing `%` or `"` is refused with an
+explanation, because `cmd.exe` cannot quote those safely.
+
+A panel in the corner of the device view shows the build while it runs: the latest
+Gradle step, the log as it arrives (expand **Build log**), and **Cancel**. It stays
+once the build ends, saying whether it finished, failed or was cancelled, until you
+dismiss it. Build failures and refused controls appear there and in a small notice
+rather than replacing the device picture, which keeps streaming.
+
+The app to launch is read from the `output-metadata.json` that AGP writes beside the
+APK, for **the module and variant the task names**: `:app:installDebug`
+reads `app`'s `debug` output, `:feature:shop:installPaidDebug` reads that module's
+`paidDebug` output, and an older release build lying around is never mistaken for
+what was just installed. A task that names no module, like the default
+`installDebug`, works when exactly one module has that variant. When the task does
+not pin down one app — two app modules with a debug variant, or a custom task name —
+the build is reported as failed with the candidates listed instead of launching a
+guess. Set `packageName`, or use a module-qualified `gradleTask`, to resolve it.
+
+The module's directory is assumed from the task path (`:feature:shop` is
+`feature/shop` under the project root) and is not read from Gradle. A module whose
+`projectDir` is remapped in `settings.gradle`, or a custom `buildDir`, is therefore
+not found: the build is reported as failed with "no build output", nothing is
+launched, and setting `packageName` in the config file is the fix.
 
 Override the defaults with a config file at the root of the working directory,
 named `.android-emulator.json`, `android-emulator.json` or
@@ -293,11 +360,17 @@ named `.android-emulator.json`, `android-emulator.json` or
 }
 ```
 
+`packageName` always wins over the build output. With `launch: false`, nothing is
+launched, so an ambiguous app is simply reported as unknown.
+
 The button is disabled, with the reason on hover, when there is no Gradle wrapper
 in the working directory, when the device is not booted, when an agent holds a
 control lease, and — the case this shares with everything else here — when
 **another Copilot session is using the device**. Agents get the same thing as
-`build_install_launch`, and the same refusal.
+`build_install_launch`, and the same refusal, and can stop a build with
+`cancel_build`. Cancel in the canvas is unavailable while an agent holds a control
+lease (take back control first), and cancelling never touches leases or another
+session's work: builds belong to the session that started them.
 
 ## Taking turns on a shared device
 
@@ -359,10 +432,40 @@ and the H.264 streaming design (including the `screenrecord` 180-second restart 
 
 ## Verifying
 
-The suites in [`scripts/verify/`](scripts/verify/) run against real hardware — there is
-no mocking. They cover the device layer, the canvas server and its security posture,
-stream decodability, emulator cold boot, cross-session sharing and queueing, and the
-rendered canvas in a real browser.
+There are two kinds of check: a device-free regression suite that runs anywhere, and
+hardware suites that drive a real emulator or device.
+
+### Regression suite (no device)
+
+Needs Node.js 22 or later and nothing else — there are no npm dependencies to
+install:
+
+```sh
+npm test            # or: node --test "test/*.test.mjs"
+```
+
+It runs [`test/`](test/) with Node's built-in test runner. These tests use fakes and
+fixtures rather than hardware: harmless stand-in `gradlew` / `gradlew.bat` scripts,
+a scripted gRPC controller, and a scripted device behind the real canvas server.
+They cover build cancellation and shutdown (including the process tree), app and
+variant selection, Windows command construction, gRPC frame delivery under FPS caps
+and slow readers, the build panel and notices, streaming without WebCodecs, and the
+device-free queue and lease suites below. The browser tests load the real canvas in
+headless Chrome and **skip, saying so,** when Chrome is not found (set `CHROME_PATH`).
+Skipped tests are reported as skipped, not passed; the Windows-only tests skip on
+other platforms.
+
+CI is configured to run the suite on Linux, macOS and Windows for every pull request
+and every push to `main` ([`.github/workflows/test.yml`](.github/workflows/test.yml)).
+
+### Hardware suites
+
+The suites in [`scripts/verify/`](scripts/verify/) drive real hardware and change its
+state (taps, rotation, boot and shutdown), so they never run in CI and only run when
+you start them. They cover the device layer, the canvas server and its security
+posture, stream decodability, emulator cold boot, cross-session sharing and queueing,
+and the rendered canvas in a real browser. `device-queue.mjs` and `lease-holds.mjs`
+need no device and are also run by `npm test`.
 
 ```sh
 node scripts/verify/device-layer.mjs
@@ -386,10 +489,14 @@ environment variables that select which device to target.
 Everything below is implemented but has **not** been exercised against real
 hardware, so treat it as unproven rather than working:
 
-- **Screenshot fallback for runtimes without WebCodecs.** The canvas falls back to
-  polling `api/frame.png` when `VideoDecoder` is missing, and a watchdog switches to
-  it if nothing paints. Every browser used during verification had WebCodecs, so
-  neither path has been seen to run.
+- **Runtimes without WebCodecs, on a real device.** Without `VideoDecoder` the canvas
+  still opens the device stream, because the emulator's gRPC transport sends PNG
+  stills that need no decoder; only a mirrored H.264 stream falls back to polling
+  `api/frame.png`, once, after which reconnects go straight to screenshots. The gRPC
+  half has been run by hand against a real API 34 emulator in headless Chrome with
+  `VideoDecoder` removed (live frames, taps, and the final frame after a burst). The
+  mirrored fallback is covered only with a scripted device, and every real runtime
+  used so far has had WebCodecs.
 - **Tablet and landscape device chrome.** The frame adapts to tablet metrics and to
   a landscape display, but only a portrait phone has been rendered. Rotation is also
   refused by any app that pins its orientation, so landscape is hard to reach.
@@ -398,12 +505,24 @@ hardware, so treat it as unproven rather than working:
   not been verified.
 - **Teardown on `session.shutdown`.** Stream children, leases and servers are closed
   on shutdown, but the handler has not been observed firing.
-- **Install against a real Android app project.** The build path is verified end to
-  end — including launching the installed app and confirming it reaches the
-  foreground — but against a stand-in `gradlew`, because this repository is not an
-  Android project. A real AGP build has not been run through the button. Flavored and
-  multi-module layouts are handled by searching the whole `outputs/apk` tree, which is
-  likewise unexercised on a real flavored project.
+- **Install against a real Android app project.** This repository is not an Android
+  project, so its suites use a stand-in `gradlew`. The build service has been run by
+  hand against a throwaway flavored AGP 8.9 app (Gradle 8.12) on an API 34 emulator:
+  an UP-TO-DATE debug install launched the debug app, not a newer release build;
+  cancelling and shutdown during a real, deliberately non-interruptible install task
+  stopped the recorded single-use daemon (a child of the client, in its own process
+  group) and confirmed it gone before the device was released, never installing
+  afterwards and never signalling another Gradle daemon; the canvas's Install and
+  Cancel buttons and a failing build were driven through headless Chrome. A reused
+  configuration cache was not exercised against real Gradle. That fixture and
+  harness are not checked in, so this is not repeatable from the repository, and
+  other AGP and Gradle versions are untested.
+- **Windows.** Tests for starting `gradlew.bat` through `cmd.exe`, quoting paths with
+  spaces and metacharacters, passing `--no-daemon` and the init script, and cancelling
+  with `taskkill` are included and scheduled
+  to run on Windows CI against a stand-in batch file; they have not yet been run on
+  native Windows, so that verification is pending. The rest of the extension — emulator discovery, streaming and
+  input — has not been run on Windows against a real emulator.
 - **Reclaiming a hold from a recycled process id.** A crashed session's hold is
   reclaimed by checking whether its process is still alive. If the operating system
   has reused that process id, the hold survives until its 60-second lease expires

@@ -219,6 +219,7 @@ Keep these behaviors from the reference — they are the reason it feels good to
 | `press_button` | yes | `home`, `back`, `recents`, `power`, `volume_up`, `volume_down` |
 | `tap` / `swipe` / `send_key` / `send_text` / `perform_inputs` | yes | |
 | `install_apk` / `launch_app` | yes | Android-specific additions (`adb install -r`, `am start`) |
+| `build_install_launch` / `cancel_build` | no | Gradle build of the session's project; takes its own device hold, and runs `--no-daemon` with an init script recording the executor; cancellation freezes and kills only that build's processes (wrapper group, descendants, recorded executor matched by pid and start time) and keeps the hold until they are confirmed gone; an unconfirmed stop keeps the hold until they exit |
 
 ## Verification (required before calling this done)
 

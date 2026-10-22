@@ -28,6 +28,25 @@ export function supportsVideoDecoder() {
     return typeof window !== "undefined" && "VideoDecoder" in window;
 }
 
+/** Raised when a stream turns out to carry H.264 and this runtime cannot decode it. */
+export const DECODER_UNAVAILABLE = "webcodecs_unavailable";
+
+/**
+ * Whether to open the device stream or go straight to polling screenshots.
+ *
+ * A missing `VideoDecoder` is not a reason to skip the stream: the emulator's
+ * gRPC transport sends PNG stills, which paint without WebCodecs. Only once a
+ * stream has proved to be video that cannot be decoded is the stream skipped,
+ * and only while the device is still being mirrored, so a later reconnect does
+ * not go round the same fail-and-fall-back loop.
+ */
+export function chooseScreenSource({ hasVideoDecoder, decoderFailed, lastTransport }) {
+    if (hasVideoDecoder || !decoderFailed) {
+        return "stream";
+    }
+    return lastTransport === "grpc" ? "stream" : "screenshots";
+}
+
 /**
  * Reads the tagged framing produced by the host.
  *
@@ -119,7 +138,9 @@ export function createH264StreamController({ onFrame, onError }) {
 
     function configureDecoder(description, { recovering = false } = {}) {
         if (!supportsVideoDecoder()) {
-            throw new Error("This canvas runtime does not expose WebCodecs VideoDecoder.");
+            const error = new Error("This stream is H.264 video, and this canvas runtime has no WebCodecs VideoDecoder to decode it.");
+            error.code = DECODER_UNAVAILABLE;
+            throw error;
         }
         if (!looksLikeAvcC(description)) {
             return;

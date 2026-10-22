@@ -146,6 +146,19 @@ export const actionSchemas = {
         },
         required: ["deviceId"],
     },
+    cancelBuild: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+            deviceId: { type: "string", minLength: 1 },
+            runId: {
+                type: "string",
+                minLength: 1,
+                description: "Only cancel this build (the id reported in the device's install status).",
+            },
+        },
+        required: ["deviceId"],
+    },
     renewControl: {
         type: "object",
         additionalProperties: false,

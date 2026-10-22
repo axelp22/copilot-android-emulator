@@ -70,6 +70,9 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
     let backpressured = false;
     let drainListenerAttached = false;
     let lastError = "";
+    /** The newest frame not yet sent; only ever one, since each supersedes the last. */
+    let pendingPixels = null;
+    let flushTimer = null;
 
     function emit(event, ...args) {
         for (const handler of listeners[event] ?? []) {
@@ -83,9 +86,15 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
 
     /**
      * Every frame is a complete picture, so a slow consumer is handled by
-     * dropping rather than queueing. That is only safe because these are stills:
-     * the H.264 source cannot drop a delta without corrupting the decoder, but
-     * here the next frame supersedes whatever was skipped.
+     * superseding rather than queueing. That is only safe because these are
+     * stills: the H.264 source cannot drop a delta without corrupting the
+     * decoder, but here the next frame replaces whatever was skipped.
+     *
+     * Superseded is not the same as dropped, though. A still screen sends
+     * nothing after its last change, so a frame skipped for the FPS cap or a
+     * full socket would otherwise leave the canvas on the picture *before* that
+     * change for as long as the screen stays idle. The newest skipped frame is
+     * therefore kept and sent once the interval elapses or the socket drains.
      */
     function write(payload) {
         if (stopped || stdout.destroyed || stdout.writableEnded) {
@@ -102,21 +111,52 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
         stdout.once("drain", () => {
             drainListenerAttached = false;
             backpressured = false;
+            scheduleFlush();
         });
     }
 
+    function clearPending() {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+        pendingPixels = null;
+    }
+
+    function flush() {
+        if (stopped || backpressured || !pendingPixels) {
+            return;
+        }
+        const pixels = pendingPixels;
+        pendingPixels = null;
+        lastEmitAt = Date.now();
+        write(frame(FRAME_TAGS.seed, pixels));
+    }
+
+    function scheduleFlush() {
+        // A full socket flushes from its drain handler instead.
+        if (stopped || backpressured || flushTimer || !pendingPixels) {
+            return;
+        }
+        const waitMs = minFrameIntervalMs ? lastEmitAt + minFrameIntervalMs - Date.now() : 0;
+        if (waitMs <= 0) {
+            flush();
+            return;
+        }
+        // Not unref'd: it is at most one frame interval, and it carries the frame
+        // the canvas would otherwise never see.
+        flushTimer = setTimeout(() => {
+            flushTimer = null;
+            flush();
+        }, waitMs);
+    }
+
     function onImage(image) {
-        if (stopped || backpressured || !image?.pixels?.length) {
+        if (stopped || !image?.pixels?.length) {
             return;
         }
-        const now = Date.now();
-        lastActivityAt = now;
-        if (minFrameIntervalMs && now - lastEmitAt < minFrameIntervalMs) {
-            return;
-        }
-        lastEmitAt = now;
+        lastActivityAt = Date.now();
         consecutiveFailures = 0;
-        write(frame(FRAME_TAGS.seed, image.pixels));
+        pendingPixels = image.pixels;
+        scheduleFlush();
     }
 
     /**
@@ -154,6 +194,7 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
         stopped = true;
         clearTimeout(restartTimer);
         clearInterval(livenessTimer);
+        clearPending();
         abort?.abort();
         emit("error", error);
         stdout.destroy(error);
@@ -239,6 +280,7 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
             stopped = true;
             clearTimeout(restartTimer);
             clearInterval(livenessTimer);
+            clearPending();
             restartTimer = null;
             livenessTimer = null;
             abort?.abort();

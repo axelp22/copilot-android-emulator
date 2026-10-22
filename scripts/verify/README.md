@@ -1,8 +1,15 @@
 # Verification suites
 
-These drive the extension against real hardware. There is no mocking: every suite
-talks to an actual emulator or connected device through `adb`, and the browser
-suite renders the canvas in Chrome.
+These drive the extension against real hardware: the device suites talk to an
+actual emulator or connected device through `adb`, and the browser suite renders a
+live canvas in Chrome. They change the device's state, so they only run when you
+start them, never in CI.
+
+Two of them, `device-queue.mjs` and `lease-holds.mjs`, need no device: they exercise
+the cross-session queue in temporary directories with discovery stubbed out. `npm
+test` runs both, alongside the device-free regression suite in [`test/`](../../test/),
+which uses fakes and stand-in Gradle wrappers rather than hardware. See
+"Verifying" in the top-level [README](../../README.md).
 
 ## Prerequisites
 
@@ -50,10 +57,11 @@ overlay and the "Take back control" affordance; otherwise those checks skip.
 
 ## What these suites do not cover
 
-See the "Known gaps" section of the top-level [README](../../README.md): the
-screenshot fallback for runtimes without WebCodecs, tablet and landscape chrome,
-canvas binding persistence, and `session.shutdown` teardown are all implemented but
-unexercised.
+See the "Known gaps" section of the top-level [README](../../README.md): tablet and
+landscape chrome, canvas binding persistence, `session.shutdown` teardown, and
+Windows against a real emulator are implemented but not exercised on hardware.
+Streaming without WebCodecs, build cancellation and shutdown are covered by the
+device-free suite in [`test/`](../../test/) rather than here.
 
 ## Notes
 

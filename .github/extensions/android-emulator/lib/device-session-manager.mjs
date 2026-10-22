@@ -311,10 +311,20 @@ export class DeviceSessionManager {
             const [status] = await this.queue.status([deviceId]).catch(() => []);
             throw this.busyError([deviceId], status);
         }
+        let retainUntil = null;
         try {
             return await fn();
+        } catch (error) {
+            // A build whose processes could not be confirmed gone keeps the device
+            // until they are, whatever else lets go of it meanwhile.
+            retainUntil = error?.retainHoldUntil ?? null;
+            throw error;
         } finally {
-            await this.dropHoldRef(deviceId, ref);
+            if (retainUntil) {
+                void retainUntil.then(() => this.dropHoldRef(deviceId, ref)).catch(() => {});
+            } else {
+                await this.dropHoldRef(deviceId, ref);
+            }
         }
     }
 
@@ -334,12 +344,35 @@ export class DeviceSessionManager {
         await this.dropHoldRef(deviceId, ref);
     }
 
-    reportInstallFailure(deviceId, message) {
-        this.build.reportFailure(deviceId, message);
+    /**
+     * Shows a refusal that happened before any run existed. A failure the run
+     * already recorded is left alone, so its build log is not thrown away.
+     */
+    reportInstallFailure(deviceId, error) {
+        if (error?.buildRecorded) {
+            return;
+        }
+        this.build.reportFailure(deviceId, error?.message ?? String(error));
+    }
+
+    /**
+     * Cancels this session's build on a device. Builds only ever belong to the
+     * session that started them, so there is no other session's work to reach;
+     * leases and device holds are untouched, and the build's own hold is released
+     * by the build settling. With `wait`, returns the final status.
+     */
+    async cancelBuild({ deviceId, runId = null, wait = true, reason = "Cancelled." } = {}) {
+        this.state.getDeviceOrThrow(deviceId);
+        if (wait) {
+            return this.build.cancel(deviceId, { runId, reason });
+        }
+        this.build.requestCancel(deviceId, { runId, reason });
+        return this.build.statusFor(deviceId);
     }
 
     /** Builds the app in this session's working directory, installs it, launches it. */
     async buildInstallLaunch({ deviceId, task, launch = true } = {}) {
+        this.build.assertAccepting();
         const device = this.state.getDeviceOrThrow(deviceId);
         if (device.state !== DEVICE_STATES.booted) {
             throw new AppError("device_not_booted", `${device.name} is not booted.`, 409);
@@ -1214,7 +1247,9 @@ export class DeviceSessionManager {
             ? await adbShell(serial, ["am", "start", "-n", `'${packageName}/${activity}'`], { timeout: 60_000 })
             : await adbShell(
                   serial,
-                  ["monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "1"],
+                  // Without `--pct-syskeys 0`, monkey aborts (exit 251, "SYS_KEYS has no
+                  // physical keys") on AVDs without hardware keys, before launching anything.
+                  ["monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "--pct-syskeys", "0", "1"],
                   { timeout: 60_000 },
               );
 
@@ -1226,13 +1261,41 @@ export class DeviceSessionManager {
 
     async dispose() {
         // Stop builds before giving up the device: an orphaned Gradle would keep
-        // installing onto a device another session has just been handed.
-        await this.build.stopAll().catch(() => {});
+        // installing onto a device another session has just been handed. stopAll
+        // refuses new builds and waits for every queued and running one to settle.
+        let buildError = null;
+        await this.build.stopAll().catch((error) => {
+            buildError = error;
+        });
         await this.video.stopAll().catch(() => {});
         this.input.clearTouchSessions();
         await this.controlPool.disposeAll().catch(() => {});
-        // Never leave a device taken, or a queue blocked, by a session that has exited.
-        await this.claims.releaseAll().catch(() => {});
-        await this.queue.releaseAll().catch(() => {});
+        // Never leave a device taken, or a queue blocked, by a session that has
+        // exited -- except a device a build may still be installing onto.
+        const retained = new Set(buildError?.details?.deviceIds ?? []);
+        if (!buildError) {
+            await this.claims.releaseAll().catch(() => {});
+            await this.queue.releaseAll().catch(() => {});
+            return;
+        }
+        if (retained.size === 0) {
+            // Unknown scope: releasing anything could hand a device to a live build.
+            throw buildError;
+        }
+        for (const deviceId of Array.from(this.claims.claims?.keys?.() ?? [])) {
+            if (!retained.has(deviceId)) {
+                await this.claims.release(deviceId).catch(() => {});
+            }
+        }
+        for (const deviceId of Array.from(this.queue.held?.keys?.() ?? [])) {
+            if (!retained.has(deviceId)) {
+                await this.queue.release(deviceId).catch(() => {});
+            }
+        }
+        for (const ticket of Array.from(this.queue.tickets?.values?.() ?? [])) {
+            await this.queue.dropTicket(ticket.deviceId, ticket.ticketId).catch(() => {});
+        }
+        this.onDiagnostic(buildError.message);
+        throw buildError;
     }
 }

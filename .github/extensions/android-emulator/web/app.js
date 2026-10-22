@@ -2,8 +2,14 @@ import { renderIcon } from "./icons.js";
 import { applyDeviceMetrics, fitDeviceFrame } from "./device-frame.js";
 import { createApiClient } from "./api-client.js";
 import { createDevicePicker } from "./device-picker.js";
-import { createH264StreamController, supportsVideoDecoder } from "./h264-stream.js";
+import {
+    DECODER_UNAVAILABLE,
+    chooseScreenSource,
+    createH264StreamController,
+    supportsVideoDecoder,
+} from "./h264-stream.js";
 import { createInputController } from "./input-controller.js";
+import { createBuildPanel, createNotice } from "./status-tray.js";
 
 const elements = {
     deviceName: document.getElementById("device-name"),
@@ -31,6 +37,17 @@ const elements = {
     overlayExpiry: document.getElementById("overlay-expiry"),
     takeBack: document.getElementById("take-back"),
     install: document.getElementById("install-button"),
+    notice: document.getElementById("notice"),
+    noticeText: document.getElementById("notice-text"),
+    noticeDismiss: document.getElementById("notice-dismiss"),
+    buildPanel: document.getElementById("build-panel"),
+    buildTitle: document.getElementById("build-title"),
+    buildDetail: document.getElementById("build-detail"),
+    buildCancel: document.getElementById("build-cancel"),
+    buildDismiss: document.getElementById("build-dismiss"),
+    buildLogDetails: document.getElementById("build-log-details"),
+    buildLog: document.getElementById("build-log"),
+    buildLogNote: document.getElementById("build-log-note"),
 };
 
 const toolbarButtons = {
@@ -78,6 +95,8 @@ const H264_STALL_POLL_MS = 3_000;
  */
 const SLOW_CAPTURE_WINDOW_MS = 8_000;
 const SLOW_CAPTURE_FPS = 8;
+/** Screenshots failing this many times in a row means the device display is broken, not just slow. */
+const PNG_FALLBACK_MAX_FAILURES = 5;
 
 let state = null;
 let pending = false;
@@ -91,6 +110,12 @@ let h264StallTimer = null;
 let lastVideoFrameAt = 0;
 let pngFallbackGeneration = 0;
 let recentFrameTimes = [];
+/**
+ * Devices whose stream has proved to be H.264 that this runtime cannot decode.
+ * Per device: a mirrored phone failing says nothing about an emulator picked
+ * next, whose gRPC stream of stills paints without WebCodecs.
+ */
+const decoderFailedDevices = new Set();
 
 function agentControlUnavailable(currentState = state) {
     return currentState?.lease?.active === true || currentState?.controlPending === true;
@@ -111,10 +136,13 @@ function hydrateIcons() {
     }
 }
 
+/**
+ * Feedback for a control or a build. Deliberately never the screen error state:
+ * a refused tap or a failed build says nothing about whether the picture is
+ * healthy, and tearing the stream down for one would blank a working display.
+ */
 function setNotice(message, isError = false) {
-    if (isError) {
-        showScreenError(message);
-    }
+    notice.show(message, { error: isError });
 }
 
 function setScreenMode(mode) {
@@ -394,6 +422,7 @@ function startPngFallback() {
     stopPngFallback();
     setScreenMode("png");
     const generation = ++pngFallbackGeneration;
+    let consecutiveFailures = 0;
 
     const stale = () => generation !== pngFallbackGeneration || state?.state !== "Booted";
     const scheduleNext = () => {
@@ -411,12 +440,25 @@ function startPngFallback() {
             if (stale()) {
                 return;
             }
+            consecutiveFailures = 0;
             elements.screen.src = image.src;
             elements.screen.classList.add("has-frame");
             elements.screenWindow.classList.add("has-frame");
             scheduleNext();
         });
-        image.addEventListener("error", scheduleNext);
+        image.addEventListener("error", () => {
+            if (stale()) {
+                return;
+            }
+            consecutiveFailures += 1;
+            // Screenshots are the last resort, so when they fail too the display
+            // really is broken and the error state, with Retry, is the right answer.
+            if (consecutiveFailures >= PNG_FALLBACK_MAX_FAILURES) {
+                showScreenError("Screenshots could not be loaded from the device.");
+                return;
+            }
+            scheduleNext();
+        });
         image.src = apiUrl(`api/frame.png?r=${Date.now()}`).toString();
     };
 
@@ -445,14 +487,19 @@ function ensureStream() {
 
     const fps = state.stream?.fps ?? 60;
     const resolution = state.stream?.resolution ?? 100;
-    const nextKey = `${fps}:${resolution}:${streamRevision}`;
+    const nextKey = `${state.deviceId ?? ""}:${fps}:${resolution}:${streamRevision}`;
     if (nextKey === activeStreamKey) {
         return;
     }
     activeStreamKey = nextKey;
 
-    if (!useVideoDecoder) {
-        setScreenStatus("Streaming screenshots (WebCodecs unavailable)");
+    const source = chooseScreenSource({
+        hasVideoDecoder: useVideoDecoder,
+        decoderFailed: decoderFailedDevices.has(state.deviceId),
+        lastTransport: state.stream?.transport ?? null,
+    });
+    if (source === "screenshots") {
+        setScreenStatus("Streaming screenshots (this canvas cannot decode video)");
         startPngFallback();
         return;
     }
@@ -508,8 +555,18 @@ function readyScreenStatus() {
  * available regardless of which transport failed.
  */
 function handleH264StreamError(error) {
-    setNotice(error.message ?? String(error), true);
-    fallBackToScreenshots("Device stream failed; streaming screenshots instead");
+    if (error?.code === DECODER_UNAVAILABLE) {
+        if (state?.deviceId) {
+            decoderFailedDevices.add(state.deviceId);
+        }
+        const reason = "This canvas cannot decode video; streaming screenshots instead";
+        setNotice(reason);
+        fallBackToScreenshots(reason);
+        return;
+    }
+    const reason = `Device stream failed (${error?.message ?? String(error)}); streaming screenshots instead`;
+    setNotice(reason);
+    fallBackToScreenshots(reason);
 }
 
 function startH264Stream(fps) {
@@ -553,7 +610,8 @@ function renderInstallButton(deviceState, booted, controlBlocked) {
     const plan = deviceState.build ?? null;
     const install = deviceState.install ?? null;
     const sharing = deviceState.sharing ?? null;
-    const running = install?.state === "running";
+    // A build whose cancellation is unconfirmed still owns the device.
+    const running = install?.state === "running" || install?.state === "cancel_failed";
 
     let reason = null;
     if (controlBlocked) {
@@ -577,29 +635,28 @@ function renderInstallButton(deviceState, booted, controlBlocked) {
     } else if (reason) {
         button.title = reason;
     } else {
-        button.title = `Build, install and launch (./gradlew ${plan.task})`;
+        button.title = `Build, install and launch (${plan.wrapper ?? "./gradlew"} ${plan.task})`;
     }
 
-    // Report the outcome once, rather than on every state push that follows it.
-    const stamp = install ? `${install.state}:${install.finishedAt ?? install.startedAt}` : "";
-    if (install && stamp !== lastInstallStamp) {
-        lastInstallStamp = stamp;
-        if (install.state === "running") {
-            setNotice(install.message ?? "Building…");
-        } else if (install.state === "succeeded") {
-            setNotice(install.message ?? "Installed");
-        } else if (install.state === "failed") {
-            setNotice(install.message ?? "The build failed.", true);
-        }
-    }
+    // Cancelling is refused under an agent lease for the same reason starting is:
+    // take back control first.
+    buildPanel.render(install, { controlBlocked });
 }
 
-let lastInstallStamp = "";
+function cancelBuild(runId) {
+    void fetchJson("api/install/cancel", { runId })
+        .then((status) => {
+            if (state && status) {
+                state = { ...state, install: status };
+                render();
+            }
+        })
+        .catch((error) => setNotice(error.message, true));
+}
 
 function bindToolbar() {
     elements.install?.addEventListener("click", (event) => {
         event.preventDefault();
-        setNotice("Starting the build…");
         void fetchJson("api/install", {}).catch((error) => setNotice(error.message, true));
     });
 
@@ -669,7 +726,14 @@ function bindToolbar() {
 
 function bindSelectionGuards() {
     for (const eventName of ["selectstart", "dragstart"]) {
-        document.addEventListener(eventName, (event) => event.preventDefault());
+        document.addEventListener(eventName, (event) => {
+            // The build log is the one thing worth copying out of the canvas.
+            const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+            if (eventName === "selectstart" && target?.closest?.(".build-log")) {
+                return;
+            }
+            event.preventDefault();
+        });
     }
     elements.viewport.addEventListener("contextmenu", (event) => event.preventDefault());
 }
@@ -714,6 +778,24 @@ function bindResize() {
 
 const h264Stream = createH264StreamController({ onFrame: drawVideoFrame, onError: handleH264StreamError });
 
+const notice = createNotice({
+    elements: { root: elements.notice, text: elements.noticeText, dismiss: elements.noticeDismiss },
+});
+
+const buildPanel = createBuildPanel({
+    elements: {
+        root: elements.buildPanel,
+        title: elements.buildTitle,
+        detail: elements.buildDetail,
+        cancel: elements.buildCancel,
+        dismiss: elements.buildDismiss,
+        logDetails: elements.buildLogDetails,
+        log: elements.buildLog,
+        logNote: elements.buildLogNote,
+    },
+    onCancel: cancelBuild,
+});
+
 const devicePicker = createDevicePicker({
     elements: {
         root: elements.devicePicker,
@@ -747,6 +829,8 @@ const inputController = createInputController({
 async function init() {
     try {
         hydrateIcons();
+        notice.bind();
+        buildPanel.bind();
         applyDeviceMetrics(frameElements, bootstrapMetrics.screen, bootstrapMetrics.family);
         requestAnimationFrame(() => {
             requestAnimationFrame(() => document.documentElement.classList.remove("awaiting-initial-paint"));
@@ -762,7 +846,8 @@ async function init() {
         connectEvents();
         reconnectStream();
     } catch (error) {
-        setNotice(error.message ?? String(error), true);
+        // Without a first state there is no display to protect, so this one is fatal.
+        showScreenError(error.message ?? String(error));
     }
 }
 

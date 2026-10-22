@@ -499,13 +499,24 @@ export async function createCanvasServer({
                 void manager
                     .buildInstallLaunch({ deviceId: target, task: body?.task })
                     .catch((error) => {
-                        onDiagnostic?.(`install failed: ${error.message}`);
+                        if (error?.code !== "build_cancelled") {
+                            onDiagnostic?.(`install failed: ${error.message}`);
+                        }
                         // A refusal happens before any run exists, so record it or the
                         // canvas would show nothing at all after the click.
-                        manager.reportInstallFailure(target, error.message);
+                        manager.reportInstallFailure(target, error);
                     })
                     .catch((error) => handleConnectionError(error, "install failure reporting failed"));
                 json(res, 202, { started: true });
+                return;
+            }
+
+            if (route === "/api/install/cancel") {
+                // Answers at once; the run reports "cancelled" over SSE when its
+                // process tree is confirmed gone. The run id keeps a stale click
+                // from cancelling a build started after the one it was aimed at.
+                const runId = typeof body?.runId === "string" ? body.runId : null;
+                json(res, 202, await manager.cancelBuild({ deviceId: target, runId, wait: false, reason: "Cancelled from the canvas." }));
                 return;
             }
 
@@ -725,7 +736,13 @@ export async function createCanvasServer({
             sseClients.clear();
             saturatedClients.clear();
             await stopActiveConnections({ blockManualInput: true });
-            await new Promise((resolve) => server.close(() => resolve()));
+            // close() alone waits for every open connection, and a page still
+            // alive can reconnect its EventSource on a kept-alive socket after the
+            // SSE clients above were ended -- a close that never finishes, which
+            // on shutdown would keep the device from ever being released.
+            const closed = new Promise((resolve) => server.close(() => resolve()));
+            server.closeAllConnections?.();
+            await closed;
         },
     };
 }

@@ -173,6 +173,28 @@
                             ></button>
                         </div>
                     </div>
+                    <div class="status-tray">
+                        <div id="notice" class="notice" role="status" aria-live="polite" hidden>
+                            <span id="notice-text" class="notice-text"></span>
+                            <button id="notice-dismiss" class="tray-dismiss" type="button" aria-label="Dismiss message">×</button>
+                        </div>
+                        <section id="build-panel" class="build-panel" aria-label="App build" hidden>
+                            <div class="build-panel-head">
+                                <span class="build-indicator" aria-hidden="true"></span>
+                                <div class="build-copy" role="status" aria-live="polite">
+                                    <strong id="build-title" class="build-title"></strong>
+                                    <span id="build-detail" class="build-detail"></span>
+                                </div>
+                                <button id="build-cancel" class="build-cancel" type="button">Cancel</button>
+                                <button id="build-dismiss" class="tray-dismiss" type="button" aria-label="Dismiss build result">×</button>
+                            </div>
+                            <details id="build-log-details" class="build-log-details">
+                                <summary>Build log</summary>
+                                <span id="build-log-note" class="build-log-note"></span>
+                                <pre id="build-log" class="build-log" tabindex="0"></pre>
+                            </details>
+                        </section>
+                    </div>
                     <div id="overlay" class="overlay hidden" role="status" aria-live="polite">
                         <div class="overlay-card">
                             <span class="overlay-title">Agent control</span>

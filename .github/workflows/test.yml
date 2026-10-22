@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The README promises macOS, Linux and Windows, and the build launcher and
+        # process-tree cancellation differ on each.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22]
+        include:
+          - os: ubuntu-latest
+            node: 24
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        shell: bash
+        run: |
+          for file in .github/extensions/android-emulator/extension.mjs .github/extensions/android-emulator/lib/*.mjs .github/extensions/android-emulator/web/*.js scripts/verify/*.mjs; do
+            node --check "$file"
+          done
+      # Device-free only. The hardware suites in scripts/verify drive a real
+      # emulator and are never run here.
+      - name: Regression suite
+        run: npm test

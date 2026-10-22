@@ -56,7 +56,12 @@ export function createInputController({
             return;
         }
         const target = event.target;
-        if (target instanceof Element && target.closest("button, select, input, textarea, [contenteditable='true']")) {
+        // The status tray holds its own focusable controls and a scrollable log;
+        // keys aimed at those must not also reach the device.
+        if (
+            target instanceof Element &&
+            target.closest("button, select, input, textarea, summary, [contenteditable='true'], .status-tray")
+        ) {
             return;
         }
 

@@ -1,0 +1,12 @@
+{
+  "name": "copilot-android-emulator",
+  "private": true,
+  "description": "Development scripts for the Android Emulator Copilot extension. The extension itself has no npm dependencies.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}
