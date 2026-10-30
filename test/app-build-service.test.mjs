@@ -7,11 +7,12 @@
  * real `gradlew.bat` files. Nothing here talks to adb or a device.
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { extensionModule, extensionRoot, isAlive, sleep, tempDir, waitUntil } from "./helpers.mjs";
 
 const {
@@ -622,7 +623,7 @@ test("Windows does not count the wrapper exiting as the tree stopping when taskk
     // While the wrapper lives, taskkill is retried, and a success then an exit confirms it.
     const living = { pid: 4343, exitCode: null, signalCode: null };
     let attempts = 0;
-    const retried = await waitForProcessTreeExit(living, {
+    const retried = await whileHostAlive(waitForProcessTreeExit(living, {
         platform: "win32",
         pollMs: 10,
         taskkill: async () => {
@@ -633,9 +634,61 @@ test("Windows does not count the wrapper exiting as the tree stopping when taskk
             living.exitCode = 1;
             return "ok";
         },
-    });
+    }));
     assert.equal(retried.confirmed, true);
     assert.equal(attempts, 3);
+});
+
+/**
+ * Exit watches deliberately do not keep the process alive (a watch may never
+ * end), and a fake wrapper holds no handle the way a real child does. A test
+ * awaiting one stands in for the extension host, which outlives it; without
+ * this, Node 22's runner sees the loop drain and abandons the file.
+ */
+async function whileHostAlive(promise) {
+    const host = setInterval(() => {}, 60_000);
+    try {
+        return await promise;
+    } finally {
+        clearInterval(host);
+    }
+}
+
+test("an exit watch never keeps the host process alive, yet confirms while the host lives", async () => {
+    const moduleUrl = pathToFileURL(path.join(extensionRoot, "lib", "app-build-service.mjs")).href;
+    const script = (held) => `
+        const { waitForProcessTreeExit } = await import(${JSON.stringify(moduleUrl)});
+        const living = { pid: 4343, exitCode: null, signalCode: null };
+        let attempts = 0;
+        const host = ${held} ? setInterval(() => {}, 60_000) : null;
+        const outcome = await waitForProcessTreeExit(living, {
+            platform: "win32",
+            pollMs: 10,
+            taskkill: async () => {
+                attempts += 1;
+                if (${held} && attempts >= 3) {
+                    living.exitCode = 1;
+                    return "ok";
+                }
+                return "ERROR: in use";
+            },
+        });
+        clearInterval(host);
+        console.log(JSON.stringify({ confirmed: outcome.confirmed, attempts }));
+    `;
+    const run = (held) =>
+        spawnSync(process.execPath, ["--input-type=module", "-e", script(held)], { encoding: "utf8", timeout: 20_000 });
+
+    // Nothing else alive: the never-confirmed watch lets the process end (13 = unsettled top-level await).
+    const unheld = run(false);
+    assert.equal(unheld.error, undefined, "the watch did not hold the process open");
+    assert.equal(unheld.status, 13, unheld.stderr);
+    assert.equal(unheld.stdout, "");
+
+    // With the host alive, the same watch keeps retrying until it can confirm.
+    const held = run(true);
+    assert.equal(held.status, 0, held.stderr);
+    assert.deepEqual(JSON.parse(held.stdout), { confirmed: true, attempts: 3 });
 });
 
 // --- shutdown -------------------------------------------------------------------------
@@ -1017,7 +1070,7 @@ test("waiting for a lingering executor keeps the process alive until the build s
     await writeFile(
         script,
         [
-            `const { AppBuildService } = await import(${JSON.stringify(path.join(extensionRoot, "lib", "app-build-service.mjs"))});`,
+            `const { AppBuildService } = await import(${JSON.stringify(pathToFileURL(path.join(extensionRoot, "lib", "app-build-service.mjs")).href)});`,
             "const manager = { snapshot: (id) => ({ id, serial: 's' }), notifyDevice() {}, async launchApp() {} };",
             `const service = new AppBuildService({ manager, executorDir: ${JSON.stringify(executorDir)} });`,
             `service.setWorkingDirectory(${JSON.stringify(root)});`,

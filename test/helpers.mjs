@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { deflateSync } from "node:zlib";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -9,8 +9,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 export const repoRoot = path.resolve(here, "..");
 export const extensionRoot = path.join(repoRoot, ".github", "extensions", "android-emulator");
 
+/** Imports an extension module. Dynamic import() needs a file: URL: a raw absolute Windows path reads as a URL scheme. */
 export function extensionModule(...segments) {
-    return import(path.join(extensionRoot, ...segments));
+    return import(pathToFileURL(path.join(extensionRoot, ...segments)).href);
 }
 
 /** A temporary directory removed when the test ends, pass or fail. */

@@ -8,10 +8,10 @@
 import { execFile } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { adb, avccToAnnexB, config, createFrameReader, createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { adb, avccToAnnexB, config, createFrameReader, createReporter, extensionImport, sleep } from "./_shared.mjs";
 
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
-const { streamSizeFor } = await import(path.join(extensionRoot, "lib", "device-model.mjs"));
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
+const { streamSizeFor } = await extensionImport("lib", "device-model.mjs");
 
 const report = createReporter("STREAM DECODE");
 const manager = new DeviceSessionManager({ onDiagnostic: (message) => report.note(message) });
