@@ -8,7 +8,8 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -18,6 +19,7 @@ import { extensionModule, extensionRoot, isAlive, sleep, tempDir, waitUntil } fr
 const {
     AppBuildService,
     BUILD_TAG_ENV,
+    buildExecutableRoots,
     classifyHiddenEnvironments,
     executorInitScript,
     executorPaths,
@@ -1136,10 +1138,10 @@ test("a process whose environment the system hid keeps the stop unconfirmed and 
     const hidden = { ...proc(200, 1, 200)[1], tagged: undefined, envHidden: true };
     const fake = fakeProcesses([[1, { ...proc(1, 0, 1)[1], tagged: false }], [200, hidden], [900, { ...proc(900, 1, 900)[1], tagged: false }]]);
     const known = new Map([[100, "Thu Oct 22 10:00:00 2026"]]);
-    await assert.rejects(liveBuildProcesses(child, { platform: "darwin", snapshot: fake.snapshot, known, tag: TAG }), /pid\(s\) 200 is hidden by the system/);
+    await assert.rejects(liveBuildProcesses(child, { platform: "darwin", snapshot: fake.snapshot, known, tag: TAG }), /pid\(s\) 200 \(executable unknown\) is hidden by the system/);
     const outcome = await terminateProcessTree(child, { platform: "darwin", snapshot: fake.snapshot, kill: fake.kill, known, tag: TAG, killWaitMs: 60, pollMs: 5 });
     assert.equal(outcome.confirmed, false, outcome.detail);
-    assert.match(outcome.detail, /pid\(s\) 200 is hidden by the system/);
+    assert.match(outcome.detail, /pid\(s\) 200 \(executable unknown\) is hidden by the system/);
     assert.equal(fake.signals.length, 0, JSON.stringify(fake.signals));
 
     // The same hidden process in the wrapper's group is owned and stopped as usual.
@@ -1191,7 +1193,7 @@ test("a stop narrows the hidden-environment window to after its last clean look,
 
     const late = await run(true);
     assert.equal(late.outcome.confirmed, false, late.outcome.detail);
-    assert.match(late.outcome.detail, /pid\(s\) 400 is hidden by the system/);
+    assert.match(late.outcome.detail, /pid\(s\) 400 \(executable unknown\) is hidden by the system/);
     assert.equal(late.signals.length, 0, JSON.stringify(late.signals));
 });
 
@@ -1250,6 +1252,142 @@ test("a hidden macOS environment is decided by its shown ancestor, or left undec
         40: undefined, 41: undefined, 50: false, 60: false, 70: undefined,
     });
     assert.equal(processes.get(40).envHidden, true);
+});
+
+test("a hidden orphan is undecided only when its executable is one a build could run", () => {
+    const since = Date.parse("Thu Oct 22 10:00:00 2026");
+    const uid = 501;
+    const roots = ["/Library/Java/JavaVirtualMachines/jdk-17/Contents/Home", "/Users/u/.gradle", "/Users/u/proj"];
+    // Each a hidden, same-uid, launchd-parented process outside its group's lead, started
+    // after the bound: shape alone cannot tell it from a reparented build process.
+    const orphan = (pid, file) => {
+        const [, entry] = proc(pid, 1, pid - 1, "Thu Oct 22 10:00:05 2026");
+        return [pid, { ...entry, uid, envShown: false, tagged: false, ...(file === undefined ? {} : { path: file }) }];
+    };
+    const crashpad = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/chrome_crashpad_handler";
+    const processes = new Map([
+        orphan(10, crashpad), // another app's helper: not the build's
+        orphan(20, "/Applications/Microsoft Teams.app/Contents/Helpers/msedgewebview2_crashpad_handler"),
+        orphan(30, "/bin/sleep"), // a platform binary: could be
+        orphan(40, "/usr/libexec/xpcproxy"),
+        orphan(50, `${roots[0]}/bin/java`), // the build's JDK
+        orphan(60, "/Users/u/.gradle/wrapper/dists/gradle-8/bin/gradle"),
+        orphan(70, "/Users/u/proj/build/tool"),
+        orphan(80, "/Users/u/project-other/tool"), // a sibling, not under the project dir
+        orphan(90, undefined), // path unreadable
+        orphan(100, "sleep"), // not a full path
+        orphan(110, "/binary/elsewhere"), // /bin is not a prefix of /binary
+    ]);
+    classifyHiddenEnvironments(processes, { since, uid, roots });
+    const result = Object.fromEntries(Array.from(processes.values()).map((entry) => [entry.pid, entry.tagged]));
+    assert.deepEqual(result, {
+        10: false, 20: false, 30: undefined, 40: undefined, 50: undefined, 60: undefined, 70: undefined,
+        80: false, 90: undefined, 100: undefined, 110: false,
+    });
+    assert.equal(processes.get(10).envHidden, undefined, "an .app helper is decided, not hidden-undecided");
+});
+
+test("the build's executable roots are its JDK, SDK, NDK, Gradle home and project, given and resolved", async (t) => {
+    const home = await tempDir(t, "home-");
+    const real = await tempDir(t, "jdk-");
+    const link = path.join(home, "jdk-link");
+    await symlink(real, link);
+    const roots = buildExecutableRoots({
+        env: { JAVA_HOME: link, ANDROID_HOME: "/opt/sdk", ANDROID_NDK_HOME: "/opt/ndk", GRADLE_USER_HOME: "relative/ignored" },
+        cwd: "/work/proj",
+        home,
+    });
+    for (const expected of [link, "/opt/sdk", "/opt/ndk", "/work/proj", path.join(home, "Library", "Android", "sdk")]) {
+        assert.ok(roots.includes(path.resolve(expected)), `${expected} in ${roots}`);
+    }
+    assert.ok(roots.includes(realpathSync.native(real)), "the JDK's resolved path");
+    assert.ok(!roots.some((root) => root.includes("relative")), "a relative Gradle home is not a root");
+    assert.ok(buildExecutableRoots({ env: {}, home }).includes(path.join(home, ".gradle")), "Gradle's default user home");
+});
+
+test("a quarantine retry keeps the bound a clean pass advanced, so a later foreign orphan cannot hold it", { timeout: 10_000 }, async () => {
+    // The wrapper is gone; its executor (200) outlives the first attempts. A hidden helper
+    // (300, a platform binary) started after the spawn under a shown, untagged parent
+    // (250): not the build's while that parent lives. Once the bound has passed its start,
+    // the parent exits and it is reparented to launchd -- its shape is now a reparented
+    // build process. A retry that went back to the spawn-time bound would hold the run
+    // until it exits; one keeping the advanced bound releases it.
+    const uid = 501;
+    const begun = Date.now();
+    const spawnedAt = begun - 60_000;
+    const helperStartedAt = begun - 10_000;
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    let calls = 0;
+    const sinces = [];
+    const snapshot = async (options) => {
+        calls += 1;
+        sinces.push(options.since);
+        const table = new Map();
+        const add = (pid, ppid, pgid, startedAt, extra = {}) =>
+            table.set(pid, { pid, ppid, pgid, uid, stat: "S", lstart: String(startedAt), startedAt, envShown: true, tagged: false, ...extra });
+        add(1, 0, 1, 0);
+        if (Date.now() - begun < 200) {
+            add(200, 1, 200, spawnedAt + 100, { tagged: true });
+        }
+        const orphaned = calls > 3;
+        if (!orphaned) {
+            add(250, 1, 250, helperStartedAt - 5);
+        }
+        add(300, orphaned ? 1 : 250, 250, helperStartedAt, { envShown: false, path: "/bin/sleep" });
+        classifyHiddenEnvironments(table, { since: options.since, uid, roots: [] });
+        return table;
+    };
+    const outcome = await whileHostAlive(waitForProcessTreeExit(child, { platform: "darwin", snapshot, kill: () => {}, tag: TAG, since: spawnedAt, killWaitMs: 30, pollMs: 5 }));
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(sinces.at(-1) > helperStartedAt + 2_000, `the final bound ${sinces.at(-1)} is past the helper's start`);
+    // And the helper's shape alone, at the spawn-time bound, is undecided: the bound is what releases it.
+    const alone = new Map([[1, { pid: 1, ppid: 0, pgid: 1, uid, startedAt: 0, envShown: true, tagged: false }], [300, { pid: 300, ppid: 1, pgid: 250, uid, startedAt: helperStartedAt, envShown: false, tagged: false, path: "/bin/sleep" }]]);
+    classifyHiddenEnvironments(alone, { since: spawnedAt, uid, roots: [] });
+    assert.equal(alone.get(300).tagged, undefined);
+});
+
+test("an app's crashpad helper started during the build neither blocks a running build nor holds a quarantined one", { timeout: 10_000 }, async () => {
+    // Chrome, Edge and Teams double-fork their crashpad handler under launchd, outside
+    // its group's lead, with its environment hidden. Launched mid-build it has the shape
+    // of a reparented build process; only its executable says it is not the build's.
+    const uid = 501;
+    const begun = Date.now();
+    const spawnedAt = begun - 60_000;
+    const crashpad = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/chrome_crashpad_handler";
+    const table = ({ wrapper, executor, helperPath }) => async (options) => {
+        const processes = new Map();
+        const add = (pid, ppid, pgid, startedAt, extra = {}) =>
+            processes.set(pid, { pid, ppid, pgid, uid, stat: "S", lstart: String(startedAt), startedAt, envShown: true, tagged: false, ...extra });
+        add(1, 0, 1, 0);
+        if (wrapper()) {
+            add(100, 1, 100, spawnedAt, { tagged: true });
+        }
+        if (executor()) {
+            add(200, 1, 200, spawnedAt + 100, { tagged: true });
+        }
+        add(500, 1, 499, begun - 1_000, { envShown: false, path: helperPath });
+        classifyHiddenEnvironments(processes, { since: options.since, uid, roots: ["/Users/u/.gradle", "/Users/u/proj"] });
+        return processes;
+    };
+
+    // A successful build: the running wrapper and executor are its only live processes.
+    const running = { pid: 100, exitCode: null, signalCode: null };
+    const live = table({ wrapper: () => true, executor: () => true, helperPath: crashpad });
+    assert.deepEqual((await liveBuildProcesses(running, { platform: "darwin", snapshot: live, tag: TAG, since: spawnedAt })).sort(), [100, 200]);
+    // The same shape from a platform binary could be the build's, and is never counted gone.
+    const sleeper = table({ wrapper: () => true, executor: () => true, helperPath: "/bin/sleep" });
+    await assert.rejects(liveBuildProcesses(running, { platform: "darwin", snapshot: sleeper, tag: TAG, since: spawnedAt }), /pid\(s\) 500 \(\/bin\/sleep\) is hidden by the system/);
+
+    // A quarantined run whose executor outlives the first attempts is released once it
+    // exits, although the helper keeps running and is never signalled.
+    const stopped = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const signals = [];
+    const quarantined = table({ wrapper: () => false, executor: () => Date.now() - begun < 200, helperPath: crashpad });
+    const outcome = await whileHostAlive(
+        waitForProcessTreeExit(stopped, { platform: "darwin", snapshot: quarantined, kill: (...call) => signals.push(call), tag: TAG, since: spawnedAt, killWaitMs: 30, pollMs: 5 }),
+    );
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(!signals.some(([target]) => Math.abs(target) === 500 || Math.abs(target) === 499), JSON.stringify(signals));
 });
 
 test("a platform binary carrying the tag is never read as untagged on macOS", { skip: process.platform === "darwin" ? false : "macOS hides some environments from ps" }, async (t) => {

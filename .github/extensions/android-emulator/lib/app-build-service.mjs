@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AppError } from "./errors.mjs";
@@ -549,6 +549,51 @@ function runPs(ps, args) {
 }
 
 /**
+ * Where an executable that hides its environment from `ps -E` could be one a
+ * build runs: Apple platform binaries (and cryptexes, under /System).
+ */
+export const HIDDEN_ENV_EXEC_PREFIXES = Object.freeze(["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec", "/System"]);
+
+function isUnder(file, root) {
+    return file === root || file.startsWith(root.endsWith("/") ? root : `${root}/`);
+}
+
+function couldBeBuildExecutable(file, roots) {
+    if (typeof file !== "string" || !file.startsWith("/")) {
+        return true;
+    }
+    return [...HIDDEN_ENV_EXEC_PREFIXES, ...roots].some((root) => typeof root === "string" && root.startsWith("/") && isUnder(file, root));
+}
+
+/**
+ * The directories a build's own executables come from, both as given and
+ * resolved (an executable's path is the one it was started with): the JDK,
+ * Android SDK and NDK, Gradle user home (wrapper distributions) and project.
+ */
+export function buildExecutableRoots({ env = process.env, cwd, home = os.homedir() } = {}) {
+    const given = [
+        env.JAVA_HOME,
+        env.ANDROID_HOME,
+        env.ANDROID_SDK_ROOT,
+        env.ANDROID_NDK_HOME,
+        env.ANDROID_NDK_ROOT,
+        env.GRADLE_USER_HOME || (home ? path.join(home, ".gradle") : undefined),
+        home ? path.join(home, "Library", "Android", "sdk") : undefined,
+        cwd,
+    ].filter((dir) => typeof dir === "string" && path.isAbsolute(dir));
+    const roots = new Set();
+    for (const dir of given) {
+        roots.add(path.resolve(dir));
+        try {
+            roots.add(realpathSync.native(dir));
+        } catch {
+            // Missing: nothing runs from it.
+        }
+    }
+    return Array.from(roots);
+}
+
+/**
  * macOS: `ps -E` silently omits the environment of some processes -- Apple
  * platform binaries such as /bin/sh and /bin/sleep -- and an omitted
  * environment reads exactly like one without the tag. Measured on macOS 26:
@@ -570,11 +615,20 @@ function runPs(ps, args) {
  * unknown ones. That keeps unrelated orphans, such as another program's helpers
  * left behind when it was killed, from holding the device for long.
  *
+ * Of those, only one whose executable a build could run with its environment
+ * hidden stays undecided: Apple platform locations (HIDDEN_ENV_EXEC_PREFIXES) or
+ * the build's own toolchain roots (`roots`: JDK, Android SDK/NDK, Gradle user
+ * home, project). A hidden process whose executable is elsewhere -- such as a
+ * Chromium crashpad handler inside an .app bundle, which double-forks under
+ * launchd whenever such an app starts -- is not the build's. One whose path was
+ * not read (`path` missing or not absolute) stays undecided.
+ *
  * Not covered: a hidden process that made itself a group leader (setsid) and
- * whose shown ancestors have all exited. The build's own processes -- the JVMs,
- * adb -- show their environment.
+ * whose shown ancestors have all exited, and a hidden one the build ran from
+ * outside those locations. The build's own processes -- the JVMs, adb, node --
+ * show their environment.
  */
-export function classifyHiddenEnvironments(processes, { since = -Infinity, uid = process.getuid?.() } = {}) {
+export function classifyHiddenEnvironments(processes, { since = -Infinity, uid = process.getuid?.(), roots = [] } = {}) {
     for (const proc of processes.values()) {
         if (proc.envShown !== false || proc.tagged === true) {
             continue;
@@ -591,6 +645,8 @@ export function classifyHiddenEnvironments(processes, { since = -Infinity, uid =
         if (top?.envShown === true) {
             proc.tagged = top.tagged;
         } else if (top && top.envShown === false && (top.ppid === 0 || (top.ppid === 1 && top.pgid === top.pid))) {
+            continue;
+        } else if (!couldBeBuildExecutable(proc.path, roots)) {
             continue;
         } else {
             proc.tagged = undefined;
@@ -613,7 +669,7 @@ export function classifyHiddenEnvironments(processes, { since = -Infinity, uid =
  * reads /proc. Elsewhere environments cannot be read and a tagged snapshot
  * fails, so nothing is ever confirmed gone without that evidence.
  */
-export async function processSnapshot({ tag, since } = {}) {
+export async function processSnapshot({ tag, since, roots } = {}) {
     const withTag = tag !== undefined;
     if (withTag) {
         assertTag(tag);
@@ -629,6 +685,8 @@ export async function processSnapshot({ tag, since } = {}) {
     );
     // Listed after the environments, so a process in both is the same one when its start time matches.
     const plain = fromPsEnv ? await runPs(ps, ["-A", "-ww", "-o", "pid=,lstart=,command="]) : "";
+    // The executable path, last because it can contain spaces.
+    const comms = fromPsEnv ? await runPs(ps, ["-A", "-ww", "-o", "pid=,lstart=,comm="]) : "";
     const tagToken = fromPsEnv ? new RegExp(`(?:^|\\s)${BUILD_TAG_ENV}=${tag}(?=\\s|$)`) : null;
     const processes = new Map();
     for (const line of stdout.split("\n")) {
@@ -670,16 +728,28 @@ export async function processSnapshot({ tag, since } = {}) {
                 listed.set(Number(match[1]), { lstart: match[2].trim(), command: match[3] ?? "" });
             }
         }
+        const execs = new Map();
+        for (const line of comms.split("\n")) {
+            const match = /^\s*(\d+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)(?:\s(.*))?$/.exec(line);
+            if (match) {
+                execs.set(Number(match[1]), { lstart: match[2].trim(), path: (match[3] ?? "").trim() });
+            }
+        }
         for (const proc of processes.values()) {
+            const exec = execs.get(proc.pid);
+            if (exec && exec.lstart === proc.lstart && exec.path) {
+                proc.path = exec.path;
+            }
             const bare = listed.get(proc.pid);
             // Shown only when the environment listing is the bare command plus more; a
             // process missing from the second listing, or changed, cannot be told apart.
             proc.envShown = Boolean(
                 bare && bare.lstart === proc.lstart && proc.command.length > bare.command.length && proc.command.startsWith(`${bare.command} `),
             );
-            delete proc.command;
+            // Kept for diagnostics only: the arguments, never the environment.
+            proc.command = bare && bare.lstart === proc.lstart ? bare.command : undefined;
         }
-        classifyHiddenEnvironments(processes, { since });
+        classifyHiddenEnvironments(processes, { since, roots });
     }
     if (withTag && !fromPsEnv) {
         await markTaggedFromProc(processes, tag);
@@ -694,8 +764,8 @@ export async function processSnapshot({ tag, since } = {}) {
  * environment the system hid (`envHidden`, see classifyHiddenEnvironments) is
  * left undecided for undecidedProcesses().
  */
-async function takeSnapshot(snapshot, tag, since) {
-    const snap = await snapshot(tag === undefined ? undefined : { tag, since });
+async function takeSnapshot(snapshot, tag, since, roots) {
+    const snap = await snapshot(tag === undefined ? undefined : { tag, since, roots });
     if (tag !== undefined) {
         for (const proc of snap.values()) {
             if (typeof proc.tagged !== "boolean" && proc.envHidden !== true) {
@@ -717,12 +787,12 @@ function isZombie(proc) {
  */
 function undecidedProcesses(snapshot, owned) {
     return Array.from(snapshot.values())
-        .filter((proc) => proc.envHidden === true && proc.tagged !== true && !owned.has(proc.pid) && !isZombie(proc))
-        .map((proc) => proc.pid);
+        .filter((proc) => proc.envHidden === true && proc.tagged !== true && !owned.has(proc.pid) && !isZombie(proc));
 }
 
-function undecidedDetail(pids) {
-    return `the environment of pid(s) ${pids.join(", ")} is hidden by the system, so they cannot be told apart from this build's`;
+function undecidedDetail(procs) {
+    const described = procs.map((proc) => `${proc.pid} (${proc.path || proc.command || "executable unknown"})`);
+    return `the environment of pid(s) ${described.join(", ")} is hidden by the system, so they cannot be told apart from this build's`;
 }
 
 /**
@@ -819,7 +889,7 @@ const noMarkers = async () => [];
  */
 async function stopOwnedPosix(
     child,
-    { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS, known = new Map(), tag, since },
+    { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS, known = new Map(), tag, since, roots },
 ) {
     const wrapperPid = child.pid;
     const exited = () => child.exitCode !== null || child.signalCode !== null;
@@ -848,7 +918,7 @@ async function stopOwnedPosix(
             // orphan its children, so the next snapshot sees all of them.
             for (let round = 0; round < 10; round += 1) {
                 const passStart = Date.now();
-                const snap = await takeSnapshot(snapshot, tag, bound);
+                const snap = await takeSnapshot(snapshot, tag, bound, roots);
                 // exited() only after the snapshot: Node reaps the wrapper only once
                 // its exit is recorded, so a wrapper not yet exited here still held
                 // its pid when the snapshot was taken.
@@ -894,6 +964,7 @@ async function stopOwnedPosix(
                             : `stopped ${stopped.size} process(es) with SIGKILL and confirmed them gone`,
                     stopped: Array.from(stopped.values()),
                     executors: Array.from(executors),
+                    since: bound,
                 };
             }
             for (const proc of live) {
@@ -926,6 +997,8 @@ async function stopOwnedPosix(
                       : `pid(s) ${remaining.join(", ") || wrapperPid} still running after SIGKILL`,
                 stopped: Array.from(stopped.values()),
                 executors: Array.from(executors),
+                // How far the clean passes narrowed the bound, for the next attempt.
+                since: bound,
             };
         }
         await delay(pollMs);
@@ -993,6 +1066,7 @@ export async function terminateProcessTree(
         known,
         tag,
         since,
+        roots,
     } = {},
 ) {
     if (!child?.pid) {
@@ -1001,7 +1075,7 @@ export async function terminateProcessTree(
     if (platform === "win32") {
         return stopOwnedWindows(child, { killWaitMs, markers, taskkill });
     }
-    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs, known, tag, since });
+    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs, known, tag, since, roots });
 }
 
 /**
@@ -1029,6 +1103,7 @@ export async function waitForProcessTreeExit(
         known,
         tag,
         since,
+        roots,
     } = {},
 ) {
     const pid = child.pid;
@@ -1050,10 +1125,15 @@ export async function waitForProcessTreeExit(
             await pause(pollMs);
         }
     }
+    let bound = since;
     for (;;) {
-        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, known, tag, since });
+        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, known, tag, since: bound, roots });
         if (outcome.confirmed) {
             return { ...outcome, detail: `build processes exited after cancellation (${outcome.detail})` };
+        }
+        // Carried over, so an attempt never looks further back than a clean pass allows.
+        if (bound !== undefined && outcome.since !== undefined) {
+            bound = Math.max(bound, outcome.since);
         }
         await pause(pollMs);
     }
@@ -1072,7 +1152,7 @@ export async function waitForProcessTreeExit(
  */
 export async function liveBuildProcesses(
     child,
-    { platform = process.platform, markers = noMarkers, snapshot = processSnapshot, known = new Map(), tag, since } = {},
+    { platform = process.platform, markers = noMarkers, snapshot = processSnapshot, known = new Map(), tag, since, roots } = {},
 ) {
     // Read only after every await: the wrapper can exit -- and its pid be reused --
     // while records or the snapshot are being read. Node reaps it only after its
@@ -1084,7 +1164,7 @@ export async function liveBuildProcesses(
         return [...(exited() ? [] : [child.pid]), ...records.filter((record) => pidAlive(record.pid)).map((record) => record.pid)];
     }
     const records = await markers();
-    const snap = await takeSnapshot(snapshot, tag, since);
+    const snap = await takeSnapshot(snapshot, tag, since, roots);
     const owned = ownedProcesses({ snapshot: snap, wrapperPid: child.pid, wrapperExited: exited(), markers: records, known });
     for (const proc of owned.values()) {
         known.set(proc.pid, proc.lstart);
@@ -1572,6 +1652,13 @@ export class AppBuildService {
             .then(() =>
                 this.processTree.terminate(child, { platform: this.platform, killWaitMs: this.terminateKillWaitMs, markers, known, ...owner }),
             )
+            .then((outcome) => {
+                // A clean pass while stopping narrows the bound for later looks too.
+                if (owner?.since && typeof outcome?.since === "number") {
+                    owner.since = Math.max(owner.since, outcome.since);
+                }
+                return outcome;
+            })
             .catch((error) => ({ confirmed: false, detail: `termination failed: ${error?.message ?? error}` }));
     }
 
@@ -1715,6 +1802,7 @@ export class AppBuildService {
             try {
                 spawnedAt = Date.now();
                 owner.since = spawnedAt;
+                owner.roots = buildExecutableRoots({ env: process.env, cwd });
                 child = spawn(invocation.command, invocation.args, {
                     cwd,
                     env: { ...process.env, ANDROID_SERIAL: serial, TERM: "dumb", [BUILD_TAG_ENV]: owner.tag },
