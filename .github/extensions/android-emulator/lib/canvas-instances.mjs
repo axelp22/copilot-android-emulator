@@ -24,8 +24,23 @@ export class CanvasInstanceController {
         this.openDeviceCanvas = openDeviceCanvas;
         this.diagnostic = onDiagnostic;
         this.instances = new Map();
+        /**
+         * Bindings that could not be persisted after an aborted switch. The
+         * store may still name the refused device, so these win on reopen.
+         */
+        this.bindingOverrides = new Map();
         this.locks = new KeyedLock();
         this.shuttingDown = false;
+    }
+
+    async #persistBinding(bindings, instanceId, deviceId) {
+        try {
+            await writeBinding(bindings, instanceId, deviceId);
+            return true;
+        } catch (error) {
+            this.diagnostic(`Could not persist canvas ${instanceId}'s binding: ${error?.message ?? error}`);
+            return false;
+        }
     }
 
     #assertOpen() {
@@ -52,8 +67,14 @@ export class CanvasInstanceController {
                 // Even for a live unbound canvas the saved binding is consulted:
                 // it may be retained from a device that was missing at first
                 // open and has since come back.
-                const savedDeviceId = await bindings?.get(instanceId);
+                const overridden = this.bindingOverrides.has(instanceId);
+                const savedDeviceId = overridden
+                    ? this.bindingOverrides.get(instanceId)
+                    : await bindings?.get(instanceId);
                 this.#assertOpen();
+                if (overridden && (await this.#persistBinding(bindings, instanceId, savedDeviceId))) {
+                    this.bindingOverrides.delete(instanceId);
+                }
                 ({ deviceId, persist } = await resolveCanvasDevice({
                     savedDeviceId,
                     requestedDeviceId,
@@ -130,6 +151,7 @@ export class CanvasInstanceController {
     close(instanceId) {
         return this.locks.run(instanceId, async () => {
             await this.#closeEntry(instanceId);
+            this.bindingOverrides.delete(instanceId);
             await this.getBindings()?.delete(instanceId);
         });
     }
@@ -147,6 +169,12 @@ export class CanvasInstanceController {
             this.manager.assertNoActiveLease(resolvedId);
 
             const bindings = this.getBindings();
+            // Restored exactly on abort: an unbound canvas may be retaining a
+            // saved device that is only temporarily missing.
+            const priorSaved = this.bindingOverrides.has(instanceId)
+                ? this.bindingOverrides.get(instanceId)
+                : await bindings?.get(instanceId);
+            this.#switchableEntry(instanceId, fromDeviceId, entry);
             await bindings?.set(instanceId, resolvedId);
             try {
                 // Revalidated after the write: an agent may have leased either
@@ -159,9 +187,19 @@ export class CanvasInstanceController {
             } catch (error) {
                 if (this.instances.get(instanceId) === entry) {
                     try {
-                        await bindings?.set(instanceId, entry.deviceId ?? null);
+                        await writeBinding(bindings, instanceId, priorSaved);
                     } catch (rollbackError) {
-                        throw rollbackFailedError(instanceId, entry.deviceId ?? null, error, rollbackError, this.diagnostic);
+                        // The store may still name the refused target. The
+                        // in-memory override keeps a reopen on what the canvas
+                        // showed; deleting the record stops a later session
+                        // from restoring the refused device.
+                        this.bindingOverrides.set(instanceId, priorSaved);
+                        await bindings?.delete(instanceId).catch((deleteError) => {
+                            this.diagnostic(
+                                `Could not clear canvas ${instanceId}'s binding either: ${deleteError?.message ?? deleteError}`,
+                            );
+                        });
+                        throw rollbackFailedError(instanceId, priorSaved ?? null, error, rollbackError, this.diagnostic);
                     }
                 }
                 throw error;
@@ -260,4 +298,13 @@ function rollbackFailedError(instanceId, deviceId, switchError, rollbackError, d
     });
     error.cause = new AggregateError([switchError, rollbackError], message);
     return error;
+}
+
+/** Writes `deviceId`, or removes the record when there was none. */
+async function writeBinding(bindings, instanceId, deviceId) {
+    if (deviceId === undefined) {
+        await bindings?.delete(instanceId);
+    } else {
+        await bindings?.set(instanceId, deviceId);
+    }
 }

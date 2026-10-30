@@ -48,8 +48,24 @@ const skip = !chromePath
       ? "this Node has no global WebSocket (needs Node 22+)"
       : false;
 
-/** Starts headless Chrome with a private profile, removed with the browser afterwards. */
+/**
+ * Starts headless Chrome and opens a page. Parallel test files each launch a
+ * browser, so a launch that dies or stalls is retried once with a fresh profile.
+ */
 async function launchChrome(t) {
+    let port;
+    try {
+        port = await startChrome(t);
+    } catch (error) {
+        t.diagnostic(`Chrome launch failed (${error.message}); retrying with a fresh profile`);
+        port = await startChrome(t);
+    }
+    const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
+    return connect(target.webSocketDebuggerUrl);
+}
+
+/** Starts headless Chrome with a private profile, removed with the browser afterwards. */
+async function startChrome(t) {
     const profile = await mkdtemp(path.join(os.tmpdir(), "canvas-chrome-"));
     const args = [
         "--headless=new",
@@ -68,7 +84,14 @@ async function launchChrome(t) {
     // surviving network service keeps writing into the profile being removed.
     const posix = process.platform !== "win32";
     const chrome = spawn(chromePath, args, { stdio: "ignore", detached: posix });
-    const exited = new Promise((resolve) => chrome.once("exit", resolve));
+    let exitCode;
+    const exited = new Promise((resolve) =>
+        chrome.once("exit", (code, signalName) => {
+            exitCode = code ?? signalName;
+            resolve();
+        }),
+    );
+    const spawnFailed = new Promise((resolve) => chrome.once("error", resolve));
     const signal = (name) => {
         try {
             if (posix) {
@@ -93,16 +116,29 @@ async function launchChrome(t) {
     });
 
     let port = null;
+    let launchError = null;
+    void spawnFailed.then((error) => {
+        launchError = error;
+    });
     await waitUntil(
         async () => {
+            if (launchError) {
+                throw launchError;
+            }
+            if (exitCode !== undefined) {
+                signal("SIGKILL");
+                throw new Error(`Chrome exited (${exitCode}) before writing DevToolsActivePort`);
+            }
             const contents = await readFile(path.join(profile, "DevToolsActivePort"), "utf8").catch(() => "");
             port = Number(contents.split("\n")[0]) || null;
             return port !== null;
         },
-        { timeoutMs: 20_000, message: "Chrome's debugging port" },
-    );
-    const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
-    return connect(target.webSocketDebuggerUrl);
+        { timeoutMs: 45_000, message: "Chrome's debugging port" },
+    ).catch((error) => {
+        signal("SIGKILL");
+        throw error;
+    });
+    return port;
 }
 
 async function connect(url) {

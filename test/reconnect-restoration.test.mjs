@@ -4,7 +4,7 @@
  * connections, and time by an injected clock.
  */
 import assert from "node:assert/strict";
-import { readdir, readFile, writeFile, mkdir } from "node:fs/promises";
+import { readdir, readFile, rename, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
 import { extensionModule, extensionRoot, tempDir } from "./helpers.mjs";
@@ -297,7 +297,8 @@ test("binding store round-trips, writes atomically and recovers from a corrupt f
     assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), [], "no temp files left");
 
     await Promise.all(Array.from({ length: 20 }, (_, i) => store.set("canvas-2", `dev-${i}`)));
-    assert.match(await store.get("canvas-2"), /^dev-\d+$/, "concurrent writes leave a whole binding");
+    assert.equal(await store.get("canvas-2"), "dev-19", "concurrent writes land whole, last call wins");
+    assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), [], "no temp files left");
 
     await writeFile(store.filePath("canvas-3"), "{\"deviceId\":", "utf8");
     assert.equal(await store.get("canvas-3"), undefined);
@@ -306,6 +307,57 @@ test("binding store round-trips, writes atomically and recovers from a corrupt f
     await store.delete("canvas-1");
     await store.delete("canvas-1");
     assert.equal(await store.get("canvas-1"), undefined);
+});
+
+function lockedRename(failures, code = "EPERM") {
+    const calls = [];
+    const renameFile = async (from, to) => {
+        calls.push(to);
+        if (calls.length <= failures) {
+            throw Object.assign(new Error(`${code}: operation not permitted, rename`), { code });
+        }
+        await rename(from, to);
+    };
+    return { calls, renameFile };
+}
+
+test("binding store retries a rename Windows refuses while the target is held open", async (t) => {
+    const root = await tempDir(t);
+    const { calls, renameFile } = lockedRename(2);
+    const delays = [];
+    const store = new CanvasBindingStore(root, { renameFile, sleep: async (ms) => delays.push(ms) });
+    await store.set("canvas", "avd:Pixel");
+    assert.equal(calls.length, 3);
+    assert.deepEqual(delays, [10, 25], "bounded backoff");
+    assert.equal(await store.get("canvas"), "avd:Pixel");
+    assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), []);
+});
+
+test("binding store gives up after bounded retries and removes its temp file", async (t) => {
+    const root = await tempDir(t);
+    const { calls, renameFile } = lockedRename(Infinity, "EBUSY");
+    const store = new CanvasBindingStore(root, { renameFile, sleep: async () => {}, retryDelaysMs: [1, 1, 1] });
+    await assert.rejects(store.set("canvas", "avd:Pixel"), { code: "EBUSY" });
+    assert.equal(calls.length, 4, "first try plus three retries");
+    assert.deepEqual(await readdir(root), [], "temp file cleaned up, nothing persisted");
+    const { renameFile: other } = lockedRename(Infinity, "ENOSPC");
+    const strict = new CanvasBindingStore(root, { renameFile: other, sleep: async () => assert.fail("no retry") });
+    await assert.rejects(strict.set("canvas", "x"), { code: "ENOSPC" }, "non-transient errors are not retried");
+    await store.delete("canvas");
+});
+
+test("binding store applies writes for one canvas in call order", async (t) => {
+    const root = await tempDir(t);
+    const order = [];
+    const store = new CanvasBindingStore(root, {
+        renameFile: async (from, to) => {
+            order.push(JSON.parse(await readFile(from, "utf8")).deviceId);
+            await rename(from, to);
+        },
+    });
+    await Promise.all([store.set("c", "A"), store.delete("c"), store.set("c", "B"), store.set("c", "C")]);
+    assert.deepEqual(order, ["A", "B", "C"]);
+    assert.equal(await store.get("c"), "C");
 });
 
 test("binding store survives a session reopen with a fresh instance", async (t) => {
@@ -1065,7 +1117,10 @@ test("R2: a failed binding rollback surfaces both the switch rejection and the r
             await set.promise;
             return write(...args);
         }
-        throw new Error("disk full");
+        if (calls === 2) {
+            throw new Error("disk full");
+        }
+        return write(...args);
     };
     const switching = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "B" });
     await tick();
@@ -1083,5 +1138,64 @@ test("R2: a failed binding rollback surfaces both the switch rejection and the r
     assert.match(diagnostics[0], /device_leased|leased/);
     assert.match(diagnostics[0], /disk full/);
     assert.equal(manager.attached.get("c"), "A", "the canvas still shows A");
-    assert.equal(store.get("c"), "B", "the unrestored binding is reported, not hidden");
+    assert.equal(store.has("c"), false, "the refused B is not left persisted");
+
+    // The host recreates the canvas (its live entry is gone, the session is not).
+    const { server } = controller.instances.get("c");
+    controller.instances.delete("c");
+    await server.close();
+    const reopened = await controller.open({ instanceId: "c", input: {} });
+    assert.equal(reopened.deviceId, "A", "reopen shows what the canvas showed");
+    assert.equal(store.get("c"), "A", "and persists it once writes work again");
+    assert.equal(controller.bindingOverrides.has("c"), false);
+});
+
+test("R2: an aborted switch on an unbound canvas keeps its retained saved binding", async () => {
+    const set = deferred();
+    const { controller, leases, store } = leasingHarness({
+        devices: { A: { kind: "emulator", state: "Booted", name: "A" } },
+        saved: { c: "B" },
+    });
+    const opened = await controller.open({ instanceId: "c", input: {} });
+    assert.equal(opened.deviceId, null);
+    assert.equal(store.get("c"), "B");
+    const bindings = controller.getBindings();
+    const write = bindings.set.bind(bindings);
+    let gated = true;
+    bindings.set = async (...args) => {
+        if (gated) {
+            gated = false;
+            await set.promise;
+        }
+        return write(...args);
+    };
+    const switching = controller.switch({ instanceId: "c", fromDeviceId: null, toDeviceId: "A" });
+    await tick();
+    leases.add("A");
+    set.resolve();
+    await assert.rejects(switching, { code: "device_leased" });
+    assert.equal(store.get("c"), "B", "retained B survives the abort");
+});
+
+test("R2: an aborted first switch removes the record it created", async () => {
+    const set = deferred();
+    const { controller, leases, store } = leasingHarness({ devices: THREE_BOOTED });
+    await controller.open({ instanceId: "c", input: { deviceId: "A" } });
+    store.delete("c");
+    const bindings = controller.getBindings();
+    const write = bindings.set.bind(bindings);
+    let gated = true;
+    bindings.set = async (...args) => {
+        if (gated) {
+            gated = false;
+            await set.promise;
+        }
+        return write(...args);
+    };
+    const switching = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "B" });
+    await tick();
+    leases.add("B");
+    set.resolve();
+    await assert.rejects(switching, { code: "device_leased" });
+    assert.equal(store.has("c"), false, "no null written over an absent record");
 });
