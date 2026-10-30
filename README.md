@@ -343,20 +343,48 @@ dismiss it. Build failures and refused controls appear there and in a small noti
 rather than replacing the device picture, which keeps streaming.
 
 The app to launch is read from the `output-metadata.json` that AGP writes beside the
-APK, for **the module and variant the task names**: `:app:installDebug`
-reads `app`'s `debug` output, `:feature:shop:installPaidDebug` reads that module's
-`paidDebug` output, and an older release build lying around is never mistaken for
-what was just installed. A task that names no module, like the default
-`installDebug`, works when exactly one module has that variant. When the task does
-not pin down one app — two app modules with a debug variant, or a custom task name —
-the build is reported as failed with the candidates listed instead of launching a
-guess. Set `packageName`, or use a module-qualified `gradleTask`, to resolve it.
+APK, for **the module and variant that was actually installed**, never from a
+recorded or guessed application id, so an older release build lying around is never
+mistaken for what was just installed.
 
-The module's directory is assumed from the task path (`:feature:shop` is
-`feature/shop` under the project root) and is not read from Gradle. A module whose
-`projectDir` is remapped in `settings.gradle`, or a custom `buildDir`, is therefore
-not found: the build is reported as failed with "no build output", nothing is
-launched, and setting `packageName` in the config file is the fix.
+Each build runs a small trusted init script (written beside the executor one under
+`~/.copilot/android-emulator/gradle/`). It adds no tasks and reads no application id
+providers. It records two things:
+
+- **Layout**, at configuration time: every project's Gradle path, `projectDir`,
+  `buildDir` and Android variant names, plus included builds. A module remapped in
+  `settings.gradle` (`project(":app").projectDir = file("android/phone")`) and a
+  custom `buildDir` are therefore found where Gradle puts them.
+- **Install evidence**, when an AGP install task starts: the project, task and
+  directories, written to a file for this build only. The same is recorded when an
+  application module's `assemble<Variant>` task runs. This runs on configuration
+  cache hits too, so it always describes the current build.
+
+When install evidence exists, it decides the app: a custom task like
+`:app:deployWear` that runs `:wear:installDebug`, a bare `deployToDevice`, or an
+install in an included build launches what was installed. Without evidence, a
+module-qualified task such as `:app:installDebug` or `:feature:shop:installPaidDebug`
+is resolved from the layout. A run that installed nothing (for example
+`:app:assembleDebug`) is resolved only from the assemble tasks it recorded, at the
+`buildDir` they actually used; if it recorded none for the requested variant, the
+build fails with `app_not_resolved` rather than trusting a layout that a reused
+configuration cache may have left from another configuration. An unqualified task like `installDebug` works when
+exactly one app module has that variant. Any module whose application id cannot be
+read counts as a candidate, so an unreadable module never makes another look unique.
+When the task does not pin down one app (two modules installed, two candidates, or
+a custom task that installed nothing recorded), the build is reported as failed
+with the candidates and exact module-qualified `gradleTask` values, instead of
+launching a guess. Set `packageName`, or use a module-qualified `gradleTask`, to
+resolve it.
+
+Failures are explicit. If the layout or evidence could not be written (or is
+malformed), the build reports `app_layout_failed` with the error rather than falling
+back to the path convention. A reused configuration cache keeps the layout from the
+build that stored it, so the layout holds only structure, not application ids, and
+is used for answers only when this run's own evidence is unavailable. With no layout at all (the init script could not be written, or
+Gradle failed before configuring the build), the module directory is assumed from
+the task path (`:feature:shop` is `feature/shop`, outputs under its `build/`), and a
+failure says so. Abbreviated project or task names (`:a:iD`) are not expanded.
 
 Override the defaults with a config file at the root of the working directory,
 named `.android-emulator.json`, `android-emulator.json` or
@@ -531,8 +559,22 @@ hardware, so treat it as unproven rather than working:
   stopped the recorded single-use daemon (a child of the client, in its own process
   group) and confirmed it gone before the device was released, never installing
   afterwards and never signalling another Gradle daemon; the canvas's Install and
-  Cancel buttons and a failing build were driven through headless Chrome. A reused
-  configuration cache was not exercised against real Gradle. A minimal AGP fixture
+  Cancel buttons and a failing build were driven through headless Chrome. The project
+  layout init script was run separately, without a device, against a throwaway AGP
+  8.13.2 build (Gradle 9.5.0, JDK 17, `--offline`) with a remapped `projectDir`, a
+  custom `buildDir`, flavored application ids, a Wear module and an included build.
+  Recorded directories matched the build. Configuration cache runs
+  `assembleFreeDebug` → `assembleFreeRelease` → `assembleFreeDebug`, where the id
+  depends on the requested task, ended in a cache reuse that still resolved the
+  debug APK's id. A release-only provider that throws did not affect a debug build,
+  with `android.compatibility.enableLegacyApi` true or false. Install evidence was
+  recorded on cache hits for `:phone:deployWear` (resolved the Wear app),
+  `deployToDevice` and `installDebug`, and `--parallel` recorded every project. The
+  install step was stubbed out, so no device was used. Java 8, isolated projects,
+  other AGP and Gradle versions, and real installs are untested. Those fixtures are
+  not checked in.
+  A reused configuration cache was not exercised against real Gradle for installs
+  on a device. A minimal AGP fixture
   ([`test/fixtures/agp-app/`](test/fixtures/agp-app/)) and an opt-in suite
   (`scripts/verify/agp-fixture.mjs`) now make the build, install and launch path
   repeatable against an explicitly named disposable emulator; the fixture has been

@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { access, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -82,12 +82,20 @@ export async function findGradleRoot(from, { platform = process.platform } = {})
  * so its executor can be identified and stopped (see "the build executor"
  * below). Both come before the task and from the extension, never from input.
  */
-export function gradleInvocation({ wrapper, task, initScript, platform = process.platform, comSpec = process.env.ComSpec }) {
-    const options = ["--no-daemon", "--init-script", initScript];
+export function gradleInvocation({
+    wrapper,
+    task,
+    initScript,
+    layoutInitScript = null,
+    platform = process.platform,
+    comSpec = process.env.ComSpec,
+}) {
+    const scripts = layoutInitScript ? [initScript, layoutInitScript] : [initScript];
+    const options = ["--no-daemon", ...scripts.flatMap((script) => ["--init-script", script])];
     if (platform !== "win32") {
         return { command: wrapper, args: [...options, task], options: { detached: true }, display: `./gradlew --no-daemon ${task}` };
     }
-    for (const file of [wrapper, initScript]) {
+    for (const file of [wrapper, ...scripts]) {
         if (/["%\x00-\x1f]/.test(file)) {
             throw new AppError(
                 "unsupported_gradle_path",
@@ -97,7 +105,7 @@ export function gradleInvocation({ wrapper, task, initScript, platform = process
             );
         }
     }
-    const line = `"${wrapper}" --no-daemon --init-script "${initScript}" "${task}"`;
+    const line = `"${wrapper}" --no-daemon ${scripts.map((script) => `--init-script "${script}" `).join("")}"${task}"`;
     return {
         command: comSpec || "cmd.exe",
         args: ["/d", "/v:off", "/s", "/c", `"${line}"`],
@@ -142,12 +150,13 @@ export function variantFromTask(name) {
 }
 
 /**
- * Every `output-metadata.json` under one module's `build/outputs/apk`. Flavored
- * variants nest as apk/<flavor>/<buildType>/, plain ones as apk/<buildType>/,
- * so the depth is not fixed.
+ * Every `output-metadata.json` under one module's `<buildDir>/outputs/apk`.
+ * Flavored variants nest as apk/<flavor>/<buildType>/, plain ones as
+ * apk/<buildType>/, so the depth is not fixed. `buildDir` defaults to the
+ * conventional `<moduleDir>/build`; Gradle's real one is used when known.
  */
-async function moduleMetadata(moduleDir) {
-    const apkRoot = path.join(moduleDir, "build", "outputs", "apk");
+async function moduleMetadata(moduleDir, buildDir = path.join(moduleDir, "build"), projectPath = null) {
+    const apkRoot = path.join(buildDir, "outputs", "apk");
     const found = [];
     async function collect(dir, depth) {
         if (depth > 3) {
@@ -162,9 +171,16 @@ async function moduleMetadata(moduleDir) {
                 const parsed = await readFile(file, "utf8")
                     .then((raw) => JSON.parse(raw))
                     .catch(() => null);
-                if (parsed?.applicationId) {
+                if (isApplicationId(parsed?.applicationId)) {
                     const relativeDir = path.relative(apkRoot, dir).split(path.sep).filter(Boolean);
-                    found.push({ file, moduleDir, relativeDir, applicationId: parsed.applicationId, variantName: parsed.variantName ?? null });
+                    found.push({
+                        file,
+                        moduleDir,
+                        projectPath,
+                        relativeDir,
+                        applicationId: parsed.applicationId,
+                        variantName: parsed.variantName ?? null,
+                    });
                 }
             }
         }
@@ -206,31 +222,805 @@ function matchesVariant(candidate, variant) {
     return candidate.relativeDir.join("").toLowerCase() === wanted;
 }
 
+/** A Java package name, which is all an Android application id can be. */
+function isApplicationId(value) {
+    return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(value);
+}
+
+// --- what Gradle says the project looks like ---------------------------------------
+//
+// A task path names a Gradle project, not a directory. `settings.gradle` can put
+// `:feature:shop` anywhere (`project(":feature:shop").projectDir = ...`), and a
+// build script can move its outputs (`layout.buildDirectory = ...`), so the only
+// reliable answer comes from Gradle itself. Every build therefore also runs a
+// second trusted init script, separate from the executor one, that records:
+//
+// - the layout: each project's path, projectDir and buildDir, its variant-shaped
+//   task names, and for Android application projects the names of its variants.
+//   It is keyed by the root directory and written at configuration time, so a
+//   configuration-cache hit (which skips init scripts) leaves the record of
+//   whichever configuration ran last -- possibly a different one. It therefore
+//   holds only structure, never application ids: an id is always read from the
+//   `output-metadata.json` AGP wrote next to the APK the build produced.
+// - install evidence: an action on every AGP install task that, when the task
+//   runs, writes which project, variant and buildDir it installed into a
+//   directory named by the build that started Gradle. Task actions are part of
+//   the cached configuration, so this is written on cache hits too, and it says
+//   what this invocation actually installed, whatever task was requested.
+//   The same action on every application project's `assemble<Variant>` task
+//   records what this invocation built, so a run that installs nothing is
+//   resolved from where it actually wrote its APK, not from the layout's
+//   (possibly stale) buildDir. With evidence enabled, a non-install task that
+//   recorded no matching assemble task fails rather than trusting the layout.
+//
+// The script reads no application id provider (so it cannot finalize one before
+// AGP's producer sets it) and never fails or changes what the build does.
+
+const PROJECT_LAYOUT_FORMAT = 3;
+const INSTALL_EVIDENCE_FORMAT = 2;
+const EVIDENCE_KINDS = new Set(["install", "assemble"]);
+/** Names, per Gradle run, the directory the install-evidence action writes to. */
+export const INSTALL_EVIDENCE_ENV = "ANDROID_EMULATOR_INSTALL_EVIDENCE";
+
+export function projectLayoutPaths(executorDir) {
+    return {
+        initScript: path.join(executorDir, "project-layout.init.gradle"),
+        layoutDir: path.join(executorDir, "projects"),
+        installsDir: path.join(executorDir, "installs"),
+    };
+}
+
 /**
- * The application id is needed to launch what was just installed. AGP writes it
- * next to the APK, which beats parsing build output or diffing installed
- * packages.
+ * The layout init script. Like the executor one, its content depends only on
+ * `layoutDir`, so it keeps the configuration cache valid. Collection failures
+ * are recorded with the project and step they hit; the shared collections are
+ * thread-safe because projects may be configured in parallel.
+ */
+export function projectLayoutInitScript(layoutDir) {
+    return [
+        "// Written by the Android Emulator Copilot extension. Records where each project's",
+        "// sources and outputs are, which Android variants it has, and which app each",
+        "// install task actually installed, so the app a build installed can be launched.",
+        "// It reads no application id and never changes or fails the build; anything it",
+        "// cannot read is recorded as an error, never silently left out.",
+        "def copilotVariants = new java.util.concurrent.ConcurrentHashMap()",
+        "def copilotErrors = java.util.Collections.synchronizedList([])",
+        "def copilotDescribe = { Throwable failure ->",
+        "    def parts = []",
+        "    def seen = [] as Set",
+        "    for (Throwable t = failure; t != null && seen.add(t) && parts.size() < 5; t = t.cause) {",
+        "        parts << t.getClass().name + (t.message ? ': ' + t.message : '')",
+        "    }",
+        "    parts.join(' <- caused by ').take(500)",
+        "}",
+        "def copilotFailed = { String project, String step, Throwable failure ->",
+        "    copilotErrors << [project: project, step: step, message: copilotDescribe(failure)]",
+        "}",
+        "gradle.beforeProject { p ->",
+        "    def projectPath = p.path",
+        "    try {",
+        "        def found = java.util.Collections.synchronizedList([])",
+        "        copilotVariants.put(projectPath, found)",
+        "        p.plugins.withId('com.android.application') {",
+        "            try {",
+        "                def components = p.extensions.findByName('androidComponents')",
+        "                components.onVariants(components.selector().all(), { v -> found << v.name.toString() } as org.gradle.api.Action)",
+        "            } catch (Throwable modern) {",
+        "                try {",
+        "                    p.extensions.findByName('android').applicationVariants.all { v -> found << v.name.toString() }",
+        "                } catch (Throwable legacy) {",
+        "                    legacy.addSuppressed(modern)",
+        "                    copilotFailed(projectPath, 'variants', legacy)",
+        "                }",
+        "            }",
+        "            try {",
+        "                def rootDir = p.rootDir.canonicalPath",
+        "                def projectDir = p.projectDir.canonicalPath",
+        "                def buildDirectory = p.layout.buildDirectory",
+        "                p.tasks.configureEach { t ->",
+        "                    def taskName = t.name",
+        "                    def kind = null",
+        "                    if (t.getClass().name.startsWith('com.android.build.gradle.internal.tasks.InstallVariantTask')) kind = 'install'",
+        "                    // A lifecycle task with an action always runs, so this is evidence of this invocation even when its APK is UP-TO-DATE.",
+        "                    else if (taskName ==~ /assemble[A-Z].*/ && !(taskName ==~ /.*(AndroidTest|UnitTest|TestFixtures)/)) kind = 'assemble'",
+        "                    if (kind == null) return",
+        "                    // Runs with the task, on configuration-cache hits too; captures only values.",
+        "                    t.doFirst {",
+        `                        def target = System.getenv('${INSTALL_EVIDENCE_ENV}')`,
+        "                        if (!target) return",
+        "                        def out = new File(target)",
+        "                        def id = java.util.UUID.randomUUID().toString()",
+        "                        try {",
+        "                            out.mkdirs()",
+        "                            def temp = new File(out, id + '.tmp')",
+        "                            temp.text = groovy.json.JsonOutput.toJson([",
+        `                                format: ${INSTALL_EVIDENCE_FORMAT}, kind: kind, rootDir: rootDir, project: projectPath, task: taskName,`,
+        "                                projectDir: projectDir, buildDir: buildDirectory.get().asFile.canonicalPath,",
+        "                            ])",
+        "                            if (!temp.renameTo(new File(out, id + '.json'))) throw new IOException('could not publish ' + temp)",
+        "                        } catch (Throwable failure) {",
+        "                            // Recorded so the extension fails closed instead of trusting a partial list.",
+        "                            try { new File(out, id + '.error').text = projectPath + ':' + taskName + ': ' + failure } catch (Throwable errorWriteFailure) { failure.addSuppressed(errorWriteFailure) }",
+        "                            org.gradle.api.logging.Logging.getLogger('android-emulator').warn('Android Emulator extension: could not record that ' + projectPath + ':' + taskName + ' ran: ' + failure)",
+        "                        }",
+        "                    }",
+        "                }",
+        "            } catch (Throwable failure) {",
+        "                copilotFailed(projectPath, 'installs', failure)",
+        "            }",
+        "        }",
+        "    } catch (Throwable failure) {",
+        "        copilotFailed(projectPath, 'variants', failure)",
+        "    }",
+        "}",
+        "gradle.projectsEvaluated { g ->",
+        "    def root = null",
+        "    def projects = null",
+        "    def included = []",
+        "    try {",
+        "        root = g.rootProject.projectDir.canonicalPath",
+        "        projects = g.rootProject.allprojects.collect { p ->",
+        "            def entry = [path: p.path, projectDir: null, buildDir: null, tasks: null, android: null, variants: []]",
+        "            try { entry.projectDir = p.projectDir.canonicalPath } catch (Throwable failure) { copilotFailed(p.path, 'projectDir', failure) }",
+        "            try {",
+        "                entry.buildDir = p.layout.buildDirectory.get().asFile.canonicalPath",
+        "            } catch (Throwable modern) {",
+        "                try {",
+        "                    entry.buildDir = p.buildDir.canonicalPath",
+        "                } catch (Throwable legacy) {",
+        "                    legacy.addSuppressed(modern)",
+        "                    copilotFailed(p.path, 'buildDir', legacy)",
+        "                }",
+        "            }",
+        "            try { entry.tasks = p.tasks.names.findAll { it ==~ /(install|assemble|package)[A-Z].*/ }.sort() } catch (Throwable failure) { copilotFailed(p.path, 'tasks', failure) }",
+        "            try { if (p.plugins.hasPlugin('com.android.application')) entry.android = 'application' } catch (Throwable failure) { copilotFailed(p.path, 'plugins', failure) }",
+        "            def names = copilotVariants.get(p.path)",
+        "            if (names != null) {",
+        "                synchronized (names) { entry.variants = names.unique(false).collect { [name: it] } }",
+        "            }",
+        "            entry",
+        "        }",
+        "    } catch (Throwable failure) {",
+        "        copilotFailed(':', 'projects', failure)",
+        "        projects = null",
+        "    }",
+        "    try {",
+        "        included = g.includedBuilds.collect { [name: it.name, projectDir: it.projectDir.canonicalPath] }",
+        "    } catch (Throwable failure) {",
+        "        copilotFailed(':', 'includedBuilds', failure)",
+        "    }",
+        "    def target = null",
+        "    try {",
+        "        if (root == null) root = g.startParameter.currentDir.canonicalPath",
+        `        def dir = new File(${groovyString(layoutDir)})`,
+        "        dir.mkdirs()",
+        "        def name = java.security.MessageDigest.getInstance('SHA-256').digest(root.getBytes('UTF-8')).encodeHex().toString().take(24)",
+        "        def errors",
+        "        synchronized (copilotErrors) { errors = new ArrayList(copilotErrors) }",
+        "        def record = groovy.json.JsonOutput.toJson([",
+        `            format: ${PROJECT_LAYOUT_FORMAT},`,
+        "            rootDir: root,",
+        "            gradleVersion: g.gradleVersion,",
+        "            writtenAt: System.currentTimeMillis(),",
+        "            status: projects == null ? 'failed' : (errors ? 'partial' : 'ok'),",
+        "            errors: errors,",
+        "            projects: projects ?: [],",
+        "            includedBuilds: included,",
+        "        ])",
+        '        target = new File(dir, "${name}.json")',
+        "        def temp = new File(dir, name + '.' + java.util.UUID.randomUUID() + '.tmp')",
+        "        temp.text = record",
+        "        if (!temp.renameTo(target)) {",
+        "            target.delete()",
+        "            if (!temp.renameTo(target)) throw new IOException('could not replace ' + target)",
+        "        }",
+        "    } catch (Throwable failure) {",
+        "        // A record left from an earlier configuration must not stand in for this one.",
+        "        try { if (target != null) target.delete() } catch (Throwable deleteFailure) { failure.addSuppressed(deleteFailure) }",
+        "        org.gradle.api.logging.Logging.getLogger('android-emulator').warn('Android Emulator extension: could not record the project layout, so the installed app cannot be resolved: ' + failure)",
+        "    }",
+        "}",
+        "",
+    ].join("\n");
+}
+
+/** Writes the layout init script (only when it changed). */
+export async function prepareProjectLayout(executorDir) {
+    const paths = projectLayoutPaths(executorDir);
+    await mkdir(paths.layoutDir, { recursive: true });
+    await mkdir(paths.installsDir, { recursive: true });
+    const content = projectLayoutInitScript(paths.layoutDir);
+    if ((await readFile(paths.initScript, "utf8").catch(() => null)) !== content) {
+        // Unique per call: builds of different projects prepare it concurrently.
+        const temp = `${paths.initScript}.${randomUUID()}.tmp`;
+        try {
+            await writeFile(temp, content);
+            await rename(temp, paths.initScript);
+        } catch (error) {
+            await rm(temp, { force: true });
+            // Another build may have published the same content in the meantime.
+            if ((await readFile(paths.initScript, "utf8").catch(() => null)) !== content) {
+                throw error;
+            }
+        }
+    }
+    return paths;
+}
+
+/**
+ * The evidence one Gradle run wrote into `dir`: one entry per AGP install task
+ * (`kind: "install"`) or application `assemble<Variant>` task (`kind: "assemble"`)
+ * that ran. A file it could not write or read makes the list
+ * incomplete, which is reported rather than returned.
+ */
+export async function readInstallEvidence(dir) {
+    const installs = [];
+    const problems = [];
+    for (const name of (await readdir(dir).catch(() => [])).sort()) {
+        const file = path.join(dir, name);
+        if (name.endsWith(".error")) {
+            problems.push(await readFile(file, "utf8").then((text) => text.trim().slice(0, 500), (error) => error.message));
+            continue;
+        }
+        if (!name.endsWith(".json")) {
+            continue;
+        }
+        let record;
+        try {
+            record = JSON.parse(await readFile(file, "utf8"));
+        } catch (error) {
+            problems.push(`${name} could not be read (${error.message})`);
+            continue;
+        }
+        const usable =
+            record?.format === INSTALL_EVIDENCE_FORMAT &&
+            EVIDENCE_KINDS.has(record.kind) &&
+            typeof record.project === "string" &&
+            record.project.startsWith(":") &&
+            typeof record.task === "string" &&
+            [record.rootDir, record.projectDir, record.buildDir].every((value) => typeof value === "string" && path.isAbsolute(value));
+        if (!usable) {
+            problems.push(`${name} is not an install record this extension wrote`);
+            continue;
+        }
+        installs.push({
+            kind: record.kind,
+            rootDir: record.rootDir,
+            project: record.project,
+            task: record.task,
+            projectDir: record.projectDir,
+            buildDir: record.buildDir,
+        });
+    }
+    return { installs, problems };
+}
+
+function sameDir(a, b, platform) {
+    return platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function validLayoutProject(project) {
+    return (
+        project &&
+        typeof project.path === "string" &&
+        project.path.startsWith(":") &&
+        typeof project.projectDir === "string" &&
+        path.isAbsolute(project.projectDir) &&
+        (project.buildDir == null || (typeof project.buildDir === "string" && path.isAbsolute(project.buildDir)))
+    );
+}
+
+const LAYOUT_STATUSES = new Set(["ok", "partial", "failed"]);
+
+export function layoutRecordName(root) {
+    return `${createHash("sha256").update(root, "utf8").digest("hex").slice(0, 24)}.json`;
+}
+
+function layoutErrors(errors) {
+    return Array.isArray(errors)
+        ? errors
+              .filter((error) => error && typeof error.message === "string")
+              .map((error) => ({
+                  project: typeof error.project === "string" ? error.project : null,
+                  step: typeof error.step === "string" ? error.step : null,
+                  message: error.message,
+              }))
+        : [];
+}
+
+/**
+ * The layout Gradle recorded for the build rooted at `gradleRoot`, or null when
+ * there is none. Records of other builds (included builds and buildSrc write
+ * their own) share the directory and are told apart by their root.
  *
- * The answer is read from the exact module and variant the task names, never
- * from whichever metadata is newest: an UP-TO-DATE `installDebug` leaves the
- * debug metadata older than a release build made earlier, and launching the
+ * A record the script wrote is returned with its `status` ("ok", "partial" or
+ * "failed") and the `errors` it hit, so a failed collection is reported as one
+ * rather than read as "no layout". This build's own record being unreadable
+ * throws for the same reason.
+ */
+export async function readProjectLayout(layoutDir, gradleRoot, { platform = process.platform } = {}) {
+    const root = await realpath(gradleRoot).catch(() => path.resolve(gradleRoot));
+    const ownName = layoutRecordName(root);
+    let best = null;
+    let ownProblem = null;
+    for (const name of await readdir(layoutDir).catch(() => [])) {
+        if (!/^[0-9a-f]+\.json$/.test(name)) {
+            continue;
+        }
+        let record;
+        try {
+            record = JSON.parse(await readFile(path.join(layoutDir, name), "utf8"));
+        } catch (error) {
+            if (name === ownName) {
+                ownProblem = `it could not be read (${error.message})`;
+            }
+            continue;
+        }
+        if (typeof record?.rootDir !== "string" || !sameDir(record.rootDir, root, platform)) {
+            if (name === ownName) {
+                ownProblem = "it does not name this build's root directory";
+            }
+            continue;
+        }
+        if (record.format !== PROJECT_LAYOUT_FORMAT) {
+            // Written by another version of the extension; this build's run rewrites it.
+            continue;
+        }
+        if (!Array.isArray(record.projects) || !LAYOUT_STATUSES.has(record.status)) {
+            ownProblem = "it is missing its projects or status";
+            continue;
+        }
+        if (!best || (record.writtenAt ?? 0) > (best.writtenAt ?? 0)) {
+            best = record;
+        }
+    }
+    if (!best) {
+        if (ownProblem) {
+            throw new AppError(
+                "app_layout_failed",
+                `The project layout Gradle recorded for this build (${path.join(layoutDir, ownName)}) is unusable: ${ownProblem}. ` +
+                    `Delete it and build again, ${PACKAGE_ADVICE}.`,
+                500,
+            );
+        }
+        return null;
+    }
+    const projects = best.projects.filter(validLayoutProject).map((project) => ({
+        path: project.path,
+        projectDir: project.projectDir,
+        buildDir: project.buildDir ?? path.join(project.projectDir, "build"),
+        tasks: Array.isArray(project.tasks) ? project.tasks.filter((task) => typeof task === "string") : null,
+        android: project.android ?? null,
+        variants: Array.isArray(project.variants)
+            ? project.variants
+                  .filter((variant) => typeof variant?.name === "string")
+                  .map((variant) => ({ name: variant.name }))
+            : [],
+    }));
+    const errors = layoutErrors(best.errors);
+    const dropped = best.projects.length - projects.length;
+    if (dropped > 0) {
+        errors.push({ project: null, step: "record", message: `${dropped} project entr${dropped === 1 ? "y has" : "ies have"} no usable path or projectDir` });
+    }
+    return {
+        rootDir: best.rootDir,
+        gradleVersion: best.gradleVersion ?? null,
+        writtenAt: best.writtenAt ?? null,
+        status: best.status === "ok" && errors.length > 0 ? "partial" : best.status,
+        errors,
+        projects,
+        includedBuilds: Array.isArray(best.includedBuilds)
+            ? best.includedBuilds.filter((build) => typeof build?.name === "string").map((build) => ({ name: build.name, projectDir: build.projectDir ?? null }))
+            : [],
+    };
+}
+
+// --- choosing the app to launch ------------------------------------------------------
+
+function projectPathFor(projectSegments) {
+    return `:${projectSegments.join(":")}`;
+}
+
+function taskIn(projectPath, name) {
+    return projectPath === ":" ? `:${name}` : `${projectPath}:${name}`;
+}
+
+function quoteList(values) {
+    return values.map((value) => `"${value}"`).join(", ");
+}
+
+const PACKAGE_ADVICE = 'or set "packageName" in .android-emulator.json to launch a fixed app';
+
+/**
+ * Candidates from what Gradle recorded: a project's configured variants, each
+ * with the application id AGP wrote next to its APK under the project's real
+ * buildDir (unknown when there is no such output). A project whose variants
+ * the script could not read contributes its outputs as they are.
+ */
+async function layoutCandidates(projects) {
+    const lists = await Promise.all(
+        projects.map(async (project) => {
+            const fromOutputs = await moduleMetadata(project.projectDir, project.buildDir, project.path);
+            if (project.variants.length === 0) {
+                return fromOutputs;
+            }
+            return project.variants.map((variant) => {
+                const outputs = fromOutputs.filter((candidate) => matchesVariant(candidate, variant.name));
+                const ids = new Set(outputs.map((output) => output.applicationId));
+                return {
+                    file: outputs[0]?.file ?? null,
+                    moduleDir: project.projectDir,
+                    projectPath: project.path,
+                    relativeDir: outputs[0]?.relativeDir ?? [],
+                    variantName: variant.name,
+                    applicationId: ids.size === 1 ? outputs[0].applicationId : null,
+                    fromGradle: true,
+                };
+            });
+        }),
+    );
+    return lists.flat();
+}
+
+function describeCandidate(candidate, gradleRoot) {
+    const where = candidate.projectPath ?? `${path.relative(gradleRoot, candidate.moduleDir) || "."}`;
+    const variant = candidate.variantName ?? (candidate.relativeDir.join("/") || "?");
+    return `${where} ${variant}: ${candidate.applicationId ?? "application id unknown"}`;
+}
+
+function describeLayoutErrors(errors) {
+    const shown = errors.slice(0, 3).map((error) => `${error.project ?? "the build"}${error.step ? ` (${error.step})` : ""}: ${error.message}`);
+    return shown.join("; ") + (errors.length > shown.length ? `; and ${errors.length - shown.length} more` : "");
+}
+
+/**
+ * Collection errors that touch the projects a task runs in make any answer
+ * from the record a guess, so they are reported instead. Errors confined to
+ * other projects do not affect it.
+ */
+function assertCollected(task, layout, scope) {
+    const errors = layout.errors ?? [];
+    const inScope = new Set(scope.map((project) => project.path));
+    const relevant =
+        layout.status === "failed"
+            ? errors
+            : errors.filter((error) => error.project === null || (error.project === ":" && error.step === "projects") || inScope.has(error.project));
+    if (layout.status === "failed" || relevant.length > 0) {
+        throw new AppError(
+            "app_layout_failed",
+            `${task} finished, but Gradle could not record ${layout.status === "failed" ? "this build's project layout" : "everything about the projects it ran in"}` +
+                `${relevant.length ? ` (${describeLayoutErrors(relevant)})` : ""}, so the app to launch is unknown. ` +
+                `Fix the error or ${PACKAGE_ADVICE.replace(/^or /, "")}.`,
+            422,
+            { errors: relevant },
+        );
+    }
+}
+
+function installTaskFor(variantName) {
+    return `install${variantName[0].toUpperCase()}${variantName.slice(1)}`;
+}
+
+/**
+ * Resolution from what this Gradle run actually installed. Each AGP install
+ * task that ran recorded its project, variant and real buildDir, and the id is
+ * the one AGP wrote next to the APK it installed, so neither the task name nor
+ * a layout recorded by an earlier configuration is trusted for it. Exactly one
+ * installed app is launched; anything else fails closed.
+ */
+async function resolveFromInstalls(task, evidence, layout) {
+    if (evidence.problems.length > 0) {
+        throw new AppError(
+            "app_layout_failed",
+            `${task} finished, but what it installed could not be fully recorded (${evidence.problems.slice(0, 3).join("; ")}), ` +
+                `so the app to launch is unknown. Build again, ${PACKAGE_ADVICE}.`,
+            422,
+            { problems: evidence.problems },
+        );
+    }
+    const unwatched = (layout?.errors ?? []).filter((error) => error.step === "installs");
+    if (unwatched.length > 0) {
+        // Install tasks in those projects ran unrecorded, so the list may be incomplete.
+        throw new AppError(
+            "app_layout_failed",
+            `${task} finished, but Gradle could not watch every install task (${describeLayoutErrors(unwatched)}), ` +
+                `so what it installed is not fully known. Fix the error or ${PACKAGE_ADVICE.replace(/^or /, "")}.`,
+            422,
+            { errors: unwatched },
+        );
+    }
+    const seen = new Map();
+    for (const install of evidence.installs) {
+        seen.set(`${install.rootDir}\0${install.project}\0${install.task}`, install);
+    }
+    const installed = await Promise.all(
+        Array.from(seen.values()).map(async (install) => {
+            const variant = variantFromTask(install.task);
+            const outputs = variant
+                ? (await moduleMetadata(install.projectDir, install.buildDir, install.project)).filter((output) => matchesVariant(output, variant))
+                : [];
+            const ids = Array.from(new Set(outputs.map((output) => output.applicationId)));
+            const build = layout && !sameDir(install.rootDir, layout.rootDir, process.platform) ? ` (build ${install.rootDir})` : "";
+            return {
+                label: `${install.project}:${install.task}${build}`,
+                project: install.project,
+                rootDir: install.rootDir,
+                variant,
+                applicationId: ids.length === 1 ? ids[0] : null,
+                metadataFile: ids.length === 1 ? outputs[0].file : null,
+                detail: ids.length > 1 ? `its outputs name ${quoteList(ids)}` : `no output-metadata.json for it under ${install.buildDir}`,
+            };
+        }),
+    );
+    const ids = Array.from(new Set(installed.map((install) => install.applicationId)));
+    if (installed.every((install) => install.applicationId) && ids.length === 1) {
+        return { applicationId: ids[0], metadataFile: installed[0].metadataFile, projectPath: installed[0].project };
+    }
+    const describe = (install) => `${install.label}: ${install.applicationId ?? `application id unknown, ${install.detail}`}`;
+    if (installed.length === 1) {
+        throw new AppError(
+            "app_not_resolved",
+            `${task} installed ${describe(installed[0])}, so the app to launch is unknown. ${PACKAGE_ADVICE.replace(/^or s/, "S")}.`,
+            422,
+        );
+    }
+    throw new AppError(
+        "app_ambiguous",
+        `${task} installed more than one app (${installed.map(describe).join("; ")}), so which one to launch is ambiguous. ` +
+            `Set "gradleTask" to one of ${quoteList(installed.map((install) => (install.rootDir === layout?.rootDir ? taskIn(install.project, installTaskFor(install.variant ?? "debug")) : install.label)))}, ` +
+            `${PACKAGE_ADVICE}.`,
+        409,
+        {
+            candidates: installed.map((install) => ({
+                project: install.project,
+                variant: install.variant,
+                applicationId: install.applicationId,
+                rootDir: install.rootDir,
+            })),
+        },
+    );
+}
+
+/**
+ * Resolution from the assemble tasks this run executed, for a run that
+ * installed nothing. Each record carries the project and the buildDir of the
+ * configuration that actually ran, so a layout recorded by another
+ * configuration cannot redirect it; with no matching record it fails closed.
+ */
+async function resolveFromAssembles(task, { variant, qualified, scope, where, layout, assembles, appTasks }) {
+    // An unqualified task runs in every application project that has it, wherever the stale layout says.
+    const inScope = qualified ? new Set(scope.map((project) => project.path)) : null;
+    const seen = new Map();
+    for (const record of assembles) {
+        if (
+            record.kind === "assemble" &&
+            sameDir(record.rootDir, layout.rootDir, process.platform) &&
+            (inScope === null || inScope.has(record.project)) &&
+            variantFromTask(record.task) === variant
+        ) {
+            seen.set(`${record.project}\0${record.task}`, record);
+        }
+    }
+    if (seen.size === 0) {
+        throw new AppError(
+            "app_not_resolved",
+            `${task} finished, but this run recorded no assemble task for variant "${variant}" in ${where}, ` +
+                `so the app it built is unknown (the recorded project layout may describe another configuration). ` +
+                `Build again, use one of ${quoteList(appTasks(installTaskFor(variant)).slice(0, 6))} as "gradleTask", ${PACKAGE_ADVICE}.`,
+            422,
+        );
+    }
+    const built = await Promise.all(
+        Array.from(seen.values()).map(async (record) => {
+            const outputs = (await moduleMetadata(record.projectDir, record.buildDir, record.project)).filter((output) => matchesVariant(output, variant));
+            const ids = Array.from(new Set(outputs.map((output) => output.applicationId)));
+            return {
+                label: `${record.project}:${record.task}`,
+                project: record.project,
+                applicationId: ids.length === 1 ? ids[0] : null,
+                metadataFile: ids.length === 1 ? outputs[0].file : null,
+                detail: ids.length > 1 ? `its outputs name ${quoteList(ids)}` : `no output-metadata.json for it under ${record.buildDir}`,
+            };
+        }),
+    );
+    const ids = Array.from(new Set(built.map((entry) => entry.applicationId)));
+    if (built.every((entry) => entry.applicationId) && ids.length === 1) {
+        return { applicationId: ids[0], metadataFile: built[0].metadataFile, projectPath: built[0].project };
+    }
+    const describe = (entry) => `${entry.label}: ${entry.applicationId ?? `application id unknown, ${entry.detail}`}`;
+    if (built.length === 1) {
+        throw new AppError(
+            "app_not_resolved",
+            `${task} built ${describe(built[0])}, so the app to launch is unknown. ${PACKAGE_ADVICE.replace(/^or s/, "S")}.`,
+            422,
+        );
+    }
+    const suggestions = Array.from(new Set(built.map((entry) => taskIn(entry.project, installTaskFor(variant)))));
+    throw new AppError(
+        "app_ambiguous",
+        `${task} built more than one app (${built.map(describe).join("; ")}), so which one to launch is ambiguous. ` +
+            `Set "gradleTask" to one of ${quoteList(suggestions)}, ${PACKAGE_ADVICE}.`,
+        409,
+        { candidates: built.map((entry) => ({ project: entry.project, variant, applicationId: entry.applicationId })) },
+    );
+}
+
+/**
+ * Resolution against Gradle's recorded layout, for a run that installed
+ * nothing (an assemble task) or whose installs were not recorded. Every failure
+ * names what Gradle does know -- the projects, the variants and the exact tasks
+ * that would pin one app -- so the fix is a copy, not a guess.
+ */
+async function resolveFromLayout(requestedRoot, task, layout, { installsRecorded = false, assembles = [] } = {}) {
+    // Gradle records canonical paths; describe them relative to the same root.
+    const gradleRoot = layout.rootDir ?? requestedRoot;
+    if (layout.status === "failed") {
+        // Its project list is empty or incomplete, so even "no such project" would be a guess.
+        assertCollected(task, layout, []);
+    }
+    const { name, projectSegments, qualified } = parseTaskPath(task);
+    const variant = variantFromTask(name);
+    const appProjects = layout.projects.filter((project) => project.android === "application" || project.variants.length > 0);
+    const appTasks = (taskName) => {
+        const tasks = appProjects.flatMap((project) => project.variants.map((candidate) => taskIn(project.path, installTaskFor(candidate.name))));
+        return tasks.length > 0 ? tasks : appProjects.map((project) => taskIn(project.path, taskName));
+    };
+
+    let scope;
+    let where;
+    if (qualified) {
+        const wanted = projectPathFor(projectSegments);
+        const project = layout.projects.find((candidate) => candidate.path === wanted);
+        if (!project) {
+            const included = (layout.includedBuilds ?? []).find((build) => build.name === projectSegments[0]);
+            if (included) {
+                throw new AppError(
+                    "app_not_resolved",
+                    `${task} runs in the included build "${included.name}", and the app it installed was not recorded, ` +
+                        `so the app to launch is unknown. Apps of included builds are resolved only from an install task that ran, ${PACKAGE_ADVICE}.`,
+                    422,
+                );
+            }
+            const known = appProjects.map((candidate) => candidate.path);
+            throw new AppError(
+                "app_not_resolved",
+                `${task} finished, but Gradle reports no project "${wanted}" in this build, so the app to launch is unknown` +
+                    `${known.length ? ` (application projects: ${quoteList(known)})` : ""}. ` +
+                    `Use the full project path in "gradleTask" (abbreviated names are not resolved), ${PACKAGE_ADVICE}.`,
+                422,
+            );
+        }
+        scope = [project];
+        where = `project "${wanted}" (${path.relative(gradleRoot, project.projectDir) || "."})`;
+    } else {
+        // An unqualified task runs in every project that has it.
+        scope = layout.projects.filter((project) => project.tasks === null || project.tasks.includes(name));
+        where = "any project";
+    }
+
+    assertCollected(task, layout, scope);
+    if (!variant) {
+        // A custom task's dependencies decide what it installs, not the project it is in.
+        throw new AppError(
+            "app_not_resolved",
+            `${task} finished, but "${name}" does not name an Android variant and ` +
+                `${installsRecorded ? "ran no Android install task" : "what it installed was not recorded"}, so the app to launch is unknown. ` +
+                `Use an install task such as ${quoteList(appTasks("installDebug").slice(0, 4))}, ${PACKAGE_ADVICE}.`,
+            422,
+        );
+    }
+    if (installsRecorded && name.startsWith("install")) {
+        throw new AppError(
+            "app_not_resolved",
+            `${task} finished, but no Android install task ran, so nothing was installed to launch. ` +
+                `Use one of ${quoteList(appTasks(name).slice(0, 6))} as "gradleTask", ${PACKAGE_ADVICE}.`,
+            422,
+        );
+    }
+    if (installsRecorded) {
+        // The layout may describe another configuration (a configuration-cache hit
+        // does not rewrite it), so only what this run's assemble tasks recorded counts.
+        return resolveFromAssembles(task, { variant, qualified, scope, where, layout, assembles, appTasks });
+    }
+
+    const candidates = await layoutCandidates(scope);
+    const matching = candidates.filter((candidate) => matchesVariant(candidate, variant));
+    const ids = Array.from(new Set(matching.map((candidate) => candidate.applicationId)));
+    if (matching.length > 0 && ids.length === 1 && ids[0]) {
+        return { applicationId: ids[0], metadataFile: matching.find((candidate) => candidate.file)?.file ?? null, projectPath: matching[0].projectPath };
+    }
+    if (matching.length === 0 || (matching.length === 1 && !ids[0])) {
+        const available = candidates.filter((candidate) => candidate.variantName);
+        const detail = matching.length
+            ? `Gradle reports variant "${variant}" in ${where}, but no build output naming its application id was found`
+            : `no variant "${variant}" was found in ${where}` +
+              (available.length ? ` (variants: ${available.map((candidate) => describeCandidate(candidate, gradleRoot)).join("; ")})` : "");
+        throw new AppError(
+            "app_not_resolved",
+            `${task} finished, but ${detail}, so the app to launch is unknown. ` +
+                `Use one of ${quoteList(appTasks(name).slice(0, 6))} as "gradleTask", ${PACKAGE_ADVICE}.`,
+            422,
+        );
+    }
+    // A matching app whose id is unknown could be the one that was built.
+    const suggestions = Array.from(new Set(matching.map((candidate) => taskIn(candidate.projectPath ?? ":", name))));
+    throw new AppError(
+        "app_ambiguous",
+        `${task} matches more than one app (${matching.map((candidate) => describeCandidate(candidate, gradleRoot)).join("; ")}), ` +
+            `so which one to launch is ambiguous. Set "gradleTask" to one of ${quoteList(suggestions)}, ${PACKAGE_ADVICE}.`,
+        409,
+        { candidates: matching.map((candidate) => ({ project: candidate.projectPath, variant: candidate.variantName, applicationId: candidate.applicationId })) },
+    );
+}
+
+/**
+ * The application id is needed to launch what was just installed.
+ *
+ * When this run recorded which AGP install tasks ran (`installs`, see
+ * projectLayoutInitScript), the app is the one they installed, whatever task
+ * was requested: custom tasks, root tasks and included builds included. A run
+ * that installed nothing is resolved only from the `assemble<Variant>` tasks it
+ * recorded, at the buildDir they ran with; a layout left by another
+ * configuration (a configuration-cache hit does not rewrite it) is never trusted
+ * for the answer. With only Gradle's recorded layout (evidence not enabled), the project the task names is looked up by its
+ * Gradle path, so a remapped projectDir and a custom buildDir are where Gradle
+ * says they are. Without either, the module directory is assumed from the task
+ * path. The id itself is always read from the `output-metadata.json` AGP wrote
+ * next to the APK, never from a record that may describe another configuration.
+ *
+ * Either way the answer is for the exact project and variant the task names,
+ * never from whichever metadata is newest: an UP-TO-DATE `installDebug` leaves
+ * the debug metadata older than a release build made earlier, and launching the
  * release app after installing debug is worse than not launching at all. When
  * the task does not pin one app, this throws rather than guessing.
  */
-export async function resolveApplicationId(gradleRoot, task) {
+export async function resolveApplicationId(gradleRoot, task, { layout = null, layoutUnavailable = null, installs = null } = {}) {
+    const installed = installs ? installs.installs.filter((entry) => (entry.kind ?? "install") === "install") : [];
+    if (installs && (installed.length > 0 || installs.problems.length > 0)) {
+        return resolveFromInstalls(task, { installs: installed, problems: installs.problems }, layout);
+    }
+    const assembles = installs ? installs.installs.filter((entry) => entry.kind === "assemble") : [];
+    if (layout) {
+        return resolveFromLayout(gradleRoot, task, layout, { installsRecorded: installs !== null, assembles });
+    }
+    if (assembles.length > 0) {
+        // No layout, but this run's own records say where it built; never the path convention.
+        const { name, projectSegments, qualified } = parseTaskPath(task);
+        const variant = variantFromTask(name);
+        const wanted = qualified ? projectPathFor(projectSegments) : null;
+        if (!variant || name.startsWith("install")) {
+            throw new AppError(
+                "app_not_resolved",
+                `${task} finished, but ${variant ? "no Android install task ran" : `"${name}" does not name an Android variant and ran no Android install task`}, ` +
+                    `so the app to launch is unknown. ${PACKAGE_ADVICE.replace(/^or s/, "S")}.`,
+                422,
+            );
+        }
+        return resolveFromAssembles(task, {
+            variant,
+            qualified,
+            scope: qualified ? [{ path: wanted }] : [],
+            where: qualified ? `project "${wanted}"` : "any project",
+            layout: { rootDir: await realpath(gradleRoot).catch(() => gradleRoot) },
+            assembles,
+            appTasks: (taskName) => Array.from(new Set(assembles.map((entry) => taskIn(entry.project, taskName)))),
+        });
+    }
     const { name, projectSegments, qualified } = parseTaskPath(task);
     const variant = variantFromTask(name);
     const moduleDirs = qualified ? [path.join(gradleRoot, ...projectSegments)] : await allModuleDirs(gradleRoot);
     const where = qualified ? path.relative(gradleRoot, moduleDirs[0]) || "the root project" : "any module";
 
-    const candidates = (await Promise.all(moduleDirs.map(moduleMetadata))).flat();
+    const candidates = (await Promise.all(moduleDirs.map((dir) => moduleMetadata(dir)))).flat();
     const matching = variant ? candidates.filter((candidate) => matchesVariant(candidate, variant)) : candidates;
     const ids = Array.from(new Set(matching.map((candidate) => candidate.applicationId)));
     const advice =
-        'Set "packageName" in .android-emulator.json, or use a module-qualified task such as ":app:installDebug".';
+        'Set "packageName" in .android-emulator.json, or use a module-qualified task such as ":app:installDebug". ' +
+        `(Gradle did not record this build's project layout${layoutUnavailable ? ` because ${layoutUnavailable}` : ""}, ` +
+        "so the module directory was assumed from the task path.)";
 
     if (ids.length === 1) {
-        return { applicationId: ids[0], metadataFile: matching[0].file };
+        return { applicationId: ids[0], metadataFile: matching[0].file, projectPath: qualified ? projectPathFor(projectSegments) : null };
     }
     if (ids.length === 0) {
         throw new AppError(
@@ -1473,7 +2263,24 @@ export class AppBuildService {
             throw new AppError("gradle_not_found", plan.reason ?? "The Gradle wrapper disappeared.", 404);
         }
         const tracking = await unlessCancelled(run, prepareExecutorTracking(this.executorDir));
-        const invocation = gradleInvocation({ wrapper: gradle.wrapper, task, initScript: tracking.initScript, platform: this.platform });
+        // Without it the build still runs, but the app it installed is unknown: that
+        // is reported, not replaced by a guess from the task path.
+        let layoutUnavailable = null;
+        const projectLayout = await unlessCancelled(
+            run,
+            prepareProjectLayout(this.executorDir).catch((error) => {
+                layoutUnavailable = `the layout init script could not be written (${error.message})`;
+                return null;
+            }),
+        );
+        const installsDir = projectLayout ? path.join(projectLayout.installsDir, randomUUID()) : null;
+        const invocation = gradleInvocation({
+            wrapper: gradle.wrapper,
+            task,
+            initScript: tracking.initScript,
+            layoutInitScript: projectLayout?.initScript ?? null,
+            platform: this.platform,
+        });
         run.command = invocation.display;
 
         const release = await this.acquireProjectLock(gradle.root, run, deviceId);
@@ -1511,6 +2318,7 @@ export class AppBuildService {
                 run,
                 deviceId,
                 markerDir: tracking.markerDir,
+                env: installsDir ? { [INSTALL_EVIDENCE_ENV]: installsDir } : {},
             });
             this.throwIfCancelled(run);
 
@@ -1520,13 +2328,32 @@ export class AppBuildService {
 
             let packageName = plan.packageName ?? null;
             if (!packageName && launch) {
-                packageName = (await unlessCancelled(run, resolveApplicationId(gradle.root, task))).applicationId;
+                // A record that is unreadable or reports failed collection is an
+                // error here, not a reason to fall back to the path convention.
+                const layout = projectLayout ? await unlessCancelled(run, readProjectLayout(projectLayout.layoutDir, gradle.root, { platform: this.platform })) : null;
+                const installs = installsDir ? await unlessCancelled(run, readInstallEvidence(installsDir)) : null;
+                if (!layout && !(installs?.installs.length || installs?.problems.length)) {
+                    throw new AppError(
+                        "app_layout_failed",
+                        `${task} finished, but ${layoutUnavailable ?? "Gradle recorded neither this build's project layout nor what it installed (see the build log)"}, ` +
+                            `so the app to launch is unknown. ${PACKAGE_ADVICE.replace(/^or s/, "S")}.`,
+                        500,
+                    );
+                }
+                packageName = (await unlessCancelled(run, resolveApplicationId(gradle.root, task, { layout, installs }))).applicationId;
             } else if (!packageName) {
-                // Only reported, never acted on, so an ambiguous answer is just unknown.
-                packageName = await resolveApplicationId(gradle.root, task).then(
-                    (resolved) => resolved.applicationId,
-                    () => null,
-                );
+                // Only reported, never acted on, so an ambiguous or failed answer is just unknown.
+                const layout = projectLayout
+                    ? await readProjectLayout(projectLayout.layoutDir, gradle.root, { platform: this.platform }).catch(() => null)
+                    : null;
+                const installs = installsDir ? await readInstallEvidence(installsDir) : null;
+                packageName =
+                    layout || installs?.installs.length
+                        ? await resolveApplicationId(gradle.root, task, { layout, installs }).then(
+                              (resolved) => resolved.applicationId,
+                              () => null,
+                          )
+                        : null;
             }
             run.packageName = packageName ?? null;
             this.throwIfCancelled(run);
@@ -1546,11 +2373,17 @@ export class AppBuildService {
             this.finish(deviceId, run, "succeeded", run.message);
             return this.statusFor(deviceId);
         } finally {
+            const cleanUp = () => {
+                release();
+                if (installsDir) {
+                    void rm(installsDir, { recursive: true, force: true }).catch(() => {});
+                }
+            };
             if (run.exited) {
                 // Gradle may still be writing this project's outputs.
-                void run.exited.then(release);
+                void run.exited.then(cleanUp);
             } else {
-                release();
+                cleanUp();
             }
         }
     }
@@ -1733,7 +2566,7 @@ export class AppBuildService {
         }
     }
 
-    runGradle({ invocation, cwd, task, serial, onLine, log, run, deviceId, markerDir }) {
+    runGradle({ invocation, cwd, task, serial, onLine, log, run, deviceId, markerDir, env = {} }) {
         return new Promise((resolve, reject) => {
             let settled = false;
             let stopping = false;
@@ -1805,7 +2638,7 @@ export class AppBuildService {
                 owner.roots = buildExecutableRoots({ env: process.env, cwd });
                 child = spawn(invocation.command, invocation.args, {
                     cwd,
-                    env: { ...process.env, ANDROID_SERIAL: serial, TERM: "dumb", [BUILD_TAG_ENV]: owner.tag },
+                    env: { ...process.env, ...env, ANDROID_SERIAL: serial, TERM: "dumb", [BUILD_TAG_ENV]: owner.tag },
                     stdio: ["ignore", "pipe", "pipe"],
                     ...invocation.options,
                 });
