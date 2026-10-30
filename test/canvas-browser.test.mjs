@@ -433,3 +433,48 @@ test("a decoder failure on one device does not keep a newly picked emulator off 
     await sleep(1_000);
     assert.equal(device.calls.streamsByDevice.Pixel_A, mirroredStreams, "no new stream for video this runtime cannot decode");
 });
+
+test("the diagnostics panel names the transport and why, and copies a redacted report", { skip, timeout: 60_000 }, async (t) => {
+    const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
+    const page = await openCanvas(t, device);
+    await page.until(painted, "the first frame");
+    await page.evaluate(`(() => {
+        window.__copied = [];
+        Object.defineProperty(navigator, "clipboard", {
+            configurable: true,
+            value: { writeText: async (text) => { window.__copied.push(text); } },
+        });
+    })()`);
+    device.update({
+        stream: {
+            codec: "h264",
+            fps: 60,
+            resolution: 100,
+            transport: "mirror",
+            transportReason: "gRPC refused: token=sk-SECRET123 at /Users/someone/.android/avd/Pixel_A.avd",
+        },
+    });
+
+    const toggle = `document.getElementById("diagnostics-toggle")`;
+    assert.equal(await page.evaluate(`${toggle}.getAttribute("aria-expanded")`), "false");
+    assert.equal(await page.evaluate(`document.getElementById("diagnostics-panel").hidden`), true);
+    await page.evaluate(`${toggle}.click()`);
+    await page.until(`!document.getElementById("diagnostics-panel").hidden`, "the diagnostics panel");
+    assert.equal(await page.evaluate(`${toggle}.getAttribute("aria-expanded")`), "true");
+    await page.until(`document.getElementById("diagnostics-transport").textContent === "Screen mirror video"`, "the mirror transport");
+    const reason = await page.evaluate(`document.getElementById("diagnostics-reason").textContent`);
+    assert.match(reason, /gRPC/);
+    for (const leak of ["sk-SECRET123", "/Users/someone", "Pixel_A.avd", "emulator-5554"]) {
+        assert.ok(!reason.includes(leak), `reason leaks ${leak}`);
+    }
+
+    await page.evaluate(`document.getElementById("diagnostics-copy").click()`);
+    await page.until(`document.getElementById("diagnostics-copy-status").textContent === "Diagnostic report copied."`, "the copy status");
+    const copied = await page.evaluate(`window.__copied.at(-1)`);
+    assert.match(copied, /Screen mirror video/);
+    for (const leak of ["sk-SECRET123", "/Users/someone", "Pixel_A.avd", "emulator-5554", "Pixel A", "127.0.0.1"]) {
+        assert.ok(!copied.includes(leak), `copied report leaks ${leak}`);
+    }
+    assert.equal(await page.evaluate(`document.getElementById("diagnostics-copy-status").getAttribute("role")`), "status");
+    assert.equal(await page.evaluate(screenErrorShown), false, "opening diagnostics is not a display error");
+});

@@ -282,3 +282,233 @@ test("a stream the host ends is reported, and an HTTP error carries the host's m
     await second.start({ url: "http://x/api/stream.h264", fps: 60 });
     assert.equal(httpErrors[0]?.message, "adb went away");
 });
+
+// --- connection diagnostics ----------------------------------------------------------
+
+const { buildDiagnosticReport, createConnectionDiagnostics, describeConnection, redactDiagnosticText } =
+    await extensionModule("web", "connection-diagnostics.js");
+
+const liveGrpc = {
+    screenSource: "video",
+    transport: "grpc",
+    transportReason: null,
+    hasVideoDecoder: true,
+    deviceKind: "emulator",
+    deviceState: "Booted",
+    events: "open",
+    eventErrors: 0,
+    streamReconnects: 0,
+    measuredFps: 29.94,
+    lastFrameAt: Date.parse("2026-01-01T00:00:09Z"),
+    requestedFps: 30,
+    resolution: 100,
+    androidVersion: "15",
+    apiLevel: 35,
+};
+
+const sensitiveReason =
+    "gRPC connect failed: /Users/alice/.android/avd/Pixel_8.avd/grpc.token token=abc123secret " +
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln https://host.local:8554/v1?key=zzz " +
+    "C:\\Users\\alice\\AppData\\emu.log alice@example.com serial 0123456789abcdef0123";
+
+const LEAKS = [
+    "/Users/alice",
+    "alice",
+    "abc123secret",
+    "eyJhbGciOiJIUzI1NiJ9",
+    "key=zzz",
+    "/v1",
+    "AppData",
+    "example.com",
+    "0123456789abcdef0123",
+    "Pixel_8",
+    "emulator-5554",
+];
+
+function assertNoLeaks(text) {
+    for (const leak of LEAKS) {
+        assert.ok(!text.includes(leak), `leaked ${leak} in:\n${text}`);
+    }
+}
+
+test("redaction strips tokens, credentials, paths, query strings, emails and long ids", () => {
+    const text = redactDiagnosticText(sensitiveReason, { maxLength: 1_000 });
+    assertNoLeaks(text);
+    assert.match(text, /\[path\]/);
+    assert.match(text, /token=\[redacted\]/);
+    assert.match(text, /\[token\]/);
+    assert.match(text, /https:\/\/host\.local:8554/);
+    assert.match(text, /\[email\]/);
+    assert.match(text, /\[id\]/);
+    assert.match(redactDiagnosticText("open file:///home/bob/x.png and ~/secret/notes"), /^open \[path\] and \[path\]$/);
+    assert.equal(redactDiagnosticText(null), "");
+    assert.equal(redactDiagnosticText("line one\nline two\u0000"), "line one line two");
+    const long = redactDiagnosticText("x ".repeat(200));
+    assert.ok(long.length <= 160 && long.endsWith("…"));
+});
+
+test("describeConnection names the transport, the connection state and why video fell back", () => {
+    const grpc = describeConnection(liveGrpc);
+    assert.equal(grpc.transportLabel, "Emulator gRPC video");
+    assert.equal(grpc.connectionLabel, "Live");
+    assert.equal(grpc.fallbackReason, "");
+    assert.equal(grpc.degraded, false);
+    assert.equal(grpc.fps, 29.9);
+    assert.equal(grpc.summary, "Emulator gRPC video · Live");
+
+    const mirror = describeConnection({ ...liveGrpc, transport: "mirror", transportReason: sensitiveReason });
+    assert.equal(mirror.transportLabel, "Screen mirror video");
+    assert.equal(mirror.degraded, true);
+    assert.match(mirror.fallbackReason, /^gRPC unavailable: gRPC connect failed:/);
+    assertNoLeaks(mirror.fallbackReason);
+
+    // A physical device always mirrors; that is not a fallback.
+    const phone = describeConnection({ ...liveGrpc, transport: "mirror", deviceKind: "physical" });
+    assert.equal(phone.fallbackReason, "");
+    assert.equal(phone.degraded, false);
+
+    const stills = describeConnection({ ...liveGrpc, screenSource: "screenshots", hasVideoDecoder: false });
+    assert.equal(stills.transportLabel, "Screenshots");
+    assert.equal(stills.fallbackReason, "This canvas cannot decode video");
+    assert.equal(stills.fps, null);
+
+    assert.equal(describeConnection({ ...liveGrpc, events: "reconnecting" }).connectionLabel, "Reconnecting");
+    const offline = describeConnection({ ...liveGrpc, events: "closed" });
+    assert.equal(offline.connectionLabel, "Offline");
+    assert.equal(offline.degraded, true);
+    assert.equal(describeConnection({ ...liveGrpc, screenError: "boom" }).connection, "error");
+    assert.equal(describeConnection({ ...liveGrpc, deviceState: "Shutdown" }).connectionLabel, "Device not running");
+    const fresh = describeConnection({});
+    assert.equal(fresh.transportLabel, "Not connected yet");
+    assert.equal(fresh.connectionLabel, "Connecting");
+});
+
+test("the copyable report is an allowlist: useful facts, no serials, names, paths or tokens", () => {
+    const report = buildDiagnosticReport(
+        {
+            ...liveGrpc,
+            transport: "mirror",
+            transportReason: sensitiveReason,
+            serial: "emulator-5554",
+            name: "Pixel_8",
+            avdPath: "/Users/alice/.android/avd/Pixel_8.avd",
+            token: "abc123secret",
+            screenError: `Failed reading ${sensitiveReason}`,
+            eventErrors: 2,
+            streamReconnects: 3,
+        },
+        { now: new Date("2026-01-01T00:00:10Z") },
+    );
+    const lines = report.split("\n");
+    assert.equal(lines[0], "Android Emulator canvas diagnostics");
+    assert.ok(lines.includes("Transport: Screen mirror video"));
+    assert.ok(lines.includes("Connection: Error"));
+    assert.ok(lines.includes("Requested: 30 fps at 100% resolution"));
+    assert.ok(lines.includes("Measured: 29.9 fps"));
+    assert.ok(lines.includes("Last frame: 1 s ago"));
+    assert.ok(lines.includes("Event stream: open (2 errors)"));
+    assert.ok(lines.includes("Stream reconnects: 3"));
+    assert.ok(lines.includes("Android: 15 (API 35)"));
+    assert.match(report, /^Fallback reason: gRPC unavailable: /m);
+    assertNoLeaks(report);
+});
+
+function diagnosticsElements() {
+    const elements = Object.fromEntries(
+        ["toggle", "toggleLabel", "panel", "close", "copy", "copyStatus", "report", "transport", "connection", "reason", "reconnects", "fps"].map(
+            (key) => [key, fakeElement()],
+        ),
+    );
+    elements.panel.id = "diagnostics-panel";
+    let focused = 0;
+    elements.toggle.focus = () => {
+        focused += 1;
+    };
+    elements.focusCount = () => focused;
+    return elements;
+}
+
+test("the diagnostics toggle is an accessible disclosure that summarises the connection", () => {
+    const elements = diagnosticsElements();
+    let snapshot = { ...liveGrpc, transport: "mirror", transportReason: "connection refused" };
+    const diagnostics = createConnectionDiagnostics({ elements, getSnapshot: () => snapshot, clipboard: null });
+    diagnostics.bind();
+
+    assert.equal(elements.toggle.attributes["aria-controls"], "diagnostics-panel");
+    assert.equal(elements.toggle.attributes["aria-expanded"], "false");
+    assert.equal(elements.toggle.attributes["aria-label"], "Connection diagnostics: Screen mirror video · Live");
+    assert.equal(elements.toggleLabel.textContent, "Screen mirror video");
+    assert.equal(elements.toggle.dataset.degraded, "true");
+    assert.match(elements.toggle.title, /gRPC unavailable: connection refused/);
+    assert.equal(elements.transport.textContent, "", "a closed panel is not rendered");
+
+    elements.toggle.click();
+    assert.equal(elements.panel.hidden, false);
+    assert.equal(elements.toggle.attributes["aria-expanded"], "true");
+    assert.equal(elements.transport.textContent, "Screen mirror video");
+    assert.equal(elements.connection.textContent, "Live");
+    assert.equal(elements.reason.textContent, "gRPC unavailable: connection refused");
+    assert.equal(elements.fps.textContent, "29.9 fps");
+    assert.equal(elements.reconnects.textContent, "0");
+    assert.match(elements.report.textContent, /^Android Emulator canvas diagnostics/);
+
+    snapshot = { ...liveGrpc, events: "reconnecting", streamReconnects: 1 };
+    diagnostics.render();
+    assert.equal(elements.reason.textContent, "None");
+    assert.equal(elements.connection.textContent, "Reconnecting");
+    assert.equal(elements.reconnects.textContent, "1");
+    assert.equal(elements.toggle.dataset.connection, "reconnecting");
+
+    elements.close.click();
+    assert.equal(elements.panel.hidden, true);
+    assert.equal(elements.toggle.attributes["aria-expanded"], "false");
+    assert.equal(elements.focusCount(), 1, "closing returns focus to the toggle");
+});
+
+test("copying writes the redacted report, and a blocked or missing clipboard selects it instead", async () => {
+    const snapshot = { ...liveGrpc, transport: "mirror", transportReason: sensitiveReason };
+    const now = () => new Date("2026-01-01T00:00:10Z");
+
+    const written = [];
+    const okElements = diagnosticsElements();
+    const ok = createConnectionDiagnostics({
+        elements: okElements,
+        getSnapshot: () => snapshot,
+        clipboard: { writeText: async (text) => void written.push(text) },
+        selectText: () => assert.fail("a successful copy needs no manual selection"),
+        now,
+    });
+    assert.equal(await ok.copyReport(), true);
+    assert.equal(written.length, 1);
+    assert.equal(written[0], buildDiagnosticReport(snapshot, { now: now() }));
+    assertNoLeaks(written[0]);
+    assert.equal(okElements.copyStatus.textContent, "Diagnostic report copied.");
+    assert.equal(okElements.copyStatus.dataset.tone, "info");
+
+    const selected = [];
+    const blockedElements = diagnosticsElements();
+    const blocked = createConnectionDiagnostics({
+        elements: blockedElements,
+        getSnapshot: () => snapshot,
+        clipboard: { writeText: async () => Promise.reject(new Error("NotAllowedError")) },
+        selectText: (element) => selected.push(element),
+        now,
+    });
+    assert.equal(await blocked.copyReport(), false);
+    assert.deepEqual(selected, [blockedElements.report]);
+    assert.equal(blockedElements.copyStatus.textContent, "Copy was blocked. The report is selected; copy it manually.");
+    assert.equal(blockedElements.copyStatus.dataset.tone, "error");
+    assertNoLeaks(blockedElements.report.textContent);
+
+    const noneElements = diagnosticsElements();
+    const none = createConnectionDiagnostics({
+        elements: noneElements,
+        getSnapshot: () => snapshot,
+        clipboard: null,
+        selectText: (element) => selected.push(element),
+        now,
+    });
+    assert.equal(await none.copyReport(), false);
+    assert.equal(selected.at(-1), noneElements.report);
+    assert.equal(noneElements.copyStatus.textContent, "Clipboard unavailable. The report is selected; copy it manually.");
+});
