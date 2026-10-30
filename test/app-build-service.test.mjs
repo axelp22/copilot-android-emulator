@@ -8,7 +8,8 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -17,11 +18,17 @@ import { extensionModule, extensionRoot, isAlive, sleep, tempDir, waitUntil } fr
 
 const {
     AppBuildService,
+    BUILD_TAG_ENV,
+    buildExecutableRoots,
+    classifyHiddenEnvironments,
     executorInitScript,
     executorPaths,
     findGradleRoot,
     gradleInvocation,
+    liveBuildProcesses,
+    markTaggedFromProc,
     ownedProcesses,
+    processSnapshot,
     parseTaskPath,
     readExecutorMarkers,
     resolveApplicationId,
@@ -845,12 +852,47 @@ test("executor records count only when written by this build's wrapper lineage a
     await write("10.json", { format: 1, pid: 10, ancestors: [4242, 1], startedAt: spawnedAt + 500 }); // ours
     await write("11.json", { format: 1, pid: 11, ancestors: [4242, 1], startedAt: spawnedAt - 60_000 }); // stale
     await write("12.json", { format: 1, pid: 12, ancestors: [777, 1], startedAt: spawnedAt + 500 }); // another build's
+    // Malformed, but written long before this build started: an earlier build's leftovers.
     await write("13.json", "{ not json");
     await write("14.json", { format: 2, pid: 14, ancestors: [4242], startedAt: spawnedAt + 500 });
+    const old = new Date(spawnedAt - 60_000);
+    await utimes(path.join(dir, "13.json"), old, old);
+    await utimes(path.join(dir, "14.json"), old, old);
     await write("15.json.tmp", { format: 1, pid: 15, ancestors: [4242], startedAt: spawnedAt + 500 });
     await write("4242.json", { format: 1, pid: 4242, ancestors: [1], startedAt: spawnedAt + 100 }); // in-process build
     const records = await readExecutorMarkers(dir, { wrapperPid: 4242, spawnedAt });
     assert.deepEqual(records.map((record) => record.pid).sort((a, b) => a - b), [10, 4242]);
+});
+
+test("a malformed executor record written during this build fails closed instead of being skipped", async (t) => {
+    const spawnedAt = Date.now();
+    for (const [name, body] of [
+        ["13.json", "{ not json"],
+        ["14.json", JSON.stringify({ format: 2, pid: 14, ancestors: [4242], startedAt: spawnedAt + 500 })],
+        ["16.json", JSON.stringify({ format: 1, pid: "16", ancestors: [4242], startedAt: spawnedAt + 500 })],
+        ["17.json", JSON.stringify({ format: 1, pid: 17, ancestors: "4242", startedAt: spawnedAt + 500 })],
+    ]) {
+        const dir = await tempDir(t, "executor-records-");
+        await writeFile(path.join(dir, "10.json"), JSON.stringify({ format: 1, pid: 10, ancestors: [4242], startedAt: spawnedAt + 500 }));
+        await writeFile(path.join(dir, name), body);
+        // It could name this build's executor, so it cannot count as "no executor".
+        await assert.rejects(readExecutorMarkers(dir, { wrapperPid: 4242, spawnedAt }), /malformed/, name);
+
+        const fake = fakeProcesses([proc(1, 0, 1)]);
+        const outcome = await terminateProcessTree(
+            { pid: 4242, exitCode: 0, signalCode: null },
+            {
+                platform: "linux",
+                snapshot: fake.snapshot,
+                kill: fake.kill,
+                markers: () => readExecutorMarkers(dir, { wrapperPid: 4242, spawnedAt }),
+                killWaitMs: 60,
+                pollMs: 5,
+            },
+        );
+        assert.equal(outcome.confirmed, false, `${name}: ${outcome.detail}`);
+        assert.equal(fake.signals.length, 0, "nothing is signalled on its account");
+    }
 });
 
 test("the init script records pid, ancestry and start time atomically, and quotes its directory", () => {
@@ -940,6 +982,681 @@ test("a process list that cannot be read is never taken as everything having sto
     });
     assert.equal(outcome.confirmed, false);
     assert.match(outcome.detail, /could not be listed/);
+});
+
+// --- executors that wrote no record (configuration cache reused) ------------------
+
+test("an executor seen while its client lived stays owned after an abrupt client exit, by pid and start time", async () => {
+    // Cache reuse: no record. The single-use daemon is a child of the client in its own session.
+    const running = new Map([proc(1, 0, 1), proc(100, 1, 100), proc(200, 100, 200), proc(900, 1, 900)]);
+    const child = { pid: 100, exitCode: null, signalCode: null };
+    const known = new Map();
+    assert.deepEqual((await liveBuildProcesses(child, { platform: "linux", snapshot: async () => running, known })).sort(), [100, 200]);
+    assert.equal(known.get(200), running.get(200).lstart, "observing records what it saw");
+
+    // The client is killed: the daemon is reparented to init, outside the wrapper's group.
+    child.signalCode = "SIGKILL";
+    const reparented = new Map([proc(1, 0, 1), proc(200, 1, 200), proc(900, 1, 900)]);
+    assert.deepEqual(
+        await liveBuildProcesses(child, { platform: "linux", snapshot: async () => reparented }),
+        [],
+        "lineage alone loses it -- the gap this guards",
+    );
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot: async () => reparented, known }), [200]);
+
+    // Its pid reused by an unrelated process: a different start time is not ours.
+    const reused = new Map([proc(1, 0, 1), proc(200, 1, 200, "Thu Oct 22 11:00:00 2026")]);
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot: async () => reused, known }), []);
+});
+
+test("stopping uses what was seen during the build to stop a reparented executor that wrote no record", async () => {
+    const fake = fakeProcesses([proc(1, 0, 1), proc(200, 1, 200), proc(900, 1, 900)]);
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const known = new Map([
+        [100, "Thu Oct 22 10:00:00 2026"],
+        [200, "Thu Oct 22 10:00:00 2026"],
+    ]);
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: fake.snapshot, kill: fake.kill, known, killWaitMs: 500, pollMs: 5 });
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    const stopIndex = fake.signals.findIndex(([target, name]) => target === 200 && name === "SIGSTOP");
+    const killIndex = fake.signals.findIndex(([target, name]) => target === 200 && name === "SIGKILL");
+    assert.ok(stopIndex !== -1 && stopIndex < killIndex, "a seeded process is still frozen before it is killed");
+    assert.ok(fake.signals.every(([target]) => ![1, 900, -1, -900].includes(target)), JSON.stringify(fake.signals));
+
+    // The same pid, now another process: left alone, and nothing to wait for.
+    const other = fakeProcesses([proc(1, 0, 1), proc(200, 1, 200, "Thu Oct 22 11:00:00 2026")]);
+    const reused = await terminateProcessTree(child, {
+        platform: "linux",
+        snapshot: other.snapshot,
+        kill: other.kill,
+        known: new Map([[200, "Thu Oct 22 10:00:00 2026"]]),
+        killWaitMs: 500,
+        pollMs: 5,
+    });
+    assert.equal(reused.confirmed, true, reused.detail);
+    assert.ok(other.signals.every(([target]) => Math.abs(target) !== 200), JSON.stringify(other.signals));
+});
+
+test("an unkillable executor known only from the build stays unconfirmed", async () => {
+    const fake = fakeProcesses([proc(200, 1, 200)]);
+    fake.table.get(200).unkillable = true;
+    const child = { pid: 100, exitCode: 0, signalCode: null };
+    const outcome = await terminateProcessTree(child, {
+        platform: "linux",
+        snapshot: fake.snapshot,
+        kill: fake.kill,
+        known: new Map([[200, "Thu Oct 22 10:00:00 2026"]]),
+        killWaitMs: 150,
+        pollMs: 5,
+    });
+    assert.equal(outcome.confirmed, false);
+    assert.match(outcome.detail, /200/);
+});
+
+test("a wrapper that exits while ownership is being read is not confused with a process that reused its pid", async () => {
+    // The wrapper is alive when the probe starts, exits during markers(), and the
+    // snapshot that follows shows its pid reused by an unrelated process.
+    const child = { pid: 100, exitCode: null, signalCode: null };
+    const reusedAt = "Thu Oct 22 11:00:00 2026";
+    const table = [proc(1, 0, 1), proc(100, 1, 100, reusedAt), proc(101, 100, 100, reusedAt), proc(900, 1, 900)];
+    const known = new Map();
+    const markers = async () => {
+        child.exitCode = 0;
+        return [];
+    };
+    const live = await liveBuildProcesses(child, { platform: "linux", markers, snapshot: async () => new Map(table), known });
+    assert.deepEqual(live, [], "the replacement is not this build's");
+    assert.equal(known.size, 0, "nor is it remembered as owned");
+
+    const fake = fakeProcesses(table);
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: fake.snapshot, kill: fake.kill, known, killWaitMs: 200, pollMs: 5 });
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(
+        fake.signals.every(([target]) => ![100, -100, 101, -101].includes(target)),
+        `an unrelated process was signalled: ${JSON.stringify(fake.signals)}`,
+    );
+});
+
+test("a wrapper that exits while the snapshot is taken is judged by its state after it", async () => {
+    const child = { pid: 100, exitCode: null, signalCode: null };
+    const reusedAt = "Thu Oct 22 11:00:00 2026";
+    const known = new Map();
+    const snapshot = async () => {
+        child.signalCode = "SIGKILL";
+        return new Map([proc(1, 0, 1), proc(100, 1, 100, reusedAt)]);
+    };
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot, known }), []);
+    assert.equal(known.size, 0);
+});
+
+test("ownership: a process carrying this build's tag is owned without any other evidence", () => {
+    const snapshot = new Map([
+        proc(1, 0, 1),
+        [200, { ...proc(200, 1, 200)[1], tagged: true }], // reparented executor, no record, never seen
+        [201, { ...proc(201, 200, 200)[1], tagged: true }],
+        [900, { ...proc(900, 1, 900)[1], tagged: false }], // another daemon
+    ]);
+    const owned = ownedProcesses({ snapshot, wrapperPid: 100, wrapperExited: true, known: new Map([[100, "Thu Oct 22 10:00:00 2026"]]) });
+    assert.deepEqual(Array.from(owned.keys()).sort((a, b) => a - b), [200, 201]);
+});
+
+const TAG = "0123456789abcdef-tag";
+
+test("an executor no observation saw is found by its tag after its client died, and stopped", async () => {
+    // The reviewer's case: the wrapper (100) has exited, the executor (200) is alive,
+    // reparented, with no record; the only observation saw the wrapper alone.
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const table = [[1, { ...proc(1, 0, 1)[1], tagged: false }], [200, { ...proc(200, 1, 200)[1], tagged: true }], [900, { ...proc(900, 1, 900)[1], tagged: false }]];
+    const known = new Map([[100, "Thu Oct 22 10:00:00 2026"]]);
+    const fake = fakeProcesses(table);
+    const tagged = async (options) => {
+        assert.equal(options?.tag, TAG, "the snapshot is asked for the build's tag");
+        return fake.snapshot();
+    };
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot: tagged, known, tag: TAG }), [200], "not gone");
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: tagged, kill: fake.kill, known, tag: TAG, killWaitMs: 500, pollMs: 5 });
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(fake.signals.some(([target, name]) => target === 200 && name === "SIGKILL"));
+    assert.ok(fake.signals.every(([target]) => Math.abs(target) !== 900), JSON.stringify(fake.signals));
+});
+
+test("without the tag in a snapshot, an unseen executor is never reported gone", async () => {
+    // Same case, but the snapshot cannot say which processes carry the tag.
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const fake = fakeProcesses([proc(1, 0, 1), proc(200, 1, 200), proc(900, 1, 900)]);
+    const known = new Map([[100, "Thu Oct 22 10:00:00 2026"]]);
+    await assert.rejects(liveBuildProcesses(child, { platform: "linux", snapshot: fake.snapshot, known, tag: TAG }), /was not read/);
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: fake.snapshot, kill: fake.kill, known, tag: TAG, killWaitMs: 60, pollMs: 5 });
+    assert.equal(outcome.confirmed, false, outcome.detail);
+    assert.equal(fake.signals.length, 0, "nothing is signalled without identifying it");
+});
+
+test("a process whose environment the system hid keeps the stop unconfirmed and is never signalled", async () => {
+    // macOS case: the wrapper (100) has exited; 200 is a recent same-user orphan whose
+    // environment ps did not show, so it could be this build's executor, or not.
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const hidden = { ...proc(200, 1, 200)[1], tagged: undefined, envHidden: true };
+    const fake = fakeProcesses([[1, { ...proc(1, 0, 1)[1], tagged: false }], [200, hidden], [900, { ...proc(900, 1, 900)[1], tagged: false }]]);
+    const known = new Map([[100, "Thu Oct 22 10:00:00 2026"]]);
+    await assert.rejects(liveBuildProcesses(child, { platform: "darwin", snapshot: fake.snapshot, known, tag: TAG }), /pid\(s\) 200 \(executable unknown\) is hidden by the system/);
+    const outcome = await terminateProcessTree(child, { platform: "darwin", snapshot: fake.snapshot, kill: fake.kill, known, tag: TAG, killWaitMs: 60, pollMs: 5 });
+    assert.equal(outcome.confirmed, false, outcome.detail);
+    assert.match(outcome.detail, /pid\(s\) 200 \(executable unknown\) is hidden by the system/);
+    assert.equal(fake.signals.length, 0, JSON.stringify(fake.signals));
+
+    // The same hidden process in the wrapper's group is owned and stopped as usual.
+    const grouped = fakeProcesses([[1, { ...proc(1, 0, 1)[1], tagged: false }], [200, { ...hidden, pgid: 100 }]]);
+    const stopped = await terminateProcessTree(child, { platform: "darwin", snapshot: grouped.snapshot, kill: grouped.kill, known, tag: TAG, killWaitMs: 500, pollMs: 5 });
+    assert.equal(stopped.confirmed, true, stopped.detail);
+    assert.ok(grouped.signals.some(([target, name]) => target === 200 && name === "SIGKILL"));
+});
+
+test("a stop narrows the hidden-environment window to after its last clean look, never past an unseen start", async () => {
+    // A macOS-style snapshot classified by the real rule. 300 is another program's hidden
+    // helper whose shown, untagged parent (250) exits after the first look, leaving it an
+    // orphan; it was decided then and cannot become the build's later. 400 is a hidden
+    // orphan that first appears after that look, so it could be one the build started.
+    const uid = 501;
+    const spawnedAt = Date.now() - 60_000;
+    const entry = (pid, ppid, pgid, startedAt, envShown) => [pid, { pid, ppid, pgid, uid, stat: "S", lstart: String(startedAt), startedAt, envShown }];
+    const run = async (withLate) => {
+        const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+        let calls = 0;
+        const sinces = [];
+        const snapshot = async (options) => {
+            calls += 1;
+            sinces.push(options.since);
+            const now = Date.now();
+            const table = new Map([entry(1, 0, 1, 0, true), entry(300, calls === 1 ? 250 : 1, 250, spawnedAt + 1_000, false)]);
+            if (calls === 1) {
+                table.set(...entry(250, 1, 250, spawnedAt + 500, true));
+            } else if (withLate) {
+                table.set(...entry(400, 1, 399, now, false));
+            }
+            // As processSnapshot: none carries the tag; a hidden one reads as untagged until classified.
+            for (const proc of table.values()) {
+                proc.tagged = false;
+            }
+            classifyHiddenEnvironments(table, { since: options.since, uid });
+            return table;
+        };
+        const fake = fakeProcesses([]);
+        const outcome = await terminateProcessTree(child, { platform: "darwin", snapshot, kill: fake.kill, tag: TAG, since: spawnedAt, killWaitMs: 150, pollMs: 5 });
+        return { outcome, sinces, signals: fake.signals };
+    };
+
+    const quiet = await run(false);
+    assert.equal(quiet.outcome.confirmed, true, quiet.outcome.detail);
+    assert.equal(quiet.sinces[0], spawnedAt);
+    assert.ok(quiet.sinces[1] > spawnedAt, "narrowed after the clean first look");
+    assert.equal(quiet.signals.length, 0, "the unrelated helper is never signalled");
+
+    const late = await run(true);
+    assert.equal(late.outcome.confirmed, false, late.outcome.detail);
+    assert.match(late.outcome.detail, /pid\(s\) 400 \(executable unknown\) is hidden by the system/);
+    assert.equal(late.signals.length, 0, JSON.stringify(late.signals));
+});
+
+test("the snapshot reads the build tag from real process environments", { skip: ["darwin", "linux"].includes(process.platform) ? false : "environments are read on macOS and Linux only" }, async (t) => {
+    const tag = `${Date.now()}-0123456789abcdef`;
+    const since = Date.now();
+    const tagged = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        env: { ...process.env, [BUILD_TAG_ENV]: tag },
+        detached: true,
+        stdio: "ignore",
+    });
+    const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        env: { ...process.env, [BUILD_TAG_ENV]: `${tag}x` }, // a prefix match is not a match
+        stdio: "ignore",
+    });
+    t.after(() => {
+        tagged.kill("SIGKILL");
+        other.kill("SIGKILL");
+    });
+    await waitUntil(async () => (await processSnapshot({ tag, since })).get(tagged.pid)?.tagged === true, { message: "the tag to be visible" });
+    const snap = await processSnapshot({ tag, since });
+    assert.equal(snap.get(other.pid)?.tagged, false);
+    assert.equal(snap.get(process.pid)?.tagged, false);
+    // Undecided only where macOS hid the environment (other tests' orphaned shells, say).
+    assert.ok(Array.from(snap.values()).every((entry) => typeof entry.tagged === "boolean" || entry.envHidden === true));
+    assert.ok(Number.isFinite(snap.get(tagged.pid).startedAt));
+    await assert.rejects(processSnapshot({ tag: "short" }), /invalid build tag/);
+});
+
+test("a hidden macOS environment is decided by its shown ancestor, or left undecided when it could be the build's", () => {
+    const since = Date.parse("Thu Oct 22 10:00:00 2026");
+    const uid = 501;
+    const at = (pid, ppid, pgid, { lstart = "Thu Oct 22 10:00:05 2026", shown = false, tagged = false, owner = uid } = {}) => {
+        const [, entry] = proc(pid, ppid, pgid, lstart);
+        return [pid, { ...entry, uid: owner, envShown: shown, tagged }];
+    };
+    const processes = new Map([
+        at(1, 0, 1, { owner: 0 }),
+        at(10, 1, 10, { shown: true, tagged: true }), // the build's JVM
+        at(11, 10, 10), // hidden child of the tagged JVM: ours through it
+        at(12, 11, 10), // hidden grandchild: ours through the JVM
+        at(20, 1, 20, { shown: true }), // another tool, shown, untagged
+        at(21, 20, 20), // hidden child of that tool: not ours
+        at(30, 1, 30), // launchd-started group leader (an XPC service): not ours
+        at(31, 30, 30), // its hidden child: not ours
+        at(40, 1, 39), // hidden orphan, not a leader: could be a reparented build process
+        at(41, 40, 39), // its hidden child: likewise
+        at(50, 1, 39, { lstart: "Thu Oct 22 09:59:00 2026" }), // started before the build: not ours
+        at(60, 1, 39, { owner: 0 }), // another user's: not ours
+        at(70, 999, 70), // hidden, parent no longer listed: undecided
+    ]);
+    classifyHiddenEnvironments(processes, { since, uid });
+    const result = Object.fromEntries(Array.from(processes.values()).map((entry) => [entry.pid, entry.tagged]));
+    assert.deepEqual(result, {
+        1: false, 10: true, 11: true, 12: true, 20: false, 21: false, 30: false, 31: false,
+        40: undefined, 41: undefined, 50: false, 60: false, 70: undefined,
+    });
+    assert.equal(processes.get(40).envHidden, true);
+});
+
+test("a hidden orphan is undecided only when its executable is one a build could run", () => {
+    const since = Date.parse("Thu Oct 22 10:00:00 2026");
+    const uid = 501;
+    const roots = ["/Library/Java/JavaVirtualMachines/jdk-17/Contents/Home", "/Users/u/.gradle", "/Users/u/proj"];
+    // Each a hidden, same-uid, launchd-parented process outside its group's lead, started
+    // after the bound: shape alone cannot tell it from a reparented build process.
+    const orphan = (pid, file) => {
+        const [, entry] = proc(pid, 1, pid - 1, "Thu Oct 22 10:00:05 2026");
+        return [pid, { ...entry, uid, envShown: false, tagged: false, ...(file === undefined ? {} : { path: file }) }];
+    };
+    const crashpad = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/chrome_crashpad_handler";
+    const processes = new Map([
+        orphan(10, crashpad), // another app's helper: not the build's
+        orphan(20, "/Applications/Microsoft Teams.app/Contents/Helpers/msedgewebview2_crashpad_handler"),
+        orphan(30, "/bin/sleep"), // a platform binary: could be
+        orphan(40, "/usr/libexec/xpcproxy"),
+        orphan(50, `${roots[0]}/bin/java`), // the build's JDK
+        orphan(60, "/Users/u/.gradle/wrapper/dists/gradle-8/bin/gradle"),
+        orphan(70, "/Users/u/proj/build/tool"),
+        orphan(80, "/Users/u/project-other/tool"), // a sibling, not under the project dir
+        orphan(90, undefined), // path unreadable
+        orphan(100, "sleep"), // not a full path
+        orphan(110, "/binary/elsewhere"), // /bin is not a prefix of /binary
+    ]);
+    classifyHiddenEnvironments(processes, { since, uid, roots });
+    const result = Object.fromEntries(Array.from(processes.values()).map((entry) => [entry.pid, entry.tagged]));
+    assert.deepEqual(result, {
+        10: false, 20: false, 30: undefined, 40: undefined, 50: undefined, 60: undefined, 70: undefined,
+        80: false, 90: undefined, 100: undefined, 110: false,
+    });
+    assert.equal(processes.get(10).envHidden, undefined, "an .app helper is decided, not hidden-undecided");
+});
+
+test("the build's executable roots are its JDK, SDK, NDK, Gradle home and project, given and resolved", async (t) => {
+    const home = await tempDir(t, "home-");
+    const real = await tempDir(t, "jdk-");
+    const link = path.join(home, "jdk-link");
+    await symlink(real, link);
+    const roots = buildExecutableRoots({
+        env: { JAVA_HOME: link, ANDROID_HOME: "/opt/sdk", ANDROID_NDK_HOME: "/opt/ndk", GRADLE_USER_HOME: "relative/ignored" },
+        cwd: "/work/proj",
+        home,
+    });
+    for (const expected of [link, "/opt/sdk", "/opt/ndk", "/work/proj", path.join(home, "Library", "Android", "sdk")]) {
+        assert.ok(roots.includes(path.resolve(expected)), `${expected} in ${roots}`);
+    }
+    assert.ok(roots.includes(realpathSync.native(real)), "the JDK's resolved path");
+    assert.ok(!roots.some((root) => root.includes("relative")), "a relative Gradle home is not a root");
+    assert.ok(buildExecutableRoots({ env: {}, home }).includes(path.join(home, ".gradle")), "Gradle's default user home");
+});
+
+test("a quarantine retry keeps the bound a clean pass advanced, so a later foreign orphan cannot hold it", { timeout: 10_000 }, async () => {
+    // The wrapper is gone; its executor (200) outlives the first attempts. A hidden helper
+    // (300, a platform binary) started after the spawn under a shown, untagged parent
+    // (250): not the build's while that parent lives. Once the bound has passed its start,
+    // the parent exits and it is reparented to launchd -- its shape is now a reparented
+    // build process. A retry that went back to the spawn-time bound would hold the run
+    // until it exits; one keeping the advanced bound releases it.
+    const uid = 501;
+    const begun = Date.now();
+    const spawnedAt = begun - 60_000;
+    const helperStartedAt = begun - 10_000;
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    let calls = 0;
+    const sinces = [];
+    const snapshot = async (options) => {
+        calls += 1;
+        sinces.push(options.since);
+        const table = new Map();
+        const add = (pid, ppid, pgid, startedAt, extra = {}) =>
+            table.set(pid, { pid, ppid, pgid, uid, stat: "S", lstart: String(startedAt), startedAt, envShown: true, tagged: false, ...extra });
+        add(1, 0, 1, 0);
+        if (Date.now() - begun < 200) {
+            add(200, 1, 200, spawnedAt + 100, { tagged: true });
+        }
+        const orphaned = calls > 3;
+        if (!orphaned) {
+            add(250, 1, 250, helperStartedAt - 5);
+        }
+        add(300, orphaned ? 1 : 250, 250, helperStartedAt, { envShown: false, path: "/bin/sleep" });
+        classifyHiddenEnvironments(table, { since: options.since, uid, roots: [] });
+        return table;
+    };
+    const outcome = await whileHostAlive(waitForProcessTreeExit(child, { platform: "darwin", snapshot, kill: () => {}, tag: TAG, since: spawnedAt, killWaitMs: 30, pollMs: 5 }));
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(sinces.at(-1) > helperStartedAt + 2_000, `the final bound ${sinces.at(-1)} is past the helper's start`);
+    // And the helper's shape alone, at the spawn-time bound, is undecided: the bound is what releases it.
+    const alone = new Map([[1, { pid: 1, ppid: 0, pgid: 1, uid, startedAt: 0, envShown: true, tagged: false }], [300, { pid: 300, ppid: 1, pgid: 250, uid, startedAt: helperStartedAt, envShown: false, tagged: false, path: "/bin/sleep" }]]);
+    classifyHiddenEnvironments(alone, { since: spawnedAt, uid, roots: [] });
+    assert.equal(alone.get(300).tagged, undefined);
+});
+
+test("an app's crashpad helper started during the build neither blocks a running build nor holds a quarantined one", { timeout: 10_000 }, async () => {
+    // Chrome, Edge and Teams double-fork their crashpad handler under launchd, outside
+    // its group's lead, with its environment hidden. Launched mid-build it has the shape
+    // of a reparented build process; only its executable says it is not the build's.
+    const uid = 501;
+    const begun = Date.now();
+    const spawnedAt = begun - 60_000;
+    const crashpad = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/chrome_crashpad_handler";
+    const table = ({ wrapper, executor, helperPath }) => async (options) => {
+        const processes = new Map();
+        const add = (pid, ppid, pgid, startedAt, extra = {}) =>
+            processes.set(pid, { pid, ppid, pgid, uid, stat: "S", lstart: String(startedAt), startedAt, envShown: true, tagged: false, ...extra });
+        add(1, 0, 1, 0);
+        if (wrapper()) {
+            add(100, 1, 100, spawnedAt, { tagged: true });
+        }
+        if (executor()) {
+            add(200, 1, 200, spawnedAt + 100, { tagged: true });
+        }
+        add(500, 1, 499, begun - 1_000, { envShown: false, path: helperPath });
+        classifyHiddenEnvironments(processes, { since: options.since, uid, roots: ["/Users/u/.gradle", "/Users/u/proj"] });
+        return processes;
+    };
+
+    // A successful build: the running wrapper and executor are its only live processes.
+    const running = { pid: 100, exitCode: null, signalCode: null };
+    const live = table({ wrapper: () => true, executor: () => true, helperPath: crashpad });
+    assert.deepEqual((await liveBuildProcesses(running, { platform: "darwin", snapshot: live, tag: TAG, since: spawnedAt })).sort(), [100, 200]);
+    // The same shape from a platform binary could be the build's, and is never counted gone.
+    const sleeper = table({ wrapper: () => true, executor: () => true, helperPath: "/bin/sleep" });
+    await assert.rejects(liveBuildProcesses(running, { platform: "darwin", snapshot: sleeper, tag: TAG, since: spawnedAt }), /pid\(s\) 500 \(\/bin\/sleep\) is hidden by the system/);
+
+    // A quarantined run whose executor outlives the first attempts is released once it
+    // exits, although the helper keeps running and is never signalled.
+    const stopped = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const signals = [];
+    const quarantined = table({ wrapper: () => false, executor: () => Date.now() - begun < 200, helperPath: crashpad });
+    const outcome = await whileHostAlive(
+        waitForProcessTreeExit(stopped, { platform: "darwin", snapshot: quarantined, kill: (...call) => signals.push(call), tag: TAG, since: spawnedAt, killWaitMs: 30, pollMs: 5 }),
+    );
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(!signals.some(([target]) => Math.abs(target) === 500 || Math.abs(target) === 499), JSON.stringify(signals));
+});
+
+test("a platform binary carrying the tag is never read as untagged on macOS", { skip: process.platform === "darwin" ? false : "macOS hides some environments from ps" }, async (t) => {
+    // The reviewer's case: `ps -E` prints no environment for /bin/sleep and does not say
+    // so. A tagged parent (standing in for the build's JVM) starts it, then dies, leaving it
+    // reparented to launchd with no shown ancestor.
+    const tag = `${Date.now()}-0123456789abcdef`;
+    const since = Date.now();
+    const parent = spawn(
+        process.execPath,
+        ["-e", "const c = require('node:child_process').spawn('/bin/sleep', ['30'], { stdio: 'ignore' }); console.log(c.pid); setInterval(() => {}, 1000);"],
+        { env: { ...process.env, [BUILD_TAG_ENV]: tag }, detached: true, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let sleeperPid;
+    t.after(() => {
+        parent.kill("SIGKILL");
+        if (sleeperPid) {
+            try {
+                process.kill(sleeperPid, "SIGKILL");
+            } catch {}
+        }
+    });
+    sleeperPid = Number(await new Promise((resolve) => parent.stdout.once("data", (data) => resolve(String(data).trim()))));
+    assert.ok(sleeperPid > 0);
+    const raw = spawnSync("ps", ["-ww", "-E", "-o", "command=", "-p", String(sleeperPid)], { encoding: "utf8" }).stdout;
+    t.diagnostic(`ps -E shows /bin/sleep's environment: ${raw.includes(`${BUILD_TAG_ENV}=`)}`);
+
+    await waitUntil(async () => (await processSnapshot({ tag, since })).get(sleeperPid)?.tagged === true, {
+        message: "sleep to be read as the tagged parent's",
+    });
+    parent.kill("SIGKILL");
+    await waitUntil(async () => (await processSnapshot({ tag, since })).get(sleeperPid)?.ppid === 1, { message: "sleep to be reparented" });
+    const entry = (await processSnapshot({ tag, since })).get(sleeperPid);
+    assert.notEqual(entry.tagged, false, "a hidden environment is not read as untagged");
+    if (!entry.envShown) {
+        assert.equal(entry.tagged, undefined, "undecided");
+        // Owned through the dead parent's process group, it is simply not gone...
+        const child = { pid: parent.pid, exitCode: null, signalCode: "SIGKILL" };
+        assert.ok((await liveBuildProcesses(child, { platform: "darwin", tag, since })).includes(sleeperPid));
+        // ...and with no such link it cannot be counted gone either.
+        const unrelated = { pid: 99_999_999, exitCode: 0, signalCode: null };
+        await assert.rejects(liveBuildProcesses(unrelated, { platform: "darwin", tag, since }), /hidden by the system/);
+    }
+    // Don't leave a hidden orphan behind for concurrently running test files to trip over.
+    process.kill(sleeperPid, "SIGKILL");
+    sleeperPid = undefined;
+});
+
+test("reading tags from /proc: unreadable others are not ours, any other failure fails the snapshot", async (t) => {
+    const root = await tempDir(t, "proc-");
+    const environ = (pid, body) => mkdir(path.join(root, String(pid)), { recursive: true }).then(() => writeFile(path.join(root, String(pid), "environ"), body));
+    await environ(10, `PATH=/bin\0${BUILD_TAG_ENV}=${TAG}\0HOME=/h\0`);
+    await environ(11, `${BUILD_TAG_ENV}=${TAG}x\0`);
+    await environ(12, `${BUILD_TAG_ENV}=${TAG}`); // first and last, without a trailing NUL
+    const processes = new Map([proc(10, 1, 10), proc(11, 1, 11), proc(12, 1, 12), proc(13, 1, 13)]); // 13: exited meanwhile
+    await markTaggedFromProc(processes, TAG, { procRoot: root });
+    assert.deepEqual(
+        Array.from(processes.values()).map((entry) => [entry.pid, entry.tagged]),
+        [[10, true], [11, false], [12, true], [13, false]],
+    );
+    await mkdir(path.join(root, "14", "environ"), { recursive: true }); // EISDIR
+    await assert.rejects(markTaggedFromProc(new Map([proc(14, 1, 14)]), TAG, { procRoot: root }), { code: "EISDIR" });
+});
+
+test("a process list that fails after one clean pass does not confirm, and the deadline still applies", { timeout: 5_000 }, async () => {
+    const child = { pid: 100, exitCode: 0, signalCode: null };
+    let calls = 0;
+    const startedAt = Date.now();
+    const outcome = await terminateProcessTree(child, {
+        platform: "linux",
+        snapshot: async () => {
+            calls += 1;
+            if (calls === 1) {
+                return new Map([proc(1, 0, 1)]);
+            }
+            throw new Error("ps is unavailable");
+        },
+        kill: () => {},
+        killWaitMs: 100,
+        pollMs: 5,
+    });
+    assert.equal(outcome.confirmed, false, outcome.detail);
+    assert.match(outcome.detail, /could not be listed/);
+    assert.ok(Date.now() - startedAt < 2_000, "it gave up at the deadline instead of spinning");
+});
+
+test("a records directory that cannot be read fails loudly instead of reading as no executor", posixOnly, async (t) => {
+    const dir = await tempDir(t, "executor-records-");
+    assert.deepEqual(await readExecutorMarkers(path.join(dir, "missing"), { wrapperPid: 1, spawnedAt: 0 }), [], "absent is empty");
+
+    const notADir = path.join(dir, "file");
+    await writeFile(notADir, "");
+    await assert.rejects(readExecutorMarkers(notADir, { wrapperPid: 1, spawnedAt: 0 }), { code: "ENOTDIR" });
+
+    const records = path.join(dir, "records");
+    await mkdir(records);
+    await writeFile(path.join(records, "10.json"), JSON.stringify({ format: 1, pid: 10, ancestors: [1], startedAt: 1 }));
+    await chmod(path.join(records, "10.json"), 0o000);
+    t.after(() => chmod(path.join(records, "10.json"), 0o600).catch(() => {}));
+    if (process.getuid?.() !== 0) {
+        await assert.rejects(readExecutorMarkers(records, { wrapperPid: 1, spawnedAt: 0 }), { code: "EACCES" });
+    }
+
+    const fake = fakeProcesses([proc(1, 0, 1)]);
+    const outcome = await terminateProcessTree(
+        { pid: 100, exitCode: 0, signalCode: null },
+        {
+            platform: "linux",
+            snapshot: fake.snapshot,
+            kill: fake.kill,
+            markers: () => readExecutorMarkers(notADir, { wrapperPid: 100, spawnedAt: 0 }),
+            killWaitMs: 100,
+            pollMs: 5,
+        },
+    );
+    assert.equal(outcome.confirmed, false, "an unreadable record is not proof there is no executor");
+});
+
+test("one record of observations is shared by tracking, the post-exit check, and the stop it falls back to", posixOnly, async (t) => {
+    const root = await posixProject(t, "echo started; sleep 0.3");
+    const seen = { probe: new Set(), terminate: new Set(), waitForExit: new Set() };
+    let probes = 0;
+    const service = newService(fakeManager(), {
+        executorExitWaitMs: 200,
+        lineagePollMs: 10,
+        processTree: {
+            probe: async (_child, options) => {
+                seen.probe.add(options.known);
+                probes += 1;
+                throw new Error("ps is unavailable"); // Neither tracking nor the check may treat this as gone.
+            },
+            terminate: async (_child, options) => {
+                seen.terminate.add(options.known);
+                return { confirmed: false, detail: "the test refused to confirm it" };
+            },
+            waitForExit: (_child, options) => {
+                seen.waitForExit.add(options.known);
+                return new Promise(() => {});
+            },
+        },
+    });
+    service.setWorkingDirectory(root);
+    const failure = await rejection(service.buildInstallLaunch({ deviceId: "one", launch: false }));
+    assert.equal(failure.code, "build_executor_unconfirmed");
+    assert.ok(failure.retainHoldUntil instanceof Promise, "the device stays reserved");
+    assert.equal(service.statusFor("one").quarantined, true);
+    assert.equal(service.projectLocks.size, 1, "the project stays reserved");
+    assert.ok(probes > 1, "it was observed while it ran, despite the failures");
+    const maps = new Set([...seen.probe, ...seen.terminate, ...seen.waitForExit]);
+    assert.equal(maps.size, 1, "every stage saw the same map");
+    assert.ok([...maps][0] instanceof Map);
+});
+
+/**
+ * A project whose `gradlew` execs a client that starts a single-use daemon in
+ * its own session and writes no executor record -- as when the configuration
+ * cache is reused -- then is SIGKILLed once the daemon is up, leaving the daemon
+ * reparented outside the wrapper's group with nothing on disk naming it.
+ */
+async function recordlessProject(t, { clientDiesAfterMs = 600 } = {}) {
+    const root = await tempDir(t, "recordless-fixture-");
+    await writeFile(
+        path.join(root, "client.cjs"),
+        `
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[2];
+const out = fs.openSync(path.join(root, "daemon.log"), "a");
+const daemon = spawn(process.execPath, ["-e", \`
+    process.on("SIGTERM", () => {});
+    require("node:fs").writeFileSync(\${JSON.stringify(path.join(root, "daemon.pid"))}, String(process.pid));
+    setTimeout(() => require("node:fs").writeFileSync(\${JSON.stringify(path.join(root, "installed"))}, "x"), 5000);
+    setInterval(() => {}, 1000);
+\`], { detached: true, stdio: ["ignore", out, out] });
+const wait = setInterval(() => {
+    if (fs.existsSync(path.join(root, "daemon.pid"))) {
+        clearInterval(wait);
+        console.log("started");
+        setTimeout(() => process.kill(process.pid, "SIGKILL"), ${clientDiesAfterMs});
+    }
+}, 10);
+`,
+    );
+    await writeFile(path.join(root, "gradlew"), `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/client.cjs" "$(dirname "$0")"\n`);
+    await chmod(path.join(root, "gradlew"), 0o755);
+    await writeMetadata(root, "app/build/outputs/apk/debug", { applicationId: "com.example.app", variantName: "debug" });
+    return root;
+}
+
+test("a recordless executor left behind by a killed client is stopped before the build is reported over", posixOnly, async (t) => {
+    const root = await recordlessProject(t);
+    const service = newService(fakeManager(), { executorExitWaitMs: 300, lineagePollMs: 20 });
+    service.setWorkingDirectory(root);
+    const failure = await rejection(service.buildInstallLaunch({ deviceId: "dev", launch: false }));
+    const daemon = await daemonPid(root);
+    t.after(() => {
+        try {
+            process.kill(daemon, "SIGKILL");
+        } catch {
+            // Gone, as expected.
+        }
+    });
+    assert.equal(failure.code, "build_failed", failure.message);
+    assert.equal(isAlive(daemon), false, "the daemon was gone before the build was reported over");
+    const termination = service.runs.get("dev").termination;
+    assert.equal(termination.confirmed, true, termination.detail);
+    assert.ok(termination.stopped?.some((entry) => entry.pid === daemon), JSON.stringify(termination));
+});
+
+test("an executor started and orphaned between observations is still found and stopped", posixOnly, async (t) => {
+    // Every observation while the client lives fails, and the client dies as soon
+    // as the daemon is up: nothing ever saw the daemon, which wrote no record.
+    const root = await recordlessProject(t, { clientDiesAfterMs: 0 });
+    let tracked = 0;
+    const service = newService(fakeManager(), {
+        executorExitWaitMs: 300,
+        lineagePollMs: 5,
+        processTree: {
+            probe: async (child, options) => {
+                if (child.exitCode === null && child.signalCode === null) {
+                    tracked += 1;
+                    throw new Error("ps is unavailable");
+                }
+                return liveBuildProcesses(child, options);
+            },
+        },
+    });
+    service.setWorkingDirectory(root);
+    const failure = await rejection(service.buildInstallLaunch({ deviceId: "dev", launch: false }));
+    const daemon = await daemonPid(root);
+    t.after(() => {
+        try {
+            process.kill(daemon, "SIGKILL");
+        } catch {
+            // Gone, as expected.
+        }
+    });
+    assert.ok(tracked > 0, "observations failed while the client ran");
+    const termination = service.runs.get("dev").termination;
+    if (["darwin", "linux"].includes(process.platform)) {
+        assert.equal(failure.code, "build_failed", failure.message);
+        assert.equal(isAlive(daemon), false, "the daemon was gone before the build was reported over");
+        assert.equal(termination.confirmed, true, termination.detail);
+        assert.ok(termination.stopped?.some((entry) => entry.pid === daemon), JSON.stringify(termination));
+    } else {
+        // No way to read the tag: the build stays reserved rather than guessing.
+        assert.equal(failure.code, "build_executor_unconfirmed", failure.message);
+        assert.equal(termination.confirmed, false);
+    }
+});
+
+test("cancelling during wrapper startup confirms the stop before anything it would start can run", posixOnly, async (t) => {
+    // The wrapper is still "downloading the distribution" when cancelled.
+    const root = await posixProject(t, ['sleep 0.4', 'echo late > "$(dirname "$0")/daemon-started"'].join("\n"));
+    const service = newService(fakeManager());
+    service.setWorkingDirectory(root);
+    const running = rejection(service.buildInstallLaunch({ deviceId: "dev", launch: false }));
+    await waitUntil(() => service.runs.get("dev")?.child?.pid, { message: "the wrapper to be spawned" });
+    const pid = service.runs.get("dev").child.pid;
+    t.after(() => killGroup(pid));
+    const final = await service.cancel("dev");
+    assert.equal(final.state, "cancelled");
+    assert.equal((await running).code, "build_cancelled");
+    assert.equal(service.runs.get("dev").termination.confirmed, true);
+    assert.equal(isAlive(pid), false);
+    await sleep(700);
+    await assert.rejects(readFile(path.join(root, "daemon-started")), { code: "ENOENT" }, "nothing ran after the cancellation");
+    await waitUntil(() => service.projectLocks.size === 0, { message: "the lock to be dropped" });
 });
 
 /**
