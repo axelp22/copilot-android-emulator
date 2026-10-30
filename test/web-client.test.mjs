@@ -285,7 +285,7 @@ test("a stream the host ends is reported, and an HTTP error carries the host's m
 
 // --- connection diagnostics ----------------------------------------------------------
 
-const { buildDiagnosticReport, createConnectionDiagnostics, describeConnection, redactDiagnosticText } =
+const { buildDiagnosticReport, classifyGrpcFailure, createConnectionDiagnostics, describeConnection } =
     await extensionModule("web", "connection-diagnostics.js");
 
 const liveGrpc = {
@@ -306,23 +306,26 @@ const liveGrpc = {
     apiLevel: 35,
 };
 
+// Realistic identifiers: an adb serial, an AVD name, a physical serial, URL
+// credentials on localhost, a token, a home path and an email address.
 const sensitiveReason =
-    "gRPC connect failed: /Users/alice/.android/avd/Pixel_8.avd/grpc.token token=abc123secret " +
-    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln https://host.local:8554/v1?key=zzz " +
-    "C:\\Users\\alice\\AppData\\emu.log alice@example.com serial 0123456789abcdef0123";
+    "emulator-5554 Pixel_8_API_34 R58N47XC8HP: gRPC connect to http://admin:hunter2@localhost:8554/v1 failed " +
+    "token=abc123secret /Users/alice/.android/avd/Pixel_8_API_34.avd C:\\Users\\alice\\AppData alice@example.com";
 
 const LEAKS = [
-    "/Users/alice",
-    "alice",
+    "emulator-5554",
+    "5554",
+    "Pixel_8",
+    "API_34",
+    "R58N47XC8HP",
+    "admin",
+    "hunter2",
+    "localhost",
+    "8554",
     "abc123secret",
-    "eyJhbGciOiJIUzI1NiJ9",
-    "key=zzz",
-    "/v1",
+    "alice",
     "AppData",
     "example.com",
-    "0123456789abcdef0123",
-    "Pixel_8",
-    "emulator-5554",
 ];
 
 function assertNoLeaks(text) {
@@ -331,20 +334,26 @@ function assertNoLeaks(text) {
     }
 }
 
-test("redaction strips tokens, credentials, paths, query strings, emails and long ids", () => {
-    const text = redactDiagnosticText(sensitiveReason, { maxLength: 1_000 });
-    assertNoLeaks(text);
-    assert.match(text, /\[path\]/);
-    assert.match(text, /token=\[redacted\]/);
-    assert.match(text, /\[token\]/);
-    assert.match(text, /https:\/\/host\.local:8554/);
-    assert.match(text, /\[email\]/);
-    assert.match(text, /\[id\]/);
-    assert.match(redactDiagnosticText("open file:///home/bob/x.png and ~/secret/notes"), /^open \[path\] and \[path\]$/);
-    assert.equal(redactDiagnosticText(null), "");
-    assert.equal(redactDiagnosticText("line one\nline two\u0000"), "line one line two");
-    const long = redactDiagnosticText("x ".repeat(200));
-    assert.ok(long.length <= 160 && long.endsWith("…"));
+test("host gRPC failures are classified into fixed labels; anything else is omitted", () => {
+    const cases = [
+        ["This emulator has no gRPC control connection.", "this emulator has no gRPC endpoint"],
+        ["EmulatorController/streamScreenshot was cancelled.", "the stream was cancelled"],
+        ["EmulatorController/getStatus failed with HTTP 401.", "authentication was rejected"],
+        ["EmulatorController/getStatus failed with HTTP 503.", "the emulator returned an HTTP error"],
+        ["EmulatorController/getStatus failed: connect ECONNREFUSED 127.0.0.1:8554", "the connection failed"],
+        ["The emulator stopped responding: no frame for 5000 ms", "the emulator stopped responding"],
+        ["EmulatorController/getStatus returned no message.", "the emulator returned no data"],
+        [sensitiveReason, "the connection failed"],
+        ["emulator-5554 Pixel_8_API_34 R58N47XC8HP", "unrecognised error (details omitted)"],
+        ["http://admin:hunter2@localhost:8554", "unrecognised error (details omitted)"],
+        ["something entirely new", "unrecognised error (details omitted)"],
+    ];
+    for (const [reason, label] of cases) {
+        assert.equal(classifyGrpcFailure(reason), label, reason);
+        assertNoLeaks(classifyGrpcFailure(reason));
+    }
+    assert.equal(classifyGrpcFailure(null), "");
+    assert.equal(classifyGrpcFailure("   "), "");
 });
 
 test("describeConnection names the transport, the connection state and why video fell back", () => {
@@ -359,8 +368,10 @@ test("describeConnection names the transport, the connection state and why video
     const mirror = describeConnection({ ...liveGrpc, transport: "mirror", transportReason: sensitiveReason });
     assert.equal(mirror.transportLabel, "Screen mirror video");
     assert.equal(mirror.degraded, true);
-    assert.match(mirror.fallbackReason, /^gRPC unavailable: gRPC connect failed:/);
-    assertNoLeaks(mirror.fallbackReason);
+    assert.equal(mirror.fallbackReason, "gRPC unavailable: the connection failed");
+
+    const unknown = describeConnection({ ...liveGrpc, transport: "mirror", transportReason: "emulator-5554 Pixel_8_API_34" });
+    assert.equal(unknown.fallbackReason, "gRPC unavailable: unrecognised error (details omitted)");
 
     // A physical device always mirrors; that is not a fallback.
     const phone = describeConnection({ ...liveGrpc, transport: "mirror", deviceKind: "physical" });
@@ -371,6 +382,16 @@ test("describeConnection names the transport, the connection state and why video
     assert.equal(stills.transportLabel, "Screenshots");
     assert.equal(stills.fallbackReason, "This canvas cannot decode video");
     assert.equal(stills.fps, null);
+
+    const stalled = describeConnection({ ...liveGrpc, screenSource: "screenshots", clientFallbackReason: "stalled" });
+    assert.equal(stalled.fallbackReason, "Video stalled");
+    // A raw message (an old client, or a code this module does not know) is never shown.
+    const raw = describeConnection({
+        ...liveGrpc,
+        screenSource: "screenshots",
+        clientFallbackReason: "Device stream failed (emulator-5554 R58N47XC8HP)",
+    });
+    assert.equal(raw.fallbackReason, "Video unavailable");
 
     assert.equal(describeConnection({ ...liveGrpc, events: "reconnecting" }).connectionLabel, "Reconnecting");
     const offline = describeConnection({ ...liveGrpc, events: "closed" });
@@ -394,6 +415,10 @@ test("the copyable report is an allowlist: useful facts, no serials, names, path
             avdPath: "/Users/alice/.android/avd/Pixel_8.avd",
             token: "abc123secret",
             screenError: `Failed reading ${sensitiveReason}`,
+            deviceState: "Booted",
+            deviceKind: "emulator",
+            androidVersion: "15 (emulator-5554)",
+            futureField: sensitiveReason,
             eventErrors: 2,
             streamReconnects: 3,
         },
@@ -408,14 +433,24 @@ test("the copyable report is an allowlist: useful facts, no serials, names, path
     assert.ok(lines.includes("Last frame: 1 s ago"));
     assert.ok(lines.includes("Event stream: open (2 errors)"));
     assert.ok(lines.includes("Stream reconnects: 3"));
-    assert.ok(lines.includes("Android: 15 (API 35)"));
-    assert.match(report, /^Fallback reason: gRPC unavailable: /m);
+    assert.ok(lines.includes("Android: unknown (API 35)"), "a malformed version is dropped, not copied");
+    assert.ok(lines.includes("Fallback reason: gRPC unavailable: the connection failed"));
+    assert.ok(lines.includes("Screen error: shown (details omitted)"));
+    assert.ok(lines.includes("Host transport: mirror"));
     assertNoLeaks(report);
+
+    const odd = buildDiagnosticReport({ ...liveGrpc, deviceState: "Pixel_8_API_34", deviceKind: "R58N47XC8HP", events: "emulator-5554", transport: "x" });
+    assert.ok(odd.includes("Device state: other"));
+    assert.ok(odd.includes("Device kind: other"));
+    assert.ok(odd.includes("Event stream: other"));
+    assert.ok(odd.includes("Host transport: other"));
+    assert.ok(buildDiagnosticReport({ ...liveGrpc, androidVersion: "15" }).includes("Android: 15 (API 35)"));
+    assertNoLeaks(odd);
 });
 
 function diagnosticsElements() {
     const elements = Object.fromEntries(
-        ["toggle", "toggleLabel", "panel", "close", "copy", "copyStatus", "report", "transport", "connection", "reason", "reconnects", "fps"].map(
+        ["toggle", "toggleLabel", "panel", "close", "copy", "copyStatus", "report", "reportDetails", "transport", "connection", "reason", "reconnects", "fps"].map(
             (key) => [key, fakeElement()],
         ),
     );
@@ -439,7 +474,7 @@ test("the diagnostics toggle is an accessible disclosure that summarises the con
     assert.equal(elements.toggle.attributes["aria-label"], "Connection diagnostics: Screen mirror video · Live");
     assert.equal(elements.toggleLabel.textContent, "Screen mirror video");
     assert.equal(elements.toggle.dataset.degraded, "true");
-    assert.match(elements.toggle.title, /gRPC unavailable: connection refused/);
+    assert.match(elements.toggle.title, /gRPC unavailable: the connection failed/);
     assert.equal(elements.transport.textContent, "", "a closed panel is not rendered");
 
     elements.toggle.click();
@@ -447,7 +482,7 @@ test("the diagnostics toggle is an accessible disclosure that summarises the con
     assert.equal(elements.toggle.attributes["aria-expanded"], "true");
     assert.equal(elements.transport.textContent, "Screen mirror video");
     assert.equal(elements.connection.textContent, "Live");
-    assert.equal(elements.reason.textContent, "gRPC unavailable: connection refused");
+    assert.equal(elements.reason.textContent, "gRPC unavailable: the connection failed");
     assert.equal(elements.fps.textContent, "29.9 fps");
     assert.equal(elements.reconnects.textContent, "0");
     assert.match(elements.report.textContent, /^Android Emulator canvas diagnostics/);
@@ -465,7 +500,7 @@ test("the diagnostics toggle is an accessible disclosure that summarises the con
     assert.equal(elements.focusCount(), 1, "closing returns focus to the toggle");
 });
 
-test("copying writes the redacted report, and a blocked or missing clipboard selects it instead", async () => {
+test("copying writes the allowlisted report, and a blocked or missing clipboard selects it instead", async () => {
     const snapshot = { ...liveGrpc, transport: "mirror", transportReason: sensitiveReason };
     const now = () => new Date("2026-01-01T00:00:10Z");
 
@@ -496,6 +531,7 @@ test("copying writes the redacted report, and a blocked or missing clipboard sel
     });
     assert.equal(await blocked.copyReport(), false);
     assert.deepEqual(selected, [blockedElements.report]);
+    assert.equal(blockedElements.reportDetails.open, true, "the preview opens so the selection is visible");
     assert.equal(blockedElements.copyStatus.textContent, "Copy was blocked. The report is selected; copy it manually.");
     assert.equal(blockedElements.copyStatus.dataset.tone, "error");
     assertNoLeaks(blockedElements.report.textContent);
@@ -511,4 +547,44 @@ test("copying writes the redacted report, and a blocked or missing clipboard sel
     assert.equal(await none.copyReport(), false);
     assert.equal(selected.at(-1), noneElements.report);
     assert.equal(noneElements.copyStatus.textContent, "Clipboard unavailable. The report is selected; copy it manually.");
+});
+
+test("a report waiting to be copied by hand survives the panel refresh until the next copy or close", async () => {
+    let clock = Date.parse("2026-01-01T00:00:10Z");
+    const now = () => new Date(clock);
+    const elements = diagnosticsElements();
+    let selections = 0;
+    let clipboard = { writeText: async () => Promise.reject(new Error("NotAllowedError")) };
+    const diagnostics = createConnectionDiagnostics({
+        elements,
+        getSnapshot: () => liveGrpc,
+        clipboard: { writeText: (text) => clipboard.writeText(text) },
+        selectText: () => {
+            selections += 1;
+        },
+        now,
+    });
+    diagnostics.bind();
+    diagnostics.setOpen(true);
+    assert.equal(await diagnostics.copyReport(), false);
+    const pinned = elements.report.textContent;
+    assert.equal(diagnostics.reportPinned, true);
+
+    clock += 5_000;
+    diagnostics.render();
+    assert.equal(elements.report.textContent, pinned, "a refresh must not replace the selected text");
+
+    clipboard = { writeText: async () => {} };
+    assert.equal(await diagnostics.copyReport(), true);
+    assert.equal(diagnostics.reportPinned, false);
+    assert.notEqual(elements.report.textContent, pinned);
+
+    clipboard = { writeText: async () => Promise.reject(new Error("NotAllowedError")) };
+    await diagnostics.copyReport();
+    diagnostics.setOpen(false);
+    assert.equal(diagnostics.reportPinned, false, "closing the panel releases the pin");
+    clock += 5_000;
+    diagnostics.setOpen(true);
+    assert.match(elements.report.textContent, /Generated: 2026-01-01T00:00:20/);
+    assert.equal(selections, 2);
 });

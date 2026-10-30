@@ -406,11 +406,12 @@ function stopH264Watchdog() {
     h264StallTimer = null;
 }
 
-function fallBackToScreenshots(reason) {
+/** `code` is one of CLIENT_FALLBACK_LABELS, so diagnostics never carry the raw error. */
+function fallBackToScreenshots(reason, code) {
     stopH264Watchdog();
     h264Stream.stop();
     screenSource = "screenshots";
-    clientFallbackReason = reason;
+    clientFallbackReason = code;
     setScreenStatus(reason);
     startPngFallback();
     diagnostics.render();
@@ -429,7 +430,7 @@ function startH264StallWatchdog() {
             return;
         }
         if (Date.now() - lastVideoFrameAt > H264_STALL_TIMEOUT_MS && !h264Stream.isStillStream()) {
-            fallBackToScreenshots("Video stalled; streaming screenshots instead");
+            fallBackToScreenshots("Video stalled; streaming screenshots instead", "stalled");
             return;
         }
 
@@ -504,12 +505,26 @@ function startPngFallback() {
     refreshFrame();
 }
 
+/**
+ * Frame times and the chosen source describe one stream. Without this reset a
+ * newly picked device would report "Live" off the previous device's last frame
+ * until its own first frame arrived.
+ */
+function resetStreamDiagnostics() {
+    screenSource = null;
+    clientFallbackReason = null;
+    lastFrameAt = 0;
+    lastVideoFrameAt = 0;
+    recentFrameTimes = [];
+}
+
 function ensureStream() {
     if (screenError) {
         return;
     }
     if (!state || state.state !== "Booted") {
         activeStreamKey = "";
+        resetStreamDiagnostics();
         h264Stream.stop();
         stopPngFallback();
         stopH264Watchdog();
@@ -531,6 +546,7 @@ function ensureStream() {
         return;
     }
     activeStreamKey = nextKey;
+    resetStreamDiagnostics();
 
     const source = chooseScreenSource({
         hasVideoDecoder: useVideoDecoder,
@@ -539,7 +555,7 @@ function ensureStream() {
     });
     if (source === "screenshots") {
         screenSource = "screenshots";
-        clientFallbackReason = "This canvas cannot decode video";
+        clientFallbackReason = "decoder-unavailable";
         setScreenStatus("Streaming screenshots (this canvas cannot decode video)");
         startPngFallback();
         return;
@@ -604,12 +620,12 @@ function handleH264StreamError(error) {
         }
         const reason = "This canvas cannot decode video; streaming screenshots instead";
         setNotice(reason);
-        fallBackToScreenshots(reason);
+        fallBackToScreenshots(reason, "decoder-unavailable");
         return;
     }
     const reason = `Device stream failed (${error?.message ?? String(error)}); streaming screenshots instead`;
     setNotice(reason);
-    fallBackToScreenshots(reason);
+    fallBackToScreenshots(reason, "stream-failed");
 }
 
 function startH264Stream(fps) {
@@ -628,7 +644,7 @@ function startH264Stream(fps) {
             return;
         }
         // Never leave the canvas blank because video decoding failed.
-        fallBackToScreenshots("Video unavailable; streaming screenshots instead");
+        fallBackToScreenshots("Video unavailable; streaming screenshots instead", "first-frame-timeout");
     }, H264_WATCHDOG_MS);
     lastVideoFrameAt = 0;
     startH264StallWatchdog();
@@ -884,6 +900,7 @@ const diagnostics = createConnectionDiagnostics({
         copy: elements.diagnosticsCopy,
         copyStatus: elements.diagnosticsCopyStatus,
         report: elements.diagnosticsReport,
+        reportDetails: elements.diagnosticsReport?.closest("details") ?? null,
         transport: elements.diagnosticsTransport,
         connection: elements.diagnosticsConnection,
         reason: elements.diagnosticsReason,

@@ -4,12 +4,13 @@
  *
  * "Why is it slow?" is usually answered by one of those three facts, so they are
  * shown in plain words and can be copied as a short report. The report is meant
- * to be pasted into issues and chats, so it is built only from an allowlist of
- * fields and every free-form string goes through redactDiagnosticText first:
- * no serials, AVD names, paths, tokens or raw logs.
+ * to be pasted into issues and chats, so it is an allowlist: every line is a
+ * fixed label, a number, or a value from a known set. Free-form text (host
+ * error messages, screen errors) is never copied; it is classified into a fixed
+ * label instead, because no redaction can reliably spot an arbitrary device
+ * name, serial or credential inside a message.
  */
 
-const MAX_REASON_LENGTH = 160;
 const COPY_STATUS_MS = 4_000;
 
 const TRANSPORT_LABELS = {
@@ -27,41 +28,53 @@ const CONNECTION_LABELS = {
     idle: "Device not running",
 };
 
-const REDACTIONS = [
-    // JSON Web Tokens and other long dotted base64 blobs.
-    [/\beyJ[\w-]+\.[\w-]+\.[\w-]+/g, "[token]"],
-    [/\b(bearer|basic)\s+[\w.~+/=-]+/gi, "$1 [redacted]"],
-    [
-        /\b(authorization|auth|token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|cookie|session|signature|sig|key)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&)]+)/gi,
-        "$1$2[redacted]",
-    ],
-    [/\bfile:\/\/\S+/gi, "[path]"],
-    // URLs keep their scheme and host but lose path and query, which can carry tokens.
-    [/\b(https?|wss?|grpc):\/\/([^/\s?#]+)[^\s)]*/gi, "$1://$2"],
-    [/\b[A-Za-z]:\\[^\s:;,)'"]*/g, "[path]"],
-    [/\\\\[^\s:;,)'"]+/g, "[path]"],
-    // Unix paths: anything rooted at / with at least one more segment.
-    [/(^|[\s(="'`])\/(?:[\w.@+-]+\/)+[\w.@+-]*/g, "$1[path]"],
-    [/(^|[\s(="'`])~\/[^\s:;,)'"]*/g, "$1[path]"],
-    [/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, "[email]"],
-    // adb serials of physical devices and long hex identifiers.
-    [/\b[0-9a-f]{16,}\b/gi, "[id]"],
-];
+/** Why the canvas itself chose screenshots; app.js reports one of these codes. */
+export const CLIENT_FALLBACK_LABELS = {
+    "decoder-unavailable": "This canvas cannot decode video",
+    "first-frame-timeout": "Video did not start in time",
+    stalled: "Video stalled",
+    "stream-failed": "The video stream failed",
+};
+const UNKNOWN_CLIENT_FALLBACK = "Video unavailable";
 
-/** Strips anything that could identify a person, a machine or a credential. */
-export function redactDiagnosticText(value, { maxLength = MAX_REASON_LENGTH } = {}) {
-    if (value === null || value === undefined) {
+// Matched against the host's raw gRPC error, which is never shown or copied itself.
+// Order matters: the first match wins.
+const GRPC_FAILURES = [
+    [/cancel/i, "the stream was cancelled"],
+    [/unauthori[sz]ed|unauthenticated|permission denied|forbidden|credential|\bHTTP 40[13]\b/i, "authentication was rejected"],
+    [/no gRPC control connection|grpc_unavailable|discovery|not found/i, "this emulator has no gRPC endpoint"],
+    [/stopped responding|timed? ?out|timeout|ETIMEDOUT|deadline/i, "the emulator stopped responding"],
+    [/\bHTTP \d{3}\b/i, "the emulator returned an HTTP error"],
+    [/ECONNREFUSED|refused|ECONNRESET|reset|hang up|EPIPE|EHOSTUNREACH|unreachable|connect/i, "the connection failed"],
+    [/no message|empty response/i, "the emulator returned no data"],
+    [/closed/i, "the channel was closed"],
+];
+const UNKNOWN_GRPC_FAILURE = "unrecognised error (details omitted)";
+
+const HOST_TRANSPORTS = new Set(["grpc", "mirror"]);
+const EVENT_STATES = new Set(["open", "connecting", "reconnecting", "closed"]);
+const DEVICE_KINDS = new Set(["emulator", "device", "physical"]);
+const DEVICE_STATES = new Set(["Booted", "Booting", "Shutdown", "ShuttingDown", "Offline", "Unauthorized", "Unavailable", "Unassigned"]);
+
+/** A fixed label for the host's gRPC failure, or "" when there was none. */
+export function classifyGrpcFailure(reason) {
+    if (reason === null || reason === undefined || String(reason).trim() === "") {
         return "";
     }
-    let text = String(value).replace(/[\u0000-\u001f\u007f]+/g, " ");
-    for (const [pattern, replacement] of REDACTIONS) {
-        text = text.replace(pattern, replacement);
-    }
-    text = text.replace(/\s+/g, " ").trim();
-    if (text.length > maxLength) {
-        text = `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-    }
-    return text;
+    const text = String(reason);
+    return GRPC_FAILURES.find(([pattern]) => pattern.test(text))?.[1] ?? UNKNOWN_GRPC_FAILURE;
+}
+
+function clientFallbackLabel(code) {
+    return Object.hasOwn(CLIENT_FALLBACK_LABELS, code) ? CLIENT_FALLBACK_LABELS[code] : UNKNOWN_CLIENT_FALLBACK;
+}
+
+function allowed(value, set) {
+    return set.has(value) ? value : value === null || value === undefined ? "unknown" : "other";
+}
+
+function finiteOrNull(value) {
+    return Number.isFinite(value) ? value : null;
 }
 
 function connectionState(snapshot) {
@@ -96,13 +109,12 @@ function activeTransport(snapshot) {
 function fallbackReason(snapshot, transport) {
     const reasons = [];
     if (snapshot.transport === "mirror" && snapshot.deviceKind === "emulator") {
-        const serverReason = redactDiagnosticText(snapshot.transportReason);
+        const serverReason = classifyGrpcFailure(snapshot.transportReason);
         reasons.push(serverReason ? `gRPC unavailable: ${serverReason}` : "gRPC unavailable");
     }
     if (transport === "screenshots") {
-        const clientReason = redactDiagnosticText(snapshot.clientFallbackReason);
-        if (clientReason) {
-            reasons.push(clientReason);
+        if (snapshot.clientFallbackReason) {
+            reasons.push(clientFallbackLabel(snapshot.clientFallbackReason));
         } else if (snapshot.hasVideoDecoder === false) {
             reasons.push("This canvas cannot decode video");
         }
@@ -145,33 +157,36 @@ function formatValue(value) {
 }
 
 /**
- * A plain-text report safe to paste anywhere. Only allowlisted fields are
- * included, and free-form strings are redacted again even though describe
- * already did, so a future field cannot slip through unredacted.
+ * A plain-text report safe to paste anywhere. Each line is built from a fixed
+ * label, a number or an allowlisted value, so a new snapshot field or an
+ * unexpected host message cannot reach it.
  */
 export function buildDiagnosticReport(snapshot = {}, { now = new Date() } = {}) {
     const view = describeConnection(snapshot);
+    const lastFrameAt = finiteOrNull(snapshot.lastFrameAt);
     const lastFrameAge =
-        Number.isFinite(snapshot.lastFrameAt) && snapshot.lastFrameAt > 0
-            ? `${Math.max(0, Math.round((now.getTime() - snapshot.lastFrameAt) / 100) / 10)} s ago`
+        lastFrameAt && lastFrameAt > 0
+            ? `${Math.max(0, Math.round((now.getTime() - lastFrameAt) / 100) / 10)} s ago`
             : "none yet";
+    const androidVersion = /^\d{1,2}(?:\.\d{1,2}){0,2}$/.test(String(snapshot.androidVersion ?? "")) ? snapshot.androidVersion : null;
+    const apiLevel = Number.isInteger(snapshot.apiLevel) ? snapshot.apiLevel : null;
     const lines = [
         "Android Emulator canvas diagnostics",
         `Generated: ${now.toISOString()}`,
         `Transport: ${view.transportLabel}`,
         `Connection: ${view.connectionLabel}`,
-        `Fallback reason: ${redactDiagnosticText(view.fallbackReason) || "none"}`,
-        `Host transport: ${formatValue(redactDiagnosticText(snapshot.transport, { maxLength: 24 }))}`,
-        `Device kind: ${formatValue(redactDiagnosticText(snapshot.deviceKind, { maxLength: 24 }))}`,
-        `Device state: ${formatValue(redactDiagnosticText(snapshot.deviceState, { maxLength: 24 }))}`,
-        `Android: ${formatValue(redactDiagnosticText(snapshot.androidVersion, { maxLength: 24 }))} (API ${formatValue(Number.isFinite(snapshot.apiLevel) ? snapshot.apiLevel : null)})`,
-        `Requested: ${formatValue(Number.isFinite(snapshot.requestedFps) ? snapshot.requestedFps : null)} fps at ${formatValue(Number.isFinite(snapshot.resolution) ? snapshot.resolution : null)}% resolution`,
+        `Fallback reason: ${view.fallbackReason || "none"}`,
+        `Host transport: ${allowed(snapshot.transport, HOST_TRANSPORTS)}`,
+        `Device kind: ${allowed(snapshot.deviceKind, DEVICE_KINDS)}`,
+        `Device state: ${allowed(snapshot.deviceState, DEVICE_STATES)}`,
+        `Android: ${formatValue(androidVersion)} (API ${formatValue(apiLevel)})`,
+        `Requested: ${formatValue(finiteOrNull(snapshot.requestedFps))} fps at ${formatValue(finiteOrNull(snapshot.resolution))}% resolution`,
         `Measured: ${view.fps === null ? "n/a" : `${view.fps} fps`}`,
         `Last frame: ${lastFrameAge}`,
         `Video decoder: ${snapshot.hasVideoDecoder ? "available" : "unavailable"}${snapshot.decoderFailed ? " (failed for this device)" : ""}`,
-        `Event stream: ${formatValue(redactDiagnosticText(snapshot.events, { maxLength: 24 }))} (${view.eventErrors} errors)`,
+        `Event stream: ${allowed(snapshot.events, EVENT_STATES)} (${view.eventErrors} errors)`,
         `Stream reconnects: ${view.reconnects}`,
-        `Screen error: ${redactDiagnosticText(snapshot.screenError) || "none"}`,
+        `Screen error: ${snapshot.screenError ? "shown (details omitted)" : "none"}`,
     ];
     return lines.join("\n");
 }
@@ -189,13 +204,30 @@ export function createConnectionDiagnostics({
 }) {
     let copyStatusTimer = null;
     let lastView = null;
+    // After a blocked copy the user has to copy the selected report by hand. The
+    // panel refreshes every second, and replacing the text would drop that
+    // selection, so the report stays pinned until the next copy or the panel closes.
+    let pinnedReport = null;
 
     function setOpen(open) {
         elements.panel.hidden = !open;
         elements.toggle.setAttribute("aria-expanded", String(open));
         if (open) {
             render();
+        } else {
+            pinnedReport = null;
         }
+    }
+
+    function selectForManualCopy(report) {
+        pinnedReport = report;
+        elements.report.textContent = report;
+        // A selection inside a closed <details> is neither visible nor focusable.
+        const details = elements.reportDetails ?? elements.report.closest?.("details");
+        if (details) {
+            details.open = true;
+        }
+        selectText(elements.report);
     }
 
     function setCopyStatus(message, tone = "info") {
@@ -211,12 +243,13 @@ export function createConnectionDiagnostics({
     }
 
     async function copyReport() {
+        pinnedReport = null;
         const report = buildDiagnosticReport(getSnapshot(), { now: now() });
         elements.report.textContent = report;
         // Looked up per copy: the page's clipboard can appear or change after load.
         const target = clipboard === undefined ? globalThis.navigator?.clipboard : clipboard;
         if (typeof target?.writeText !== "function") {
-            selectText(elements.report);
+            selectForManualCopy(report);
             setCopyStatus("Clipboard unavailable. The report is selected; copy it manually.", "error");
             return false;
         }
@@ -225,7 +258,7 @@ export function createConnectionDiagnostics({
             setCopyStatus("Diagnostic report copied.");
             return true;
         } catch {
-            selectText(elements.report);
+            selectForManualCopy(report);
             setCopyStatus("Copy was blocked. The report is selected; copy it manually.", "error");
             return false;
         }
@@ -249,7 +282,9 @@ export function createConnectionDiagnostics({
         elements.reason.textContent = view.fallbackReason || "None";
         elements.reconnects.textContent = String(view.reconnects);
         elements.fps.textContent = view.fps === null ? "n/a" : `${view.fps} fps`;
-        elements.report.textContent = buildDiagnosticReport(snapshot, { now: now() });
+        if (pinnedReport === null) {
+            elements.report.textContent = buildDiagnosticReport(snapshot, { now: now() });
+        }
         return view;
     }
 
@@ -265,7 +300,18 @@ export function createConnectionDiagnostics({
         render();
     }
 
-    return { bind, render, copyReport, setOpen, get view() { return lastView; } };
+    return {
+        bind,
+        render,
+        copyReport,
+        setOpen,
+        get view() {
+            return lastView;
+        },
+        get reportPinned() {
+            return pinnedReport !== null;
+        },
+    };
 }
 
 function defaultSelectText(element) {
@@ -274,8 +320,22 @@ function defaultSelectText(element) {
     if (!selection || !range) {
         return;
     }
-    range.selectNodeContents(element);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    element.focus?.();
+    const select = () => {
+        // Focus first: moving focus afterwards can collapse a selection just made.
+        element.focus?.({ preventScroll: true });
+        range.selectNodeContents(element);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    };
+    select();
+    // Chrome can ignore focus() on content of a <details> opened in the same task
+    // until it has re-run style; retry once the new layout is in place.
+    const doc = element.ownerDocument;
+    if (doc && doc.activeElement !== element && typeof globalThis.requestAnimationFrame === "function") {
+        globalThis.requestAnimationFrame(() => {
+            if (element.isConnected && doc.activeElement !== element) {
+                select();
+            }
+        });
+    }
 }
