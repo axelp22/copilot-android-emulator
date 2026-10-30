@@ -230,7 +230,17 @@ presents that identity when attaching to it.
   stopped the same way). With the configuration cache reused, Gradle skips init
   scripts, so no record is written and the executor is identified by ancestry alone.
   A build script that deliberately detaches processes from Gradle's tree is not
-  tracked; standard AGP builds do not. On Windows, `taskkill /T /F` stops the tree
+  tracked; standard AGP builds do not. Processes are also tagged through their
+  environment. macOS hides the environment of platform and hardened binaries (`/bin/sh`,
+  app helpers); such a process of your user, started during the build and not
+  attributable to a shown ancestor, counts as possibly the build's — keeping the stop
+  unconfirmed and naming its executable — only when that executable is under a system
+  path (`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/libexec`, `/System`) or the build's
+  JDK, Android SDK/NDK, Gradle user home or project directory, or cannot be read.
+  Helpers elsewhere, such as a browser's crash handler inside an `.app` bundle, are
+  not the build's. A hidden-environment binary a build runs from another location
+  (for example a Homebrew tool via an `Exec` task) that detaches from its tree would
+  not be tracked. On Windows, `taskkill /T /F` stops the tree
   under the wrapper, and the stop is confirmed only if it succeeded and the recorded
   executor is no longer running; start times are not checked there, so a live
   recorded pid is never killed but leaves the stop unconfirmed (below). A forced
