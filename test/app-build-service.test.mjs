@@ -12,6 +12,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { extensionModule, extensionRoot, isAlive, sleep, tempDir, waitUntil } from "./helpers.mjs";
 
 const {
@@ -1017,7 +1018,7 @@ test("waiting for a lingering executor keeps the process alive until the build s
     await writeFile(
         script,
         [
-            `const { AppBuildService } = await import(${JSON.stringify(path.join(extensionRoot, "lib", "app-build-service.mjs"))});`,
+            `const { AppBuildService } = await import(${JSON.stringify(pathToFileURL(path.join(extensionRoot, "lib", "app-build-service.mjs")).href)});`,
             "const manager = { snapshot: (id) => ({ id, serial: 's' }), notifyDevice() {}, async launchApp() {} };",
             `const service = new AppBuildService({ manager, executorDir: ${JSON.stringify(executorDir)} });`,
             `service.setWorkingDirectory(${JSON.stringify(root)});`,

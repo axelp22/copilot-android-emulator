@@ -5,10 +5,9 @@
  *
  *   VERIFY_BOOT_AVD=lowend_api34 node scripts/verify/boot-lifecycle.mjs
  */
-import path from "node:path";
-import { adb, config, createReporter, extensionRoot } from "./_shared.mjs";
+import { adb, config, createReporter, extensionImport } from "./_shared.mjs";
 
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
 
 const report = createReporter("BOOT LIFECYCLE");
 const manager = new DeviceSessionManager({ onDiagnostic: (message) => report.note(message) });

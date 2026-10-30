@@ -485,7 +485,9 @@ VERIFY_AGP_SERIAL=emulator-5580 node scripts/verify/agp-fixture.mjs
 `agp-fixture.mjs` builds, installs and launches the checked-in AGP fixture
 ([`test/fixtures/agp-app/`](test/fixtures/agp-app/)) with real Gradle. It never picks
 a device on its own: it refuses to start unless `VERIFY_AGP_SERIAL` names a booted
-`emulator-<port>`, and uninstalls the fixture afterwards.
+`emulator-<port>`, refuses if the fixture package is already installed or another
+session holds that device in the shared device queue, and uninstalls only the
+package it installed afterwards.
 
 See [`scripts/verify/README.md`](scripts/verify/README.md) for prerequisites and the
 environment variables that select which device to target.

@@ -1,10 +1,15 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 export const extensionRoot = path.resolve(here, "..", "..", ".github", "extensions", "android-emulator");
+
+/** Imports an extension module. Dynamic import() needs a file: URL: a raw absolute Windows path reads as a URL scheme. */
+export function extensionImport(...segments) {
+    return import(pathToFileURL(path.join(extensionRoot, ...segments)).href);
+}
 
 /** Every knob these suites need, overridable from the environment. */
 export const config = {

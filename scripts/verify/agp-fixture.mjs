@@ -18,7 +18,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkDisposableTarget } from "./_disposable-target.mjs";
-import { createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { checkPackageAbsent, cleanupFixture, hasPackage, holdFixtureDevice, sameExecutable } from "./_fixture-package.mjs";
+import { createReporter, extensionImport, sleep } from "./_shared.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtureRoot = path.resolve(here, "..", "..", "test", "fixtures", "agp-app");
@@ -26,7 +27,8 @@ const FIXTURE_PACKAGE = "dev.copilot.androidemulator.fixture";
 
 const settings = {
     serial: (process.env.VERIFY_AGP_SERIAL ?? "").trim(),
-    adb: process.env.VERIFY_ADB || "adb",
+    adbOverride: (process.env.VERIFY_ADB ?? "").trim(),
+    adb: null,
     gradle: process.env.VERIFY_GRADLE || "gradle",
     gradleVersion: process.env.VERIFY_AGP_GRADLE_VERSION || "8.13",
     agpVersion: (process.env.VERIFY_AGP_VERSION ?? "").trim(),
@@ -35,7 +37,11 @@ const settings = {
 
 const report = createReporter("AGP FIXTURE");
 
+/** Runs a tool without a shell. A `.js`/`.cjs`/`.mjs` path (a test stand-in) runs under this node, so it works on Windows too. */
 function run(command, args, options = {}) {
+    if (/\.[cm]?js$/i.test(command)) {
+        [command, args] = [process.execPath, [command, ...args]];
+    }
     return new Promise((resolve, reject) => {
         execFile(command, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
             if (error) {
@@ -63,21 +69,81 @@ if (!settings.serial) {
     process.exit(2);
 }
 
+function refuse(code, reason) {
+    console.error(`AGP FIXTURE: refusing to run (${code}). ${reason}`);
+    process.exit(2);
+}
+
+// The extension and Gradle find adb through ANDROID_HOME / the SDK, not VERIFY_ADB,
+// so the suite uses that same adb unless told otherwise (resolving it runs no device command).
+const { resolveToolchain } = await extensionImport("lib", "adb.mjs");
+const extensionAdb = (await resolveToolchain()).adbPath;
+settings.adb = settings.adbOverride || extensionAdb;
+if (!settings.adb) {
+    refuse("adb_not_found", "No adb found. Set ANDROID_HOME to an SDK with platform-tools.");
+}
+
 const target = await checkDisposableTarget({ serial: settings.serial, runAdb });
 if (!target.ok) {
-    console.error(`AGP FIXTURE: refusing to run (${target.code}). ${target.reason}`);
-    process.exit(2);
+    refuse(target.code, target.reason);
 }
 report.note(`target ${target.serial}${target.avdName ? ` (AVD ${target.avdName})` : ""}`);
 
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
-const { DeviceQueue } = await import(path.join(extensionRoot, "lib", "device-queue.mjs"));
+// Only an app the suite installed itself may be removed: refuse if it is already there.
+// Checked again below once the device is held, which is the check that counts.
+const absent = await checkPackageAbsent({ packageName: FIXTURE_PACKAGE, runAdb });
+if (!absent.ok) {
+    refuse(absent.code, absent.reason);
+}
+
+// The guard above used VERIFY_ADB; the build and install use the extension's adb.
+// A different binary could talk to a different server, so the two must agree.
+if (settings.adbOverride && !(await sameExecutable(settings.adbOverride, extensionAdb))) {
+    refuse(
+        "adb_mismatch",
+        `VERIFY_ADB (${settings.adbOverride}) is not the adb the extension and Gradle use (${extensionAdb ?? "none found"}). ` +
+            "Unset VERIFY_ADB, or point ANDROID_HOME at the SDK that contains it.",
+    );
+}
+
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
+
+// --- hold the device in the shared queue every Copilot session uses -----------
+// The manager keeps its default queue and claim stores, so a session driving this
+// serial, or another fixture run, makes the suite refuse instead of installing
+// alongside it. The hold lasts until cleanup has finished.
+const manager = new DeviceSessionManager({ onDiagnostic: () => {} });
+/** Gives up the shared hold (and anything else the manager holds) before a refusal. */
+async function refuseHeld(code, reason) {
+    await manager.dispose().catch(() => {});
+    refuse(code, reason);
+}
+let deviceId;
+try {
+    // Always resolve by the explicit serial; never let the manager choose.
+    deviceId = await manager.resolveDeviceId(settings.serial);
+    const device = manager.state.getDeviceOrThrow(deviceId);
+    if (device.serial !== settings.serial || device.kind !== "emulator") {
+        throw new Error(`resolved ${deviceId} (${device.serial}, ${device.kind}) instead of emulator ${settings.serial}`);
+    }
+} catch (error) {
+    await refuseHeld("target_not_resolved", String(error?.message ?? error));
+}
+const hold = await holdFixtureDevice({ manager, deviceId, serial: settings.serial });
+if (!hold.ok) {
+    await refuseHeld(hold.code, hold.reason);
+}
+const absentWhileHeld = await checkPackageAbsent({ packageName: FIXTURE_PACKAGE, runAdb });
+if (!absentWhileHeld.ok) {
+    await refuseHeld(absentWhileHeld.code, absentWhileHeld.reason);
+}
+report.assert(true, "the device is held in the shared device queue", `${deviceId} as ${hold.owner.sessionLabel}`);
 
 const scratch = await mkdtemp(path.join(os.tmpdir(), "agp-fixture-"));
 const project = path.join(scratch, "project");
 const wrapperDir = path.join(scratch, "wrapper");
-let manager = null;
-let installedByUs = false;
+let installAttempted = false;
+let buildsStopped = false;
 
 try {
     // --- a private copy of the fixture with a generated wrapper ---------------
@@ -105,21 +171,10 @@ try {
     report.assert(true, "the fixture is copied with a generated wrapper", `Gradle ${settings.gradleVersion}`);
 
     // --- the extension, pointed at the copy and the named emulator only --------
-    manager = new DeviceSessionManager({ onDiagnostic: () => {} });
+    // Artifacts and the project stay in the scratch directory; only the queue is shared.
     manager.setArtifactsRoot(path.join(scratch, "artifacts"));
-    manager.queue = new DeviceQueue({
-        root: path.join(scratch, "queue"),
-        owner: { sessionId: "verify-agp-fixture", sessionLabel: "agp-fixture-suite" },
-    });
     manager.build.setWorkingDirectory(project);
-
-    // Always resolve by the explicit serial; never let the manager choose.
-    const deviceId = await manager.resolveDeviceId(settings.serial);
-    const device = manager.state.getDeviceOrThrow(deviceId);
-    if (device.serial !== settings.serial || device.kind !== "emulator") {
-        throw new Error(`resolved ${deviceId} (${device.serial}, ${device.kind}) instead of emulator ${settings.serial}`);
-    }
-    report.assert(true, "the extension resolves the named emulator", `${deviceId} -> ${device.serial}`);
+    report.assert(true, "the extension resolves the named emulator", `${deviceId} -> ${settings.serial}`);
 
     const plan = await manager.refreshBuildPlan();
     report.assert(plan.available === true, "the fixture is detected as a Gradle project", String(plan.gradleRoot));
@@ -129,7 +184,8 @@ try {
     report.note(`building with AGP ${settings.agpVersion || "from gradle.properties"}; the first run downloads dependencies`);
     let result = null;
     let failure = null;
-    installedByUs = true;
+    // The package was confirmed absent above, so whatever is installed from here on is ours.
+    installAttempted = true;
     try {
         result = await manager.buildInstallLaunch({ deviceId });
     } catch (error) {
@@ -139,7 +195,7 @@ try {
     report.assert(result?.packageName === FIXTURE_PACKAGE, "the application id comes from the real build output", String(result?.packageName));
 
     const packages = await runAdb(["shell", "pm", "list", "packages", FIXTURE_PACKAGE]).catch(() => "");
-    report.assert(packages.includes(`package:${FIXTURE_PACKAGE}`), "the fixture is installed on the target emulator");
+    report.assert(hasPackage(packages, FIXTURE_PACKAGE), "the fixture is installed on the target emulator");
 
     let focused = "";
     for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -156,23 +212,38 @@ try {
     );
 
     const [queueAfter] = await manager.queue.status([deviceId]);
-    report.assert(!queueAfter.holder, "the device is released after the build");
+    report.assert(queueAfter.holder?.isMine === true, "the device stays held by this run after the build", queueAfter.holder?.sessionLabel ?? "no holder");
 } catch (error) {
     report.assert(false, "the suite ran to completion", String(error?.message ?? error).slice(0, 300));
 } finally {
-    // --- cleanup: only the fixture package, only on the named serial ------------
-    if (installedByUs) {
-        await runAdb(["shell", "am", "force-stop", FIXTURE_PACKAGE]).catch(() => {});
-        await runAdb(["uninstall", FIXTURE_PACKAGE]).catch(() => {});
-        const left = await runAdb(["shell", "pm", "list", "packages", FIXTURE_PACKAGE]).catch(() => "");
-        report.assert(!left.includes(`package:${FIXTURE_PACKAGE}`), "the fixture is uninstalled afterwards");
+    // --- cleanup: builds confirmed stopped first, then only the fixture package ---
+    const { checks, notes } = await cleanupFixture({
+        packageName: FIXTURE_PACKAGE,
+        serial: settings.serial,
+        runAdb,
+        // stopAll throws unless every build is confirmed stopped; the hold is kept meanwhile.
+        stopBuilds: async () => {
+            await manager.build.stopAll();
+            buildsStopped = true;
+        },
+        installAttempted,
+        scratch,
+        keepScratch: settings.keepProject,
+        removeScratch: () => rm(scratch, { recursive: true, force: true }),
+    });
+    for (const check of checks) {
+        report.assert(check.ok, check.label, check.detail);
     }
-    await manager?.dispose().catch(() => {});
-    if (settings.keepProject) {
-        report.note(`kept ${scratch}`);
-    } else {
-        await rm(scratch, { recursive: true, force: true }).catch(() => {});
+    for (const note of notes) {
+        report.note(note);
     }
+    // Only now is the device given back. dispose() keeps it held if a build is unconfirmed.
+    if (buildsStopped) {
+        await hold.release().catch(() => {});
+    }
+    await manager.dispose().catch((error) => {
+        report.assert(false, "the device is released after cleanup", `${error?.code ?? ""} ${error?.message ?? error}`.trim());
+    });
 }
 
 report.finish();

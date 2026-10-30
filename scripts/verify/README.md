@@ -62,7 +62,18 @@ checks, addressing only that serial with `adb -s`, that:
    `host:port` serials are refused);
 2. adb reports it as `device` (not offline or unauthorized);
 3. it is an emulator (`ro.kernel.qemu` or `ro.boot.qemu` is `1`);
-4. it has finished booting (`sys.boot_completed` is `1`).
+4. it has finished booting (`sys.boot_completed` is `1`);
+5. the adb it uses is the one the extension and Gradle use (`adb_mismatch`
+   otherwise: they find adb through `ANDROID_HOME`, not `VERIFY_ADB`);
+6. `dev.copilot.androidemulator.fixture` is **not** already installed
+   (`package_present`), and that this could be verified (`package_check_failed`).
+   The suite only ever removes an app it installed;
+7. it can take the device in the extension's **shared device queue**
+   (`~/.copilot/android-emulator/queue`, the one every Copilot session uses) under an
+   identity unique to the run (`device_busy` otherwise). A session using that serial,
+   or a second fixture run, therefore makes it refuse instead of installing alongside.
+   The package check is repeated once the device is held. Only the queue is shared;
+   the project, wrapper and artifacts stay in the run's scratch directory.
 
 Any failure exits with status 2 and a reason code, before a build starts.
 
@@ -87,20 +98,28 @@ Requirements:
 
 The suite copies the fixture into a scratch directory, generates a wrapper there,
 builds `installDebug`, checks that the package is installed and in the foreground,
-then force-stops and uninstalls it and deletes the scratch directory (whether or not
-the checks passed). Nothing is written into the repository.
+then cleans up whether or not the checks passed. Cleanup first confirms every build
+has stopped, so no Gradle task can reinstall afterwards; then it force-stops and
+uninstalls the package (only if the run got as far as a build) and verifies it is
+gone; then it deletes the scratch directory and finally releases the device hold.
+A removal it could not verify, a scratch directory it could not delete, or a build
+it could not confirm stopped fails the run. In the last case it leaves the package,
+the scratch directory and the device hold in place and says so, rather than
+deleting files from under a live build; stop that Gradle process and clean up by
+hand. Nothing is written into the repository.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `VERIFY_AGP_SERIAL` | none (required) | serial of the disposable emulator, e.g. `emulator-5580` |
-| `VERIFY_ADB` | `adb` | path to adb |
+| `VERIFY_ADB` | the extension's SDK adb | path to adb; must be the same adb the extension resolves |
 | `VERIFY_GRADLE` | `gradle` | Gradle used only to generate the wrapper |
 | `VERIFY_AGP_GRADLE_VERSION` | `8.13` | Gradle version the wrapper pins |
 | `VERIFY_AGP_VERSION` | `fixtureAgpVersion` in the fixture | override the AGP version for this run |
 | `VERIFY_AGP_KEEP` | unset | `1` keeps the scratch directory for inspection |
 
-`test/agp-fixture-harness.test.mjs` (part of `npm test`) covers the target guard and
-the refusals with a fake adb, so the safety checks are exercised without hardware.
+`test/agp-fixture-harness.test.mjs` (part of `npm test`) covers the target guard,
+the refusals and cleanup with a fake adb, and two runs contending for one device in
+a temporary shared queue, so the safety checks are exercised without hardware.
 
 `rendered-canvas.mjs` needs a live canvas URL. Ask Copilot to open the Android
 Emulator canvas, take the URL it reports, then:
