@@ -103,10 +103,15 @@ has stopped, so no Gradle task can reinstall afterwards; then it force-stops and
 uninstalls the package (only if the run got as far as a build) and verifies it is
 gone; then it deletes the scratch directory and finally releases the device hold.
 A removal it could not verify, a scratch directory it could not delete, or a build
-it could not confirm stopped fails the run. In the last case it leaves the package,
-the scratch directory and the device hold in place and says so, rather than
-deleting files from under a live build; stop that Gradle process and clean up by
-hand. Nothing is written into the repository.
+it could not confirm stopped fails the run. In the last case it does not exit: it
+prints a `FAIL` line with manual recovery steps (the Gradle pid, the
+`adb -s <serial> uninstall` command and the scratch path), leaves the package and
+scratch directory alone, and keeps running so the shared device hold stays renewed
+and other sessions stay excluded. It re-checks every few seconds; once Gradle has
+exited it finishes cleanup, releases the device and exits non-zero. One Ctrl-C only
+warns; a second abandons supervision and exits 1, after which the hold expires
+within a minute, so follow the printed recovery steps before using the device.
+Nothing is written into the repository.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -118,7 +123,8 @@ hand. Nothing is written into the repository.
 | `VERIFY_AGP_KEEP` | unset | `1` keeps the scratch directory for inspection |
 
 `test/agp-fixture-harness.test.mjs` (part of `npm test`) covers the target guard,
-the refusals and cleanup with a fake adb, and two runs contending for one device in
+the refusals and cleanup with a fake adb, supervision of an unconfirmed Gradle stop
+(hold kept and renewed until exit, two-signal abandon), and two runs contending for one device in
 a temporary shared queue, so the safety checks are exercised without hardware.
 
 `rendered-canvas.mjs` needs a live canvas URL. Ask Copilot to open the Android

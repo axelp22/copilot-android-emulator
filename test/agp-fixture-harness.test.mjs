@@ -6,11 +6,12 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
 import { checkDisposableTarget } from "../scripts/verify/_disposable-target.mjs";
-import { checkPackageAbsent, cleanupFixture, hasPackage, holdFixtureDevice } from "../scripts/verify/_fixture-package.mjs";
+import { checkPackageAbsent, cleanupFixture, finishFixtureRun, hasPackage, holdFixtureDevice } from "../scripts/verify/_fixture-package.mjs";
 import { extensionModule, repoRoot, tempDir } from "./helpers.mjs";
 
 const fixtureRoot = path.join(repoRoot, "test", "fixtures", "agp-app");
@@ -384,4 +385,162 @@ test("the suite uses the extension's shared queue rather than a private one", as
     const source = await readFile(path.join(repoRoot, "scripts", "verify", "agp-fixture.mjs"), "utf8");
     assert.doesNotMatch(source, /new DeviceQueue|\.queue\s*=/);
     assert.match(source, /holdFixtureDevice\(/);
+});
+
+/** A reporter that records instead of exiting, in the order calls happen. */
+function recordingReport(log) {
+    const report = { checks: [], notes: [], finished: false };
+    report.assert = (ok, label, detail = "") => report.checks.push({ ok, label, detail });
+    report.note = (note) => report.notes.push(note);
+    report.skip = () => {};
+    report.finish = () => {
+        report.finished = true;
+        log.push("finish");
+    };
+    return report;
+}
+
+/**
+ * The suite's end-of-run path with the real extension manager and shared queue; only
+ * the build service is faked so Gradle can stay unconfirmed until `gradle.exited`.
+ */
+async function supervisedRun(t, { pollMs = 20 } = {}) {
+    const dir = await tempDir(t, "agp-fixture-supervise-");
+    const queueRoot = path.join(dir, "queue");
+    const claimsRoot = path.join(dir, "claims");
+    const manager = await sharedQueueManager(queueRoot, claimsRoot);
+    const rival = await sharedQueueManager(queueRoot, claimsRoot);
+    t.after(async () => {
+        await manager.dispose().catch(() => {});
+        await rival.dispose().catch(() => {});
+    });
+    const deviceId = "emulator-5580";
+    const hold = await holdFixtureDevice({ manager, deviceId, serial: deviceId, runId: "44444444-run-sup" });
+    assert.equal(hold.ok, true);
+
+    const log = [];
+    const gradle = { exited: false, stopAttempts: 0 };
+    const unconfirmed = () =>
+        Object.assign(new Error(`Gradle could not be confirmed stopped for ${deviceId}`), {
+            code: "build_stop_unconfirmed",
+            details: { deviceIds: [deviceId] },
+        });
+    manager.build = {
+        runs: new Map([[deviceId, { orphanPid: 4242 }]]),
+        stopAll: async () => {
+            gradle.stopAttempts += 1;
+            if (!gradle.exited) {
+                throw unconfirmed();
+            }
+        },
+    };
+    let beats = 0;
+    const { runAdb } = fakeAdb({ [LIST]: "" });
+    const signals = new EventEmitter();
+    const exits = [];
+    const report = recordingReport(log);
+    const done = finishFixtureRun({
+        packageName: PKG,
+        serial: deviceId,
+        runAdb: async (args) => {
+            log.push(`adb ${args.join(" ")}`);
+            return runAdb(args);
+        },
+        stopBuilds: () => manager.build.stopAll(),
+        installAttempted: true,
+        scratch: "/tmp/agp-fixture-sup",
+        removeScratch: async () => log.push("removeScratch"),
+        releaseHold: async () => {
+            log.push("releaseHold");
+            await hold.release();
+        },
+        dispose: async () => {
+            log.push("dispose");
+            await manager.dispose();
+        },
+        heartbeat: async () => {
+            beats += 1;
+            await manager.queue.beat();
+        },
+        orphanPids: () => [...manager.build.runs.values()].map((run) => run.orphanPid),
+        report,
+        pollMs,
+        signals,
+        exit: (code) => exits.push(code),
+    });
+    const until = async (predicate) => {
+        while (!predicate()) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+    };
+    return { manager, rival, deviceId, log, gradle, report, signals, exits, done, until, beats: () => beats };
+}
+
+test("an unconfirmed Gradle stop keeps the run alive and the shared hold live until it exits", { timeout: 20_000 }, async (t) => {
+    const run = await supervisedRun(t);
+    await run.until(() => run.gradle.stopAttempts >= 3 && run.beats() >= 2);
+
+    // Still supervising: nothing uninstalled, released, disposed or exited.
+    assert.equal(run.report.finished, false, "report.finish (process.exit) is not reached while Gradle is unconfirmed");
+    assert.deepEqual(run.log, [], "no uninstall, scratch removal, release or dispose before confirmation");
+    assert.deepEqual(run.exits, []);
+    assert.ok(run.report.notes.some((note) => /^FAIL: Gradle could not be confirmed stopped/.test(note)));
+    assert.ok(run.report.notes.some((note) => /pid 4242/.test(note) && /adb -s emulator-5580 uninstall/.test(note)));
+
+    // Other sessions stay excluded through the same shared store, and the hold is renewed.
+    const [status] = await run.manager.queue.status([run.deviceId]);
+    assert.equal(status.holder?.isMine, true);
+    const blocked = await holdFixtureDevice({ manager: run.rival, deviceId: run.deviceId, serial: run.deviceId, runId: "55555555-rival" });
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.code, "device_busy");
+
+    run.gradle.exited = true;
+    await run.done;
+    assert.deepEqual(run.log, [
+        `adb shell am force-stop ${PKG}`,
+        `adb uninstall ${PKG}`,
+        `adb ${LIST}`,
+        "removeScratch",
+        "releaseHold",
+        "dispose",
+        "finish",
+    ]);
+    assert.ok(run.report.notes.includes("Gradle has since exited; finishing cleanup."));
+    assert.ok(run.report.checks.some((check) => !check.ok && check.label === "builds are confirmed stopped before cleanup"), "the run still fails");
+    assert.ok(run.report.checks.some((check) => check.ok && check.label === "the fixture is uninstalled afterwards"));
+    assert.deepEqual(run.exits, []);
+
+    const after = await holdFixtureDevice({ manager: run.rival, deviceId: run.deviceId, serial: run.deviceId, runId: "66666666-rival" });
+    assert.equal(after.ok, true, "the device is free only after confirmed cleanup");
+    await after.release();
+});
+
+test("one signal while supervising only warns; a second abandons with recovery steps and exit 1", { timeout: 20_000 }, async (t) => {
+    const run = await supervisedRun(t, { pollMs: 60_000 });
+    await run.until(() => run.report.notes.length > 0);
+
+    run.signals.emit("SIGINT", "SIGINT");
+    assert.ok(run.report.notes.some((note) => /SIGINT received, but Gradle is still unconfirmed/.test(note)));
+    assert.deepEqual(run.exits, []);
+
+    run.signals.emit("SIGTERM", "SIGTERM");
+    await run.done;
+    assert.deepEqual(run.exits, [1]);
+    const abandoned = run.report.checks.find((check) => check.label === "the device stays held until Gradle is confirmed stopped");
+    assert.equal(abandoned?.ok, false);
+    assert.match(abandoned.detail, /abandoned on SIGTERM/);
+    assert.match(abandoned.detail, /adb -s emulator-5580 uninstall/);
+    assert.equal(run.report.finished, false);
+    assert.deepEqual(run.log, [], "abandoning does not uninstall, release or dispose");
+    assert.equal(run.signals.listenerCount("SIGINT") + run.signals.listenerCount("SIGTERM"), 0, "signal handlers are removed");
+});
+
+test("the suite ends through finishFixtureRun and never exits on its own after cleanup", async () => {
+    const source = await readFile(path.join(repoRoot, "scripts", "verify", "agp-fixture.mjs"), "utf8");
+    const tail = source.slice(source.lastIndexOf("} finally {"));
+    assert.match(tail, /await finishFixtureRun\(\{/);
+    assert.match(tail, /stopBuilds: \(\) => manager\.build\.stopAll\(\)/);
+    assert.match(tail, /heartbeat: \(\) => manager\.queue\.beat\(\)/);
+    assert.doesNotMatch(tail, /report\.finish\(|process\.exit\(|cleanupFixture\(/);
+    assert.doesNotMatch(source, /cleanupFixture/);
 });

@@ -18,7 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkDisposableTarget } from "./_disposable-target.mjs";
-import { checkPackageAbsent, cleanupFixture, hasPackage, holdFixtureDevice, sameExecutable } from "./_fixture-package.mjs";
+import { checkPackageAbsent, finishFixtureRun, hasPackage, holdFixtureDevice, sameExecutable } from "./_fixture-package.mjs";
 import { createReporter, extensionImport, sleep } from "./_shared.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -143,7 +143,6 @@ const scratch = await mkdtemp(path.join(os.tmpdir(), "agp-fixture-"));
 const project = path.join(scratch, "project");
 const wrapperDir = path.join(scratch, "wrapper");
 let installAttempted = false;
-let buildsStopped = false;
 
 try {
     // --- a private copy of the fixture with a generated wrapper ---------------
@@ -216,34 +215,22 @@ try {
 } catch (error) {
     report.assert(false, "the suite ran to completion", String(error?.message ?? error).slice(0, 300));
 } finally {
-    // --- cleanup: builds confirmed stopped first, then only the fixture package ---
-    const { checks, notes } = await cleanupFixture({
+    // Cleanup with builds confirmed stopped first. If they cannot be confirmed, this
+    // never returns: the process stays alive holding the device until they are.
+    await finishFixtureRun({
         packageName: FIXTURE_PACKAGE,
         serial: settings.serial,
         runAdb,
-        // stopAll throws unless every build is confirmed stopped; the hold is kept meanwhile.
-        stopBuilds: async () => {
-            await manager.build.stopAll();
-            buildsStopped = true;
-        },
+        // stopAll throws unless every build is confirmed stopped.
+        stopBuilds: () => manager.build.stopAll(),
         installAttempted,
         scratch,
         keepScratch: settings.keepProject,
         removeScratch: () => rm(scratch, { recursive: true, force: true }),
-    });
-    for (const check of checks) {
-        report.assert(check.ok, check.label, check.detail);
-    }
-    for (const note of notes) {
-        report.note(note);
-    }
-    // Only now is the device given back. dispose() keeps it held if a build is unconfirmed.
-    if (buildsStopped) {
-        await hold.release().catch(() => {});
-    }
-    await manager.dispose().catch((error) => {
-        report.assert(false, "the device is released after cleanup", `${error?.code ?? ""} ${error?.message ?? error}`.trim());
+        releaseHold: () => hold.release(),
+        dispose: () => manager.dispose(),
+        heartbeat: () => manager.queue.beat(),
+        orphanPids: () => [...manager.build.runs.values()].map((run) => run.orphanPid),
+        report,
     });
 }
-
-report.finish();

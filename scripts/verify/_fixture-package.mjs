@@ -181,3 +181,121 @@ export async function cleanupFixture({
     }
     return { checks, notes };
 }
+
+/**
+ * Ends a fixture run: cleanup, then release, then the exit report -- and never
+ * exits while a build is unconfirmed.
+ *
+ * When `stopBuilds()` cannot confirm every build stopped, an orphaned Gradle may
+ * still install onto the device. Exiting would end this process's queue heartbeat,
+ * so the shared queue would soon treat the device as free while that Gradle runs.
+ * Instead the process stays alive, keeping the hold, and retries `stopBuilds()`
+ * every `pollMs` until it succeeds; only then does it clean up, release and exit
+ * (always as a failure). A first SIGINT/SIGTERM only warns; a second abandons the
+ * device explicitly, with manual-recovery steps, and exits non-zero.
+ *
+ * `report` is the suite reporter; its `finish()` exits the process.
+ */
+export async function finishFixtureRun({
+    packageName,
+    serial,
+    runAdb,
+    stopBuilds,
+    installAttempted,
+    scratch,
+    keepScratch = false,
+    removeScratch,
+    releaseHold,
+    dispose,
+    report,
+    orphanPids = () => [],
+    heartbeat = async () => {},
+    pollMs = 5_000,
+    signals = process,
+    exit = (code) => process.exit(code),
+}) {
+    let buildsStopped = false;
+    const confirmStop = async () => {
+        await stopBuilds();
+        buildsStopped = true;
+    };
+    const cleanupOptions = { packageName, serial, runAdb, installAttempted, scratch, keepScratch, removeScratch };
+    const record = ({ checks, notes }) => {
+        for (const check of checks) {
+            report.assert(check.ok, check.label, check.detail);
+        }
+        for (const note of notes) {
+            report.note(note);
+        }
+    };
+
+    record(await cleanupFixture({ ...cleanupOptions, stopBuilds: confirmStop }));
+
+    if (!buildsStopped) {
+        const recovery = () => {
+            const pids = orphanPids().filter(Boolean);
+            return (
+                `Manual recovery: stop Gradle${pids.length > 0 ? ` (pid ${pids.join(", ")})` : ""} and its daemons, ` +
+                `then run \`adb -s ${serial} uninstall ${packageName}\` and delete ${scratch}.`
+            );
+        };
+        report.note(
+            `FAIL: Gradle could not be confirmed stopped. This process stays alive and keeps ${serial} held in the ` +
+                `shared device queue until it exits, rechecking every ${Math.round(pollMs / 1000)}s. ${recovery()}`,
+        );
+        let interrupts = 0;
+        let abandon = null;
+        const abandoned = new Promise((resolve) => {
+            abandon = resolve;
+        });
+        const onSignal = (signal) => {
+            interrupts += 1;
+            if (interrupts === 1) {
+                report.note(
+                    `${signal} received, but Gradle is still unconfirmed: exiting now would release ${serial} to other ` +
+                        "sessions while it may still install. Signal again to abandon the hold anyway.",
+                );
+                return;
+            }
+            abandon(signal);
+        };
+        signals.on("SIGINT", onSignal);
+        signals.on("SIGTERM", onSignal);
+        try {
+            while (!buildsStopped) {
+                let timer;
+                const outcome = await Promise.race([
+                    new Promise((resolve) => {
+                        timer = setTimeout(() => resolve("poll"), pollMs);
+                    }),
+                    abandoned,
+                ]);
+                clearTimeout(timer);
+                if (outcome !== "poll") {
+                    report.assert(
+                        false,
+                        "the device stays held until Gradle is confirmed stopped",
+                        `abandoned on ${outcome}: ${serial} is no longer protected from other sessions. ${recovery()}`,
+                    );
+                    exit(1);
+                    return;
+                }
+                // The queue's own heartbeat is unref'd; renew explicitly while supervising.
+                await heartbeat().catch(() => {});
+                await confirmStop().catch(() => {});
+            }
+        } finally {
+            signals.off("SIGINT", onSignal);
+            signals.off("SIGTERM", onSignal);
+        }
+        report.note("Gradle has since exited; finishing cleanup.");
+        record(await cleanupFixture(cleanupOptions));
+    }
+
+    // Only now is the device given back.
+    await releaseHold().catch(() => {});
+    await dispose().catch((error) => {
+        report.assert(false, "the device is released after cleanup", `${error?.code ?? ""} ${error?.message ?? error}`.trim());
+    });
+    report.finish();
+}
