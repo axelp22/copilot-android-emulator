@@ -712,10 +712,20 @@ export async function createCanvasServer({
         return bootstrap.size > 0 ? `?${bootstrap}` : "";
     }
 
+    let closing = null;
+    function assertNotClosing() {
+        if (closing) {
+            throw new AppError("canvas_closed", "The device canvas is closing.", 409);
+        }
+    }
     return {
         url: `http://127.0.0.1:${port}${basePath}/${bootstrapQuery()}`,
         async rebindDevice(nextDeviceId) {
+            assertNotClosing();
             await stopActiveConnections({ blockManualInput: true });
+            // A close that began while connections were stopping wins; rebinding
+            // would resubscribe a server that is being torn down.
+            assertNotClosing();
             deviceId = nextDeviceId;
             acceptingManualInput = true;
             subscribeToDevice();
@@ -724,25 +734,32 @@ export async function createCanvasServer({
             void manager.refreshSharing(deviceId).catch(() => {});
             writeStateEvent();
         },
-        async close() {
-            clearInterval(sharingTimer);
-            unsub?.();
-            unsub = null;
-            unregisterManualInputStop?.();
-            unregisterManualInputStop = null;
-            for (const client of sseClients) {
-                client.end();
-            }
-            sseClients.clear();
-            saturatedClients.clear();
-            await stopActiveConnections({ blockManualInput: true });
-            // close() alone waits for every open connection, and a page still
-            // alive can reconnect its EventSource on a kept-alive socket after the
-            // SSE clients above were ended -- a close that never finishes, which
-            // on shutdown would keep the device from ever being released.
-            const closed = new Promise((resolve) => server.close(() => resolve()));
-            server.closeAllConnections?.();
-            await closed;
+        close() {
+            // Shutdown and onClose can both close the same server; the second
+            // caller must wait for the first rather than tear down twice.
+            closing ??= closeServer();
+            return closing;
         },
     };
+
+    async function closeServer() {
+        clearInterval(sharingTimer);
+        unsub?.();
+        unsub = null;
+        unregisterManualInputStop?.();
+        unregisterManualInputStop = null;
+        for (const client of sseClients) {
+            client.end();
+        }
+        sseClients.clear();
+        saturatedClients.clear();
+        await stopActiveConnections({ blockManualInput: true });
+        // close() alone waits for every open connection, and a page still
+        // alive can reconnect its EventSource on a kept-alive socket after the
+        // SSE clients above were ended -- a close that never finishes, which
+        // on shutdown would keep the device from ever being released.
+        const closed = new Promise((resolve) => server.close(() => resolve()));
+        server.closeAllConnections?.();
+        await closed;
+    }
 }
