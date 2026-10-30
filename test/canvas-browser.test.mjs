@@ -581,8 +581,8 @@ test("a stream that keeps failing settles on screenshots after a bounded number 
     const retries = device.calls.streams - beforeRetries;
     assert.equal(retries, 6, `retries stop (saw ${retries})`);
     const screenshots = device.calls.screenshots;
-    await sleep(500);
-    assert.ok(device.calls.screenshots > screenshots, "screenshots keep coming");
+    // Screenshots refresh every PNG_FALLBACK_INTERVAL_MS after the previous one loads.
+    await waitUntil(() => device.calls.screenshots > screenshots, { message: "screenshots keep coming", timeoutMs: 5_000 });
     assert.equal(await page.evaluate(screenErrorShown), false);
 });
 
