@@ -346,14 +346,19 @@ providers. It records two things:
   `settings.gradle` (`project(":app").projectDir = file("android/phone")`) and a
   custom `buildDir` are therefore found where Gradle puts them.
 - **Install evidence**, when an AGP install task starts: the project, task and
-  directories, written to a file for this build only. This runs on configuration
+  directories, written to a file for this build only. The same is recorded when an
+  application module's `assemble<Variant>` task runs. This runs on configuration
   cache hits too, so it always describes the current build.
 
 When install evidence exists, it decides the app: a custom task like
 `:app:deployWear` that runs `:wear:installDebug`, a bare `deployToDevice`, or an
 install in an included build launches what was installed. Without evidence, a
 module-qualified task such as `:app:installDebug` or `:feature:shop:installPaidDebug`
-is resolved from the layout. An unqualified task like `installDebug` works when
+is resolved from the layout. A run that installed nothing (for example
+`:app:assembleDebug`) is resolved only from the assemble tasks it recorded, at the
+`buildDir` they actually used; if it recorded none for the requested variant, the
+build fails with `app_not_resolved` rather than trusting a layout that a reused
+configuration cache may have left from another configuration. An unqualified task like `installDebug` works when
 exactly one app module has that variant. Any module whose application id cannot be
 read counts as a candidate, so an unreadable module never makes another look unique.
 When the task does not pin down one app (two modules installed, two candidates, or
@@ -365,8 +370,8 @@ resolve it.
 Failures are explicit. If the layout or evidence could not be written (or is
 malformed), the build reports `app_layout_failed` with the error rather than falling
 back to the path convention. A reused configuration cache keeps the layout from the
-build that stored it; that is safe because the layout holds only structure, not
-application ids. With no layout at all (the init script could not be written, or
+build that stored it, so the layout holds only structure, not application ids, and
+is used for answers only when this run's own evidence is unavailable. With no layout at all (the init script could not be written, or
 Gradle failed before configuring the build), the module directory is assumed from
 the task path (`:feature:shop` is `feature/shop`, outputs under its `build/`), and a
 failure says so. Abbreviated project or task names (`:a:iD`) are not expanded.

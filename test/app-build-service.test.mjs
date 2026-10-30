@@ -98,7 +98,8 @@ function shellQuote(value) {
 function evidenceLines(root, installs) {
     return installs.map((install, index) => {
         const record = {
-            format: 1,
+            format: 2,
+            kind: install.kind ?? "install",
             rootDir: root,
             project: install.project,
             task: install.task,
@@ -166,8 +167,13 @@ async function layoutFor(t, root, projects) {
 }
 
 /** One evidence record as readInstallEvidence returns it (paths relative to `root`). */
-function install(root, project, task, dir, buildDir = `${dir}/build`) {
+function assemble(root, project, task, dir, buildDir = `${dir}/build`) {
+    return install(root, project, task, dir, buildDir, "assemble");
+}
+
+function install(root, project, task, dir, buildDir = `${dir}/build`, kind = "install") {
     return {
+        kind,
         rootDir: root,
         project,
         task,
@@ -604,15 +610,69 @@ test("an id recorded at configuration time never overrides the installed artifac
     assert.equal((await resolveApplicationId(root, ":app:assembleDebug", { layout })).applicationId, "com.example.installed");
 });
 
+test("a stale layout record never resolves a non-install task without this run's evidence", async (t) => {
+    // assembleDebug (A) -> installDebug -Pflip (B: build-b, id B) -> assembleDebug (A) on a cache hit:
+    // the root-keyed record still describes B, and B's real metadata remains in build-b.
+    const root = await realpath(await tempDir(t));
+    await writeMetadata(root, "app/build/outputs/apk/debug", { applicationId: "com.example.a", variantName: "debug" });
+    await writeMetadata(root, "app/build-b/outputs/apk/debug", { applicationId: "com.example.b", variantName: "debug" });
+    const layoutDir = await tempDir(t, "layout-");
+    await writeLayout(layoutDir, root, [{ path: ":", dir: "" }, { path: ":app", dir: "app", buildDir: "app/build-b", variants: [{ name: "debug" }] }], {
+        name: layoutRecordName(root),
+    });
+    const layout = await readProjectLayout(layoutDir, root);
+    const ranA = { installs: [assemble(root, ":app", "assembleDebug", "app")], problems: [] };
+    const nothingRan = { installs: [], problems: [] };
+    for (const task of [":app:assembleDebug", "assembleDebug"]) {
+        assert.equal((await resolveApplicationId(root, task, { layout, installs: ranA })).applicationId, "com.example.a", task);
+        const stale = await rejection(resolveApplicationId(root, task, { layout, installs: nothingRan }));
+        assert.equal(stale.code, "app_not_resolved", task);
+    }
+    // Without a layout at all, this run's assemble evidence alone still resolves A.
+    assert.equal((await resolveApplicationId(root, "assembleDebug", { installs: ranA })).applicationId, "com.example.a");
+});
+
+test("assemble evidence fails closed for custom, packaging and ambiguous tasks", async (t) => {
+    const root = await realpath(await tempDir(t));
+    await writeMetadata(root, "app/build/outputs/apk/debug", { applicationId: "com.example.app", variantName: "debug" });
+    await writeMetadata(root, "wear/build/outputs/apk/debug", { applicationId: "com.example.wear", variantName: "debug" });
+    const layout = await layoutFor(t, root, [
+        { path: ":app", dir: "app", variants: [{ name: "debug" }] },
+        { path: ":wear", dir: "wear", variants: [{ name: "debug" }] },
+    ]);
+    const one = { installs: [assemble(root, ":app", "assembleDebug", "app")], problems: [] };
+    const both = { installs: [assemble(root, ":app", "assembleDebug", "app"), assemble(root, ":wear", "assembleDebug", "wear")], problems: [] };
+
+    const ambiguous = await rejection(resolveApplicationId(root, "assembleDebug", { layout, installs: both }));
+    assert.equal(ambiguous.code, "app_ambiguous");
+    assert.equal((await resolveApplicationId(root, ":wear:assembleDebug", { layout, installs: both })).applicationId, "com.example.wear");
+    for (const task of ["deployToDevice", ":app:installDebug"]) {
+        const error = await rejection(resolveApplicationId(root, task, { layout, installs: one }));
+        assert.equal(error.code, "app_not_resolved", task);
+    }
+    // A packaging-only run records no assemble task, so the layout alone resolves nothing.
+    const packaged = await rejection(resolveApplicationId(root, ":app:packageDebug", { layout, installs: { installs: [], problems: [] } }));
+    assert.equal(packaged.code, "app_not_resolved");
+    assert.match(packaged.message, /recorded no assemble task/);
+});
+
+test("the init script records assemble evidence only for applications and never reads applicationId", () => {
+    const script = projectLayoutInitScript("/state/layout");
+    assert.match(script, /kind = 'assemble'/);
+    assert.doesNotMatch(script, /applicationId/);
+    const appBlock = script.indexOf("withId('com.android.application')");
+    assert.ok(appBlock >= 0 && script.indexOf("kind = 'assemble'") > appBlock, "assemble evidence is registered under the application plugin");
+});
+
 test("install evidence is read strictly, and any gap fails closed", async (t) => {
     const root = await realpath(await tempDir(t));
     await writeMetadata(root, "app/build/outputs/apk/debug", { applicationId: "com.example.app", variantName: "debug" });
     const dir = await tempDir(t, "installs-");
-    const good = { format: 1, rootDir: root, project: ":app", task: "installDebug", projectDir: path.join(root, "app"), buildDir: path.join(root, "app/build") };
+    const good = { format: 2, kind: "install", rootDir: root, project: ":app", task: "installDebug", projectDir: path.join(root, "app"), buildDir: path.join(root, "app/build") };
     await writeFile(path.join(dir, "a.json"), JSON.stringify(good));
     await writeFile(path.join(dir, "notes.txt"), "ignored");
     let evidence = await readInstallEvidence(dir);
-    assert.deepEqual(evidence, { installs: [{ rootDir: root, project: ":app", task: "installDebug", projectDir: good.projectDir, buildDir: good.buildDir }], problems: [] });
+    assert.deepEqual(evidence, { installs: [{ kind: "install", rootDir: root, project: ":app", task: "installDebug", projectDir: good.projectDir, buildDir: good.buildDir }], problems: [] });
     assert.deepEqual(await readInstallEvidence(path.join(dir, "missing")), { installs: [], problems: [] });
 
     await writeFile(path.join(dir, "b.json"), JSON.stringify({ ...good, projectDir: "relative" }));
@@ -1327,7 +1387,7 @@ async function windowsProject(t, lines) {
     // What the install-evidence action records for :app:installDebug, copied into place like the real one.
     await writeFile(
         path.join(root, "install-evidence.json"),
-        JSON.stringify({ format: 1, rootDir: root, project: ":app", task: "installDebug", projectDir: path.join(root, "app"), buildDir: path.join(root, "app", "build") }),
+        JSON.stringify({ format: 2, kind: "install", rootDir: root, project: ":app", task: "installDebug", projectDir: path.join(root, "app"), buildDir: path.join(root, "app", "build") }),
     );
     const evidence = [
         'if defined ANDROID_EMULATOR_INSTALL_EVIDENCE (',
