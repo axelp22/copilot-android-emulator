@@ -1414,6 +1414,8 @@ test("Windows runs gradlew.bat from a path with spaces and metacharacters", wind
         "echo arg3=[%~3]",
         "echo arg4=[%~4]",
         "echo arg5=[%~5]",
+        "echo arg6=[%~6]",
+        "echo arg7=[%~7]",
         "echo ^> Task :app:installDebug",
         "exit /b 0",
     ]);
@@ -1426,8 +1428,10 @@ test("Windows runs gradlew.bat from a path with spaces and metacharacters", wind
     assert.ok(result.log.includes("serial=serial-dev"), result.log.join("\n"));
     assert.ok(result.log.includes("arg1=[--no-daemon]"), result.log.join("\n"));
     assert.ok(result.log.includes(`arg3=[${executorPaths(executorDir).initScript}]`), result.log.join("\n"));
-    assert.ok(result.log.includes("arg4=[:app:installDebug]"), result.log.join("\n"));
-    assert.ok(result.log.includes("arg5=[]"), "the task stays a single argument");
+    assert.ok(result.log.includes("arg4=[--init-script]"), result.log.join("\n"));
+    assert.ok(result.log.includes(`arg5=[${projectLayoutPaths(executorDir).initScript}]`), result.log.join("\n"));
+    assert.ok(result.log.includes("arg6=[:app:installDebug]"), result.log.join("\n"));
+    assert.ok(result.log.includes("arg7=[]"), "the task stays a single argument");
     assert.equal(manager.calls.launch[0]?.packageName, "com.example.app");
 });
 
