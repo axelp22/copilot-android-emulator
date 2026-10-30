@@ -5,17 +5,30 @@ import { nowIso, streamBitRateFor, streamSizeFor, timestampName } from "./device
 import { getWmDensity, getWmSize, parsePngDimensions, screencapPng } from "./adb.mjs";
 import { createH264Stream } from "./h264-stream.mjs";
 import { createGrpcFrameStream } from "./grpc-frame-stream.mjs";
+import { GRPC_STATUS } from "./grpc-client.mjs";
 
 export class ScreenService {
-    constructor({ state, artifactsRoot, ensureBooted, onDiagnostic, controlPool = null }) {
+    constructor({
+        state,
+        artifactsRoot,
+        ensureBooted,
+        onDiagnostic,
+        controlPool = null,
+        createFrameStream = createGrpcFrameStream,
+    }) {
         this.state = state;
         this.artifactsRoot = artifactsRoot;
         this.ensureBooted = ensureBooted;
         this.onDiagnostic = onDiagnostic ?? (() => {});
         /** Shared emulator gRPC connections; absent means mirror everything. */
         this.controlPool = controlPool;
-        /** Why the last gRPC attempt fell back, surfaced in device state. */
-        this.lastGrpcFailure = null;
+        this.createFrameStream = createFrameStream;
+        /**
+         * Why the last gRPC attempt fell back, per device, surfaced in device
+         * state. Per device so one emulator's failure is never reported as
+         * another's.
+         */
+        this.grpcFailures = new Map();
     }
 
     async captureScreen(deviceId) {
@@ -125,7 +138,11 @@ export class ScreenService {
         const mirror = await this.createH264Stream({ deviceId, fps, resolution, timeLimitSeconds });
         // Record why, so a gRPC regression is visible rather than looking like the
         // emulator simply being slow.
-        this.state.setStreamTransport(deviceId, "mirror", device.kind === "emulator" ? this.lastGrpcFailure : null);
+        this.state.setStreamTransport(
+            deviceId,
+            "mirror",
+            device.kind === "emulator" ? (this.grpcFailures.get(deviceId) ?? null) : null,
+        );
         return mirror;
     }
 
@@ -135,9 +152,11 @@ export class ScreenService {
      * degrade the picture quality, never the session.
      */
     async #tryGrpcStream({ deviceId, fps, resolution, required }) {
+        let serial = null;
+        let entry = null;
         try {
             await this.ensureBooted(deviceId);
-            const serial = this.state.requireSerial(deviceId);
+            serial = this.state.requireSerial(deviceId);
             // A restarted AVD keeps its serial but gets a new pid and port, so
             // check before borrowing that the cached connection is still the
             // emulator we think it is.
@@ -145,7 +164,7 @@ export class ScreenService {
             // Borrow the shared connection rather than opening one per stream: the
             // JWT handshake waits for the emulator to accept a published key, and
             // paying that on every quality change would stall the first frame.
-            const entry = await this.controlPool?.get(serial);
+            entry = await this.controlPool?.get(serial);
             if (!entry?.controller) {
                 if (required) {
                     throw new AppError(
@@ -157,19 +176,68 @@ export class ScreenService {
                 return null;
             }
             const device = this.state.getDeviceOrThrow(deviceId);
-            return await createGrpcFrameStream({
+            const stream = await this.createFrameStream({
                 controller: entry.controller,
                 size: streamSizeFor(device.screen, resolution),
                 fps,
                 onDiagnostic: (message) => this.onDiagnostic(`[${deviceId}] ${message}`),
             });
+            this.grpcFailures.delete(deviceId);
+            // A stream can die long after its first frame (a liveness probe
+            // fails, the socket resets). Retire the connection it borrowed then
+            // too, or every later stream would reuse the broken channel.
+            const borrowed = entry;
+            stream.on?.("error", (error) => {
+                if (isConnectionFailure(error)) {
+                    void this.controlPool?.reportFailure?.(serial, error, borrowed)?.catch?.(() => {});
+                }
+            });
+            return stream;
         } catch (error) {
+            // A borrowed connection that failed to stream is probably stale (the
+            // emulator restarted under the same pid/port check window, or its
+            // socket died). Drop it so the next attempt reconnects instead of
+            // mirroring forever against a dead channel.
+            if (entry?.controller && serial && isConnectionFailure(error)) {
+                await this.controlPool?.reportFailure?.(serial, error, entry)?.catch?.(() => {});
+            }
             if (required) {
                 throw error;
             }
-            this.lastGrpcFailure = error?.message ?? String(error);
-            this.onDiagnostic(`[${deviceId}] gRPC stream unavailable, mirroring instead: ${this.lastGrpcFailure}`);
+            const reason = error?.message ?? String(error);
+            this.grpcFailures.set(deviceId, reason);
+            this.onDiagnostic(`[${deviceId}] gRPC stream unavailable, mirroring instead: ${reason}`);
             return null;
         }
     }
+}
+
+/**
+ * AppError codes the gRPC client and frame stream use for a broken channel. Not
+ * `grpc_unavailable` (that is "this device has no endpoint") nor
+ * `grpc_cancelled` (our own abort).
+ */
+const TRANSPORT_ERROR_CODES = new Set([
+    "grpc_transport_error",
+    "grpc_closed",
+    "grpc_http_error",
+    "grpc_stream_dead",
+    "grpc_stream_failed",
+]);
+
+/**
+ * Whether an error means the channel itself is unusable rather than the call
+ * being refused. Errors without a gRPC status are transport-level (a reset
+ * socket, a closed session).
+ */
+export function isConnectionFailure(error) {
+    const status = error?.grpcStatus;
+    if (status === undefined || status === null) {
+        if (error instanceof AppError) {
+            // The client wraps transport faults in AppErrors without a status.
+            return TRANSPORT_ERROR_CODES.has(error.code);
+        }
+        return true;
+    }
+    return status === GRPC_STATUS.unavailable || status === GRPC_STATUS.deadlineExceeded || status === GRPC_STATUS.cancelled;
 }

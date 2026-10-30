@@ -88,12 +88,16 @@ export class DeviceRegistry {
     upsertDevice(device) {
         const existing = this.devices.get(device.id);
         if (existing) {
-            existing.serial = device.serial ?? existing.serial;
+            // A boot in flight owns the state until discovery observes a booted device.
+            const bootInFlight = existing.state === DEVICE_STATES.booting && device.state !== DEVICE_STATES.booted;
+            // Discovery reports a shut-down AVD with no serial. Keeping the old one
+            // would point every later adb or gRPC call at whatever now owns that
+            // port, or at nothing, after an emulator restart or a USB unplug.
+            existing.serial = bootInFlight || !("serial" in device) ? (device.serial ?? existing.serial) : (device.serial ?? null);
             existing.avdName = device.avdName ?? existing.avdName;
             existing.kind = device.kind ?? existing.kind;
             existing.name = device.name ?? existing.name;
-            // A boot in flight owns the state until discovery observes a booted device.
-            if (!(existing.state === DEVICE_STATES.booting && device.state !== DEVICE_STATES.booted)) {
+            if (!bootInFlight) {
                 existing.state = device.state;
             }
             existing.isAvailable = device.isAvailable !== false;
