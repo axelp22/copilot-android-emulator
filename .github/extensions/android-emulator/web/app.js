@@ -110,6 +110,15 @@ const SLOW_CAPTURE_WINDOW_MS = 8_000;
 const SLOW_CAPTURE_FPS = 8;
 /** Screenshots failing this many times in a row means the device display is broken, not just slow. */
 const PNG_FALLBACK_MAX_FAILURES = 5;
+/**
+ * A stream that fails part way through (an emulator restart, a dropped gRPC
+ * connection the host has since replaced) is retried with backoff while
+ * screenshots keep the canvas painted. Bounded so a device whose stream keeps
+ * failing settles on screenshots rather than reconnecting forever.
+ */
+const STREAM_RETRY_BASE_MS = 500;
+const STREAM_RETRY_MAX_MS = 8_000;
+const STREAM_RETRY_MAX_ATTEMPTS = 6;
 
 let state = null;
 let pending = false;
@@ -123,6 +132,9 @@ let h264StallTimer = null;
 let lastVideoFrameAt = 0;
 let pngFallbackGeneration = 0;
 let recentFrameTimes = [];
+let streamRetryTimer = null;
+let streamRetryAttempts = 0;
+let streamRetryDevice = null;
 /** Connection facts for the diagnostics panel; never shown raw, only through its redacting view. */
 let eventsState = "connecting";
 let eventErrors = 0;
@@ -184,6 +196,7 @@ function setScreenStatus(message, { error = false, poweredOff = false, stateName
 
 function showScreenError(details) {
     screenError = String(details || "Unknown device error.");
+    cancelStreamRetry();
     h264Stream.stop();
     stopPngFallback();
     stopH264Watchdog();
@@ -523,6 +536,7 @@ function ensureStream() {
         return;
     }
     if (!state || state.state !== "Booted") {
+        cancelStreamRetry();
         activeStreamKey = "";
         resetStreamDiagnostics();
         h264Stream.stop();
@@ -546,6 +560,12 @@ function ensureStream() {
         return;
     }
     activeStreamKey = nextKey;
+    clearTimeout(streamRetryTimer);
+    streamRetryTimer = null;
+    if (streamRetryDevice !== (state.deviceId ?? null)) {
+        streamRetryDevice = state.deviceId ?? null;
+        streamRetryAttempts = 0;
+    }
     resetStreamDiagnostics();
 
     const source = chooseScreenSource({
@@ -581,6 +601,7 @@ function drawVideoFrame(frame) {
     h264Watchdog = null;
     lastVideoFrameAt = Date.now();
     recentFrameTimes.push(lastVideoFrameAt);
+    streamRetryAttempts = 0;
     const width = frame.displayWidth || frame.codedWidth || frame.width;
     const height = frame.displayHeight || frame.codedHeight || frame.height;
     if (width && height && (elements.h264Screen.width !== width || elements.h264Screen.height !== height)) {
@@ -626,6 +647,41 @@ function handleH264StreamError(error) {
     const reason = `Device stream failed (${error?.message ?? String(error)}); streaming screenshots instead`;
     setNotice(reason);
     fallBackToScreenshots(reason, "stream-failed");
+    scheduleStreamRetry();
+}
+
+function cancelStreamRetry() {
+    clearTimeout(streamRetryTimer);
+    streamRetryTimer = null;
+    streamRetryAttempts = 0;
+}
+
+/**
+ * Only the stream that failed is retried: a device switch, a settings change or
+ * a manual reconnect replaces the key and so cancels a pending retry, and a
+ * device that left the Booted state or hit a screen error is not reopened.
+ */
+function scheduleStreamRetry() {
+    clearTimeout(streamRetryTimer);
+    streamRetryTimer = null;
+    if (streamRetryAttempts >= STREAM_RETRY_MAX_ATTEMPTS) {
+        return;
+    }
+    const failedKey = activeStreamKey;
+    const delay = Math.min(STREAM_RETRY_BASE_MS * 2 ** streamRetryAttempts, STREAM_RETRY_MAX_MS);
+    streamRetryAttempts += 1;
+    streamRetryTimer = setTimeout(() => {
+        streamRetryTimer = null;
+        if (
+            activeStreamKey !== failedKey ||
+            state?.state !== "Booted" ||
+            screenError ||
+            clientFallbackReason !== "stream-failed"
+        ) {
+            return;
+        }
+        reconnectStream();
+    }, delay);
 }
 
 function startH264Stream(fps) {
