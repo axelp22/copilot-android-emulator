@@ -281,6 +281,15 @@ function scriptedDevice({ transport, frames, others = {} }) {
                     exits.delete(handler);
                     return child;
                 },
+                // The device side dropping the stream part way through, as an
+                // emulator restart or a broken gRPC connection does.
+                fail() {
+                    child.killed = true;
+                    for (const handler of exits) {
+                        handler(1, null);
+                    }
+                    stdout.end();
+                },
                 kill() {
                     if (child.killed) {
                         return;
@@ -490,6 +499,55 @@ test("a decoder failure on one device does not keep a newly picked emulator off 
     await waitUntil(() => device.calls.screenshots > screenshotsBefore, { message: "screenshots for the mirrored device", timeoutMs: 10_000 });
     await sleep(1_000);
     assert.equal(device.calls.streamsByDevice.Pixel_A, mirroredStreams, "no new stream for video this runtime cannot decode");
+});
+
+test("a stream that fails part way through reconnects by itself, keeping screenshots meanwhile", { skip, timeout: 60_000 }, async (t) => {
+    const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
+    const page = await openCanvas(t, device);
+    await page.until(painted, "the first frame");
+    await sleep(500);
+    const streamsBefore = device.calls.streams;
+    device.calls.children.at(-1).fail();
+
+    await waitUntil(() => device.calls.screenshots > 0, { message: "screenshots while the stream is down", timeoutMs: 10_000 });
+    await waitUntil(() => device.calls.streams > streamsBefore, { message: "an automatic new stream", timeoutMs: 10_000 });
+    await page.until(painted, "video again after the reconnect");
+    const live = device.calls.children.at(-1);
+    assert.equal(live.killed, false);
+    assert.equal(await page.evaluate(screenErrorShown), false, "a dropped stream is not a display error");
+
+    // Once video is back the retry is spent: no further streams open on their own.
+    const streamsAfterRecovery = device.calls.streams;
+    await sleep(1_500);
+    assert.equal(device.calls.streams, streamsAfterRecovery, "no reconnect loop once recovered");
+    assert.equal(live.killed, false);
+});
+
+test("a stream that keeps failing settles on screenshots after a bounded number of retries", { skip, timeout: 90_000 }, async (t) => {
+    const device = scriptedDevice({ transport: "grpc", frames: [] });
+    const failing = device.createVideoStream;
+    device.createVideoStream = async (input) => {
+        const child = await failing(input);
+        // A real mid-stream failure has already sent a response; a byte short
+        // of a frame flushes it without painting, so the browser cannot replay
+        // the request on its own and only the canvas's retries are counted.
+        child.stdout.write(Buffer.from([0]));
+        setTimeout(() => child.fail(), 20);
+        return child;
+    };
+    const page = await openCanvas(t, device);
+    await waitUntil(() => device.calls.screenshots > 0, { message: "screenshots", timeoutMs: 10_000 });
+    // Retries are counted from the first fallback; startup may open more than once.
+    const beforeRetries = device.calls.streams;
+    // 0.5 + 1 + 2 + 4 + 8 + 8 s of backoff.
+    await waitUntil(() => device.calls.streams - beforeRetries >= 6, { message: "the bounded retries", timeoutMs: 40_000 });
+    await sleep(10_000);
+    const retries = device.calls.streams - beforeRetries;
+    assert.equal(retries, 6, `retries stop (saw ${retries})`);
+    const screenshots = device.calls.screenshots;
+    await sleep(500);
+    assert.ok(device.calls.screenshots > screenshots, "screenshots keep coming");
+    assert.equal(await page.evaluate(screenErrorShown), false);
 });
 
 test("the diagnostics panel names the transport and why, and copies an allowlisted report", { skip, timeout: 60_000 }, async (t) => {

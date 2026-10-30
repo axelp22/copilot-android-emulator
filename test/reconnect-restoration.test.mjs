@@ -845,3 +845,207 @@ test("F13: removing an emulator with a pending handshake does not stall discover
     await tick();
     assert.equal(channel.closed, true, "late connection closed on settlement");
 });
+
+test("R1: a boot queued behind discovery never starts once the manager is disposed", async () => {
+    const discovery = deferred();
+    const manager = new DeviceSessionManager({});
+    manager.state.updateFromList([
+        { id: "avd:A", serial: null, avdName: "A", kind: "emulator", name: "A", state: "Shutdown" },
+    ]);
+    const spawned = [];
+    manager.discoverDevices = async () => {
+        await discovery.promise;
+        return [{ id: "avd:A", serial: null, avdName: "A", kind: "emulator", name: "A", state: "Shutdown" }];
+    };
+    manager.withDeviceHold = async (_deviceId, _reason, fn) => fn();
+    manager.runBoot = async (deviceId) => {
+        spawned.push(deviceId);
+    };
+    const booting = manager.ensureBooted("avd:A");
+    await tick();
+    let disposed = false;
+    const disposing = manager.dispose().then(() => {
+        disposed = true;
+    });
+    await tick();
+    assert.equal(disposed, false, "dispose drains boot work before releasing ownership");
+    discovery.resolve();
+    await assert.rejects(booting, { code: "session_shutting_down" });
+    await disposing;
+    assert.deepEqual(spawned, [], "no emulator spawned after dispose");
+    await assert.rejects(manager.ensureBooted("avd:A"), { code: "session_shutting_down" });
+    await assert.rejects(manager.completePreparedBoot("avd:A"), { code: "session_shutting_down" });
+});
+
+function leasingHarness(options) {
+    const harness = instanceHarness(options);
+    const leases = new Set();
+    harness.manager.assertNoActiveLease = (deviceId) => {
+        if (leases.has(deviceId)) {
+            throw new AppError("device_leased", `${deviceId} is leased`, 409);
+        }
+    };
+    return { ...harness, leases };
+}
+
+const THREE_BOOTED = {
+    A: { kind: "emulator", state: "Booted", name: "A" },
+    B: { kind: "emulator", state: "Booted", name: "B" },
+    C: { kind: "emulator", state: "Booted", name: "C" },
+};
+
+test("R2: a queued switch from a stale source cannot detach a device leased meanwhile", async () => {
+    const set = deferred();
+    const { controller, manager, leases, store, events } = leasingHarness({ devices: THREE_BOOTED, saved: { c: "A" } });
+    await controller.open({ instanceId: "c", input: {} });
+    const bindings = controller.getBindings();
+    const write = bindings.set.bind(bindings);
+    let gated = true;
+    bindings.set = async (...args) => {
+        if (gated) {
+            gated = false;
+            await set.promise;
+        }
+        return write(...args);
+    };
+    const toB = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "B" });
+    const toC = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "C" });
+    await tick();
+    set.resolve();
+    await toB;
+    leases.add("B");
+    await assert.rejects(toC, { code: "canvas_switch_stale" });
+    assert.equal(manager.attached.get("c"), "B", "B stays attached");
+    assert.equal(leases.has("B"), true, "the agent keeps B's lease");
+    assert.equal(events.includes("detach:B"), false);
+    assert.equal(store.get("c"), "B");
+});
+
+test("R2: a lease taken while the switch's binding write is pending aborts it and restores the binding", async () => {
+    const set = deferred();
+    const { controller, manager, leases, store } = leasingHarness({ devices: THREE_BOOTED, saved: { c: "A" } });
+    await controller.open({ instanceId: "c", input: {} });
+    const bindings = controller.getBindings();
+    const write = bindings.set.bind(bindings);
+    let gated = true;
+    bindings.set = async (...args) => {
+        if (gated) {
+            gated = false;
+            await set.promise;
+        }
+        return write(...args);
+    };
+    const switching = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "B" });
+    await tick();
+    leases.add("A");
+    set.resolve();
+    await assert.rejects(switching, { code: "device_leased" });
+    assert.equal(manager.attached.get("c"), "A", "A stays attached under its lease");
+    assert.equal(store.get("c"), "A", "binding restored");
+});
+
+test("R3: a failed touch-up retries through the retired connection before it closes", async (t) => {
+    const pressures = [];
+    const attempts = [];
+    let failNextUp = false;
+    const channels = [];
+    const { pool } = fakePool({
+        emulators: TWO_EMULATORS,
+        connect: async () => {
+            const channel = { closed: false, close() { this.closed = true; } };
+            channels.push(channel);
+            return {
+                channel,
+                tokens: { dispose() {} },
+                controller: {
+                    sendTouch: async ({ touches }) => {
+                        attempts.push(touches[0].pressure);
+                        if (channel.closed) {
+                            throw new Error("channel closed");
+                        }
+                        if (touches[0].pressure === 0 && failNextUp) {
+                            failNextUp = false;
+                            throw grpcError(GRPC_STATUS.unavailable);
+                        }
+                        pressures.push(touches[0].pressure);
+                    },
+                },
+            };
+        },
+    });
+    const { registry } = screenServiceWith({ pool, createFrameStream: async () => ({}) });
+    const input = new InputDispatcher({
+        state: registry,
+        ensureBooted: async () => {},
+        screenSize: async () => ({ width: 1080, height: 1920 }),
+        refreshScreenMetrics: async () => {},
+        controlPool: pool,
+    });
+    t.after(() => pool.disposeAll());
+    const touch = { deviceId: "avd:A", x: 0.5, y: 0.5 };
+    await input.notifyTouch({ ...touch, phase: "down" });
+    await pool.reportFailure("emulator-5554", grpcError(GRPC_STATUS.unavailable));
+    assert.equal(channels[0].closed, false, "held for the gesture");
+    failNextUp = true;
+    await input.notifyTouch({ ...touch, phase: "up" });
+    assert.deepEqual(attempts, [1, 0, 0], "the release was retried");
+    assert.deepEqual(pressures, [1, 0], "the retry reached the transport");
+    await tick();
+    assert.equal(channels[0].closed, true, "closed once the gesture let go");
+});
+
+function gatedTokens() {
+    const gate = deferred();
+    const tokens = { disposed: false, async dispose() { await gate.promise; tokens.disposed = true; } };
+    return { gate, tokens };
+}
+
+test("R5: disposeAll waits for the cleanup its settlement hook started", async () => {
+    const { gate, tokens } = gatedTokens();
+    const channel = { closed: false, close() { this.closed = true; } };
+    const { pool } = fakePool({
+        emulators: { s: { pid: 1, grpcPort: 1 } },
+        connect: async () => ({ controller: {}, channel, tokens }),
+    });
+    assert.ok(await pool.get("s"));
+    let settled = false;
+    const disposing = pool.disposeAll().then(() => {
+        settled = true;
+    });
+    await tick();
+    assert.equal(channel.closed, true);
+    assert.equal(settled, false, "disposeAll still waits for token disposal");
+    gate.resolve();
+    await disposing;
+    assert.equal(tokens.disposed, true);
+});
+
+test("R5: overlapping closes share one cleanup, and disposeAll waits for a hold's close", async () => {
+    const { gate, tokens } = gatedTokens();
+    let disposals = 0;
+    const dispose = tokens.dispose;
+    tokens.dispose = async () => {
+        disposals += 1;
+        return dispose();
+    };
+    const channel = { closed: false, close() { this.closed = true; } };
+    const { pool } = fakePool({
+        emulators: { s: { pid: 1, grpcPort: 1 } },
+        connect: async () => ({ controller: {}, channel, tokens }),
+    });
+    const connection = await pool.get("s");
+    const releaseHold = pool.hold(connection.controller ?? connection);
+    await pool.reportFailure("s", new Error("broken"));
+    releaseHold();
+    let settled = false;
+    const disposing = pool.disposeAll().then(() => {
+        settled = true;
+    });
+    const releasing = pool.release("s");
+    await tick();
+    assert.equal(settled, false, "disposeAll waits for the hold's in-progress close");
+    gate.resolve();
+    await Promise.all([disposing, releasing]);
+    assert.equal(tokens.disposed, true);
+    assert.equal(disposals, 1, "closed once");
+});

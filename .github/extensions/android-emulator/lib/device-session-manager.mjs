@@ -71,6 +71,10 @@ export class DeviceSessionManager {
         this.deviceMetaCache = new Map();
         this.discoveryInFlight = null;
         this.bootOperations = new Map();
+        // Boot work still running, so dispose can wait for it to observe that
+        // the session is over before handing the device back.
+        this.bootWork = new Set();
+        this.disposed = false;
         // Shared with other Copilot sessions so they can see, and avoid, a device
         // this session is already driving.
         this.claims = new DeviceClaimStore({});
@@ -717,12 +721,37 @@ export class DeviceSessionManager {
         return this.state.snapshot(deviceId);
     }
 
-    async ensureBooted(deviceId) {
+    #assertNotDisposed() {
+        if (this.disposed) {
+            throw new AppError("session_shutting_down", "The Android Emulator session is shutting down.", 503);
+        }
+    }
+
+    #trackBoot(start) {
+        let work;
+        try {
+            this.#assertNotDisposed();
+            work = start();
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        this.bootWork.add(work);
+        const forget = () => this.bootWork.delete(work);
+        work.then(forget, forget);
+        return work;
+    }
+
+    ensureBooted(deviceId) {
+        return this.#trackBoot(() => this.#ensureBooted(deviceId));
+    }
+
+    async #ensureBooted(deviceId) {
         const device = this.state.devices.get(deviceId);
         if (device?.state === DEVICE_STATES.booted && device.serial) {
             return this.state.snapshot(deviceId);
         }
         await this.refreshDevices();
+        this.#assertNotDisposed();
         const refreshed = this.state.getDeviceOrThrow(deviceId);
         if (refreshed.state === DEVICE_STATES.booted && refreshed.serial) {
             return this.state.snapshot(deviceId);
@@ -738,6 +767,7 @@ export class DeviceSessionManager {
         // here for the same AVD would otherwise each spawn `emulator -avd`, and
         // the in-process dedupe below cannot see across processes.
         return this.withDeviceHold(deviceId, "Booting the device", () => {
+            this.#assertNotDisposed();
             this.prepareBoot(deviceId);
             return this.completePreparedBoot(deviceId);
         });
@@ -772,16 +802,19 @@ export class DeviceSessionManager {
         if (pending) {
             return pending;
         }
-        const promise = this.runBoot(deviceId).finally(() => {
-            if (this.bootOperations.get(deviceId) === promise) {
-                this.bootOperations.delete(deviceId);
-            }
+        return this.#trackBoot(() => {
+            const promise = this.runBoot(deviceId).finally(() => {
+                if (this.bootOperations.get(deviceId) === promise) {
+                    this.bootOperations.delete(deviceId);
+                }
+            });
+            this.bootOperations.set(deviceId, promise);
+            return promise;
         });
-        this.bootOperations.set(deviceId, promise);
-        return promise;
     }
 
     async runBoot(deviceId) {
+        this.#assertNotDisposed();
         const device = this.assertLifecycleAllowed(deviceId);
         if (!device.avdName) {
             throw new AppError("unknown_avd", `No AVD is associated with ${deviceId}.`, 409);
@@ -790,6 +823,9 @@ export class DeviceSessionManager {
         try {
             const emulatorPath = await requireEmulatorBinary();
             const before = new Set((await listAttached()).map((entry) => entry.serial));
+            // Last point before an emulator is spawned: never start one for a
+            // session that has already been disposed.
+            this.#assertNotDisposed();
             // gRPC is already enabled by default on current emulators; the custom
             // allowlist exists so this extension can authenticate as itself with
             // only the methods it needs, instead of borrowing Android Studio's
@@ -823,6 +859,7 @@ export class DeviceSessionManager {
     async waitForNewEmulatorSerial(avdName, beforeSerials) {
         const deadline = Date.now() + BOOT_TIMEOUT_MS;
         while (Date.now() < deadline) {
+            this.#assertNotDisposed();
             const attached = await listAttached().catch(() => []);
             const candidates = attached.filter(
                 (entry) => isEmulatorSerial(entry.serial) && entry.state === "device",
@@ -843,6 +880,7 @@ export class DeviceSessionManager {
     async waitForBootCompleted(serial) {
         const deadline = Date.now() + BOOT_TIMEOUT_MS;
         while (Date.now() < deadline) {
+            this.#assertNotDisposed();
             try {
                 const value = await adbShell(serial, ["getprop", "sys.boot_completed"], { timeout: 10_000 });
                 if (value.trim() === "1") {
@@ -1272,6 +1310,10 @@ export class DeviceSessionManager {
     }
 
     async dispose() {
+        // Refuse new boot work, then let what is running observe that and stop
+        // before the device and queue holds below are given up.
+        this.disposed = true;
+        await Promise.allSettled(Array.from(this.bootWork));
         // Stop builds before giving up the device: an orphaned Gradle would keep
         // installing onto a device another session has just been handed. stopAll
         // refuses new builds and waits for every queued and running one to settle.

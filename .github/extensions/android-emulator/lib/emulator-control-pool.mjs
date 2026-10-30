@@ -82,8 +82,13 @@ export class EmulatorControlPool {
         this.holds = new Map();
         /** Connections dropped from the cache whose close waits on a hold. */
         this.retiring = new Map();
-        /** Closed connections, so overlapping teardown paths close once. */
-        this.closed = new WeakSet();
+        /**
+         * Close in progress or finished, per connection, so overlapping
+         * teardown paths close once and every caller awaits the same cleanup.
+         */
+        this.closing = new WeakMap();
+        /** Closes still running, so disposeAll waits for every one of them. */
+        this.pendingCloses = new Set();
         this.disposed = false;
     }
 
@@ -332,17 +337,26 @@ export class EmulatorControlPool {
         const retiring = [...this.retiring.values()];
         this.retiring.clear();
         await Promise.all(retiring.map((connection) => this.#close(connection)));
+        // Including a close a released gesture hold started on its own.
+        await Promise.allSettled([...this.pendingCloses]);
         this.unavailableUntil.clear();
         this.failureCounts.clear();
         this.failedEndpoints.clear();
     }
 
-    async #close(connection) {
-        if (!connection || this.closed.has(connection)) {
-            return;
+    #close(connection) {
+        if (!connection) {
+            return Promise.resolve();
         }
-        this.closed.add(connection);
-        await closeConnection(connection);
+        let closing = this.closing.get(connection);
+        if (!closing) {
+            closing = closeConnection(connection);
+            this.closing.set(connection, closing);
+            this.pendingCloses.add(closing);
+            const forget = () => this.pendingCloses.delete(closing);
+            closing.then(forget, forget);
+        }
+        return closing;
     }
 }
 

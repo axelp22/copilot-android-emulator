@@ -114,7 +114,7 @@ export class CanvasInstanceController {
             device.state !== "Booted" &&
             input?.autoBoot !== false &&
             input?.bootAfterOpen !== true;
-        if (autoBoot) {
+        if (autoBoot && !this.shuttingDown) {
             void this.manager.ensureBooted(deviceId).catch((error) => {
                 this.diagnostic(`Failed to boot ${deviceId}: ${error?.message ?? String(error)}`);
             });
@@ -137,21 +137,30 @@ export class CanvasInstanceController {
     switch({ instanceId, fromDeviceId, toDeviceId }) {
         return this.locks.run(instanceId, async () => {
             this.#assertOpen();
+            const entry = this.#switchableEntry(instanceId, fromDeviceId);
             const resolvedId = await this.manager.resolveDeviceId(toDeviceId);
             const target = await this.manager.assertDeviceAvailable(resolvedId);
-            if (fromDeviceId) {
-                this.manager.assertNoActiveLease(fromDeviceId);
+            this.#switchableEntry(instanceId, fromDeviceId, entry);
+            if (entry.deviceId) {
+                this.manager.assertNoActiveLease(entry.deviceId);
             }
             this.manager.assertNoActiveLease(resolvedId);
 
-            const entry = this.instances.get(instanceId);
-            if (!entry) {
-                throw new AppError("canvas_instance_missing", "The device canvas is no longer available.", 404);
-            }
-
-            await this.getBindings()?.set(instanceId, resolvedId);
-            if (this.shuttingDown || this.instances.get(instanceId) !== entry) {
-                throw new AppError("canvas_instance_missing", "The device canvas is no longer available.", 404);
+            const bindings = this.getBindings();
+            await bindings?.set(instanceId, resolvedId);
+            try {
+                // Revalidated after the write: an agent may have leased either
+                // device, or another switch moved the canvas, meanwhile.
+                this.#switchableEntry(instanceId, fromDeviceId, entry);
+                if (entry.deviceId) {
+                    this.manager.assertNoActiveLease(entry.deviceId);
+                }
+                this.manager.assertNoActiveLease(resolvedId);
+            } catch (error) {
+                if (this.instances.get(instanceId) === entry) {
+                    await bindings?.set(instanceId, entry.deviceId ?? null)?.catch?.(() => {});
+                }
+                throw error;
             }
             // Marked only once the switch is committed, so an aborted switch
             // cannot leave the target stuck in Booting with no boot running.
@@ -169,6 +178,9 @@ export class CanvasInstanceController {
 
             if (needsBoot) {
                 queueMicrotask(() => {
+                    if (this.shuttingDown) {
+                        return;
+                    }
                     void this.manager.completePreparedBoot(resolvedId).catch((error) => {
                         this.diagnostic(`Failed to boot the switched emulator: ${error?.message ?? String(error)}`);
                     });
@@ -182,6 +194,27 @@ export class CanvasInstanceController {
                 state: needsBoot ? "Booting" : target.state,
             };
         });
+    }
+
+    /**
+     * The entry a switch from `fromDeviceId` may act on. A queued switch whose
+     * source is no longer what the canvas shows is stale: acting on it would
+     * detach a device it never checked.
+     */
+    #switchableEntry(instanceId, fromDeviceId, expected) {
+        this.#assertOpen();
+        const entry = this.instances.get(instanceId);
+        if (!entry || (expected && entry !== expected)) {
+            throw new AppError("canvas_instance_missing", "The device canvas is no longer available.", 404);
+        }
+        if ((fromDeviceId ?? null) !== (entry.deviceId ?? null)) {
+            throw new AppError(
+                "canvas_switch_stale",
+                "The canvas changed device before this switch ran. Choose the device again.",
+                409,
+            );
+        }
+        return entry;
     }
 
     /**

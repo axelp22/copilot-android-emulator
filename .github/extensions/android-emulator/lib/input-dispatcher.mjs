@@ -409,17 +409,22 @@ export class InputDispatcher {
                     await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: GRPC_TOUCH_PRESSURE });
                     return { deviceId, action: "touch", phase, x, y, transport: "grpc" };
                 }
-                // phase === "up": release the slot at the final position.
+                // phase === "up": release the slot at the final position. The
+                // hold is kept until the release has been sent or retried below,
+                // so a retired connection stays open for that retry.
                 this.touchSessions.delete(deviceId);
-                try {
-                    await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 });
-                } finally {
-                    existing.releaseHold?.();
-                }
+                await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 });
+                existing.releaseHold?.();
                 return { deviceId, action: "touch", phase, x, y, transport: "grpc" };
             } catch (error) {
-                // Release the slot on a best-effort basis before giving up on it.
+                // Release the slot on a best-effort basis before giving up on it,
+                // still holding the connection so the retry can reach the server.
                 await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 }).catch(() => {});
+                const current = this.touchSessions.get(deviceId);
+                if (current?.controller === controller) {
+                    this.touchSessions.delete(deviceId);
+                }
+                current?.releaseHold?.();
                 existing?.releaseHold?.();
                 return this.abandonPointerBackend(deviceId, error);
             }
