@@ -18,6 +18,7 @@ import { extensionModule, extensionRoot, isAlive, sleep, tempDir, waitUntil } fr
 const {
     AppBuildService,
     BUILD_TAG_ENV,
+    classifyHiddenEnvironments,
     executorInitScript,
     executorPaths,
     findGradleRoot,
@@ -1128,8 +1129,75 @@ test("without the tag in a snapshot, an unseen executor is never reported gone",
     assert.equal(fake.signals.length, 0, "nothing is signalled without identifying it");
 });
 
+test("a process whose environment the system hid keeps the stop unconfirmed and is never signalled", async () => {
+    // macOS case: the wrapper (100) has exited; 200 is a recent same-user orphan whose
+    // environment ps did not show, so it could be this build's executor, or not.
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const hidden = { ...proc(200, 1, 200)[1], tagged: undefined, envHidden: true };
+    const fake = fakeProcesses([[1, { ...proc(1, 0, 1)[1], tagged: false }], [200, hidden], [900, { ...proc(900, 1, 900)[1], tagged: false }]]);
+    const known = new Map([[100, "Thu Oct 22 10:00:00 2026"]]);
+    await assert.rejects(liveBuildProcesses(child, { platform: "darwin", snapshot: fake.snapshot, known, tag: TAG }), /pid\(s\) 200 is hidden by the system/);
+    const outcome = await terminateProcessTree(child, { platform: "darwin", snapshot: fake.snapshot, kill: fake.kill, known, tag: TAG, killWaitMs: 60, pollMs: 5 });
+    assert.equal(outcome.confirmed, false, outcome.detail);
+    assert.match(outcome.detail, /pid\(s\) 200 is hidden by the system/);
+    assert.equal(fake.signals.length, 0, JSON.stringify(fake.signals));
+
+    // The same hidden process in the wrapper's group is owned and stopped as usual.
+    const grouped = fakeProcesses([[1, { ...proc(1, 0, 1)[1], tagged: false }], [200, { ...hidden, pgid: 100 }]]);
+    const stopped = await terminateProcessTree(child, { platform: "darwin", snapshot: grouped.snapshot, kill: grouped.kill, known, tag: TAG, killWaitMs: 500, pollMs: 5 });
+    assert.equal(stopped.confirmed, true, stopped.detail);
+    assert.ok(grouped.signals.some(([target, name]) => target === 200 && name === "SIGKILL"));
+});
+
+test("a stop narrows the hidden-environment window to after its last clean look, never past an unseen start", async () => {
+    // A macOS-style snapshot classified by the real rule. 300 is another program's hidden
+    // helper whose shown, untagged parent (250) exits after the first look, leaving it an
+    // orphan; it was decided then and cannot become the build's later. 400 is a hidden
+    // orphan that first appears after that look, so it could be one the build started.
+    const uid = 501;
+    const spawnedAt = Date.now() - 60_000;
+    const entry = (pid, ppid, pgid, startedAt, envShown) => [pid, { pid, ppid, pgid, uid, stat: "S", lstart: String(startedAt), startedAt, envShown }];
+    const run = async (withLate) => {
+        const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+        let calls = 0;
+        const sinces = [];
+        const snapshot = async (options) => {
+            calls += 1;
+            sinces.push(options.since);
+            const now = Date.now();
+            const table = new Map([entry(1, 0, 1, 0, true), entry(300, calls === 1 ? 250 : 1, 250, spawnedAt + 1_000, false)]);
+            if (calls === 1) {
+                table.set(...entry(250, 1, 250, spawnedAt + 500, true));
+            } else if (withLate) {
+                table.set(...entry(400, 1, 399, now, false));
+            }
+            // As processSnapshot: none carries the tag; a hidden one reads as untagged until classified.
+            for (const proc of table.values()) {
+                proc.tagged = false;
+            }
+            classifyHiddenEnvironments(table, { since: options.since, uid });
+            return table;
+        };
+        const fake = fakeProcesses([]);
+        const outcome = await terminateProcessTree(child, { platform: "darwin", snapshot, kill: fake.kill, tag: TAG, since: spawnedAt, killWaitMs: 150, pollMs: 5 });
+        return { outcome, sinces, signals: fake.signals };
+    };
+
+    const quiet = await run(false);
+    assert.equal(quiet.outcome.confirmed, true, quiet.outcome.detail);
+    assert.equal(quiet.sinces[0], spawnedAt);
+    assert.ok(quiet.sinces[1] > spawnedAt, "narrowed after the clean first look");
+    assert.equal(quiet.signals.length, 0, "the unrelated helper is never signalled");
+
+    const late = await run(true);
+    assert.equal(late.outcome.confirmed, false, late.outcome.detail);
+    assert.match(late.outcome.detail, /pid\(s\) 400 is hidden by the system/);
+    assert.equal(late.signals.length, 0, JSON.stringify(late.signals));
+});
+
 test("the snapshot reads the build tag from real process environments", { skip: ["darwin", "linux"].includes(process.platform) ? false : "environments are read on macOS and Linux only" }, async (t) => {
     const tag = `${Date.now()}-0123456789abcdef`;
+    const since = Date.now();
     const tagged = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
         env: { ...process.env, [BUILD_TAG_ENV]: tag },
         detached: true,
@@ -1143,13 +1211,91 @@ test("the snapshot reads the build tag from real process environments", { skip: 
         tagged.kill("SIGKILL");
         other.kill("SIGKILL");
     });
-    await waitUntil(async () => (await processSnapshot({ tag })).get(tagged.pid)?.tagged === true, { message: "the tag to be visible" });
-    const snap = await processSnapshot({ tag });
+    await waitUntil(async () => (await processSnapshot({ tag, since })).get(tagged.pid)?.tagged === true, { message: "the tag to be visible" });
+    const snap = await processSnapshot({ tag, since });
     assert.equal(snap.get(other.pid)?.tagged, false);
     assert.equal(snap.get(process.pid)?.tagged, false);
-    assert.ok(Array.from(snap.values()).every((entry) => typeof entry.tagged === "boolean"));
+    // Undecided only where macOS hid the environment (other tests' orphaned shells, say).
+    assert.ok(Array.from(snap.values()).every((entry) => typeof entry.tagged === "boolean" || entry.envHidden === true));
     assert.ok(Number.isFinite(snap.get(tagged.pid).startedAt));
     await assert.rejects(processSnapshot({ tag: "short" }), /invalid build tag/);
+});
+
+test("a hidden macOS environment is decided by its shown ancestor, or left undecided when it could be the build's", () => {
+    const since = Date.parse("Thu Oct 22 10:00:00 2026");
+    const uid = 501;
+    const at = (pid, ppid, pgid, { lstart = "Thu Oct 22 10:00:05 2026", shown = false, tagged = false, owner = uid } = {}) => {
+        const [, entry] = proc(pid, ppid, pgid, lstart);
+        return [pid, { ...entry, uid: owner, envShown: shown, tagged }];
+    };
+    const processes = new Map([
+        at(1, 0, 1, { owner: 0 }),
+        at(10, 1, 10, { shown: true, tagged: true }), // the build's JVM
+        at(11, 10, 10), // hidden child of the tagged JVM: ours through it
+        at(12, 11, 10), // hidden grandchild: ours through the JVM
+        at(20, 1, 20, { shown: true }), // another tool, shown, untagged
+        at(21, 20, 20), // hidden child of that tool: not ours
+        at(30, 1, 30), // launchd-started group leader (an XPC service): not ours
+        at(31, 30, 30), // its hidden child: not ours
+        at(40, 1, 39), // hidden orphan, not a leader: could be a reparented build process
+        at(41, 40, 39), // its hidden child: likewise
+        at(50, 1, 39, { lstart: "Thu Oct 22 09:59:00 2026" }), // started before the build: not ours
+        at(60, 1, 39, { owner: 0 }), // another user's: not ours
+        at(70, 999, 70), // hidden, parent no longer listed: undecided
+    ]);
+    classifyHiddenEnvironments(processes, { since, uid });
+    const result = Object.fromEntries(Array.from(processes.values()).map((entry) => [entry.pid, entry.tagged]));
+    assert.deepEqual(result, {
+        1: false, 10: true, 11: true, 12: true, 20: false, 21: false, 30: false, 31: false,
+        40: undefined, 41: undefined, 50: false, 60: false, 70: undefined,
+    });
+    assert.equal(processes.get(40).envHidden, true);
+});
+
+test("a platform binary carrying the tag is never read as untagged on macOS", { skip: process.platform === "darwin" ? false : "macOS hides some environments from ps" }, async (t) => {
+    // The reviewer's case: `ps -E` prints no environment for /bin/sleep and does not say
+    // so. A tagged parent (standing in for the build's JVM) starts it, then dies, leaving it
+    // reparented to launchd with no shown ancestor.
+    const tag = `${Date.now()}-0123456789abcdef`;
+    const since = Date.now();
+    const parent = spawn(
+        process.execPath,
+        ["-e", "const c = require('node:child_process').spawn('/bin/sleep', ['30'], { stdio: 'ignore' }); console.log(c.pid); setInterval(() => {}, 1000);"],
+        { env: { ...process.env, [BUILD_TAG_ENV]: tag }, detached: true, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let sleeperPid;
+    t.after(() => {
+        parent.kill("SIGKILL");
+        if (sleeperPid) {
+            try {
+                process.kill(sleeperPid, "SIGKILL");
+            } catch {}
+        }
+    });
+    sleeperPid = Number(await new Promise((resolve) => parent.stdout.once("data", (data) => resolve(String(data).trim()))));
+    assert.ok(sleeperPid > 0);
+    const raw = spawnSync("ps", ["-ww", "-E", "-o", "command=", "-p", String(sleeperPid)], { encoding: "utf8" }).stdout;
+    t.diagnostic(`ps -E shows /bin/sleep's environment: ${raw.includes(`${BUILD_TAG_ENV}=`)}`);
+
+    await waitUntil(async () => (await processSnapshot({ tag, since })).get(sleeperPid)?.tagged === true, {
+        message: "sleep to be read as the tagged parent's",
+    });
+    parent.kill("SIGKILL");
+    await waitUntil(async () => (await processSnapshot({ tag, since })).get(sleeperPid)?.ppid === 1, { message: "sleep to be reparented" });
+    const entry = (await processSnapshot({ tag, since })).get(sleeperPid);
+    assert.notEqual(entry.tagged, false, "a hidden environment is not read as untagged");
+    if (!entry.envShown) {
+        assert.equal(entry.tagged, undefined, "undecided");
+        // Owned through the dead parent's process group, it is simply not gone...
+        const child = { pid: parent.pid, exitCode: null, signalCode: "SIGKILL" };
+        assert.ok((await liveBuildProcesses(child, { platform: "darwin", tag, since })).includes(sleeperPid));
+        // ...and with no such link it cannot be counted gone either.
+        const unrelated = { pid: 99_999_999, exitCode: 0, signalCode: null };
+        await assert.rejects(liveBuildProcesses(unrelated, { platform: "darwin", tag, since }), /hidden by the system/);
+    }
+    // Don't leave a hidden orphan behind for concurrently running test files to trip over.
+    process.kill(sleeperPid, "SIGKILL");
+    sleeperPid = undefined;
 });
 
 test("reading tags from /proc: unreadable others are not ours, any other failure fails the snapshot", async (t) => {

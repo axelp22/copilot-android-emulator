@@ -537,18 +537,83 @@ export async function markTaggedFromProc(processes, tag, { procRoot = "/proc" } 
     return processes;
 }
 
+function runPs(ps, args) {
+    return new Promise((resolve, reject) => {
+        execFile(
+            ps,
+            args,
+            { env: { ...process.env, LC_ALL: "C", LANG: "C" }, maxBuffer: 64 * 1024 * 1024, timeout: 5_000 },
+            (error, out) => (error ? reject(error) : resolve(out)),
+        );
+    });
+}
+
+/**
+ * macOS: `ps -E` silently omits the environment of some processes -- Apple
+ * platform binaries such as /bin/sh and /bin/sleep -- and an omitted
+ * environment reads exactly like one without the tag. Measured on macOS 26:
+ * /bin/sh, /bin/sleep and launchd's services are hidden; JDK 17 java, Homebrew
+ * node, /usr/bin/python3 and ad-hoc signed copies of /bin/sleep are visible.
+ *
+ * A hidden process (`envShown === false`) is decided, where it can be, by its
+ * nearest ancestor whose environment was shown: a child inherits its parent's
+ * environment, and on macOS an orphan is reparented to launchd, never to another
+ * process, so a living shown ancestor is its real one. Otherwise it is left
+ * undecided (`tagged` undefined, which fails the snapshot) when it could be one
+ * of this build's: this user's, started since the build (`since`), and not a
+ * process group leader launchd started -- launchd's own services, which start
+ * all the time, are those. Everything else hidden is not the build's.
+ *
+ * Callers narrow `since` to the start of their last clean observation: every
+ * process alive then was decided -- owned, and so remembered, or shown not to be
+ * the build's, which cannot change -- so only processes started after it can be
+ * unknown ones. That keeps unrelated orphans, such as another program's helpers
+ * left behind when it was killed, from holding the device for long.
+ *
+ * Not covered: a hidden process that made itself a group leader (setsid) and
+ * whose shown ancestors have all exited. The build's own processes -- the JVMs,
+ * adb -- show their environment.
+ */
+export function classifyHiddenEnvironments(processes, { since = -Infinity, uid = process.getuid?.() } = {}) {
+    for (const proc of processes.values()) {
+        if (proc.envShown !== false || proc.tagged === true) {
+            continue;
+        }
+        if (proc.uid !== uid || proc.startedAt < since - START_MATCH_SLACK_MS) {
+            continue;
+        }
+        let top = proc;
+        const seen = new Set();
+        while (top && top.envShown === false && top.ppid > 1 && !seen.has(top.pid)) {
+            seen.add(top.pid);
+            top = processes.get(top.ppid);
+        }
+        if (top?.envShown === true) {
+            proc.tagged = top.tagged;
+        } else if (top && top.envShown === false && (top.ppid === 0 || (top.ppid === 1 && top.pgid === top.pid))) {
+            continue;
+        } else {
+            proc.tagged = undefined;
+            proc.envHidden = true;
+        }
+    }
+    return processes;
+}
+
 /**
  * Every process on the machine: pid, parent, group, state and start time. The
  * start time is what tells a process from a later one that reused its pid.
  *
  * With `tag`, every process also says whether its environment carries this
  * build's tag (BUILD_TAG_ENV), which identifies a build process no earlier
- * observation saw. macOS appends the environment to `ps -E`'s command column
- * (escaping newlines, so one process stays one line); Linux reads /proc.
- * Elsewhere environments cannot be read and a tagged snapshot fails, so nothing
- * is ever confirmed gone without that evidence.
+ * observation saw. `since` is when the build started: nothing older carries
+ * the tag. macOS appends the environment to `ps -E`'s command column (escaping
+ * newlines, so one process stays one line), and a second listing without it
+ * shows which environments were hidden (see classifyHiddenEnvironments); Linux
+ * reads /proc. Elsewhere environments cannot be read and a tagged snapshot
+ * fails, so nothing is ever confirmed gone without that evidence.
  */
-export async function processSnapshot({ tag } = {}) {
+export async function processSnapshot({ tag, since } = {}) {
     const withTag = tag !== undefined;
     if (withTag) {
         assertTag(tag);
@@ -558,19 +623,17 @@ export async function processSnapshot({ tag } = {}) {
     }
     const fromPsEnv = withTag && process.platform === "darwin";
     const ps = await psPath();
-    const stdout = await new Promise((resolve, reject) => {
-        execFile(
-            ps,
-            fromPsEnv ? ["-A", "-ww", "-E", "-o", "pid=,ppid=,pgid=,stat=,lstart=,command="] : ["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
-            { env: { ...process.env, LC_ALL: "C", LANG: "C" }, maxBuffer: 64 * 1024 * 1024, timeout: 5_000 },
-            (error, out) => (error ? reject(error) : resolve(out)),
-        );
-    });
+    const stdout = await runPs(
+        ps,
+        fromPsEnv ? ["-A", "-ww", "-E", "-o", "pid=,ppid=,pgid=,uid=,stat=,lstart=,command="] : ["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
+    );
+    // Listed after the environments, so a process in both is the same one when its start time matches.
+    const plain = fromPsEnv ? await runPs(ps, ["-A", "-ww", "-o", "pid=,lstart=,command="]) : "";
     const tagToken = fromPsEnv ? new RegExp(`(?:^|\\s)${BUILD_TAG_ENV}=${tag}(?=\\s|$)`) : null;
     const processes = new Map();
     for (const line of stdout.split("\n")) {
         const match = fromPsEnv
-            ? /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)(?:\s(.*))?$/.exec(line)
+            ? /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)(?:\s(.*))?$/.exec(line)
             : /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
         if (!match) {
             if (fromPsEnv && line.trim()) {
@@ -579,22 +642,44 @@ export async function processSnapshot({ tag } = {}) {
             }
             continue;
         }
-        const lstart = match[5].trim();
+        const [stat, lstartText] = fromPsEnv ? [match[5], match[6]] : [match[4], match[5]];
+        const lstart = lstartText.trim();
         const proc = {
             pid: Number(match[1]),
             ppid: Number(match[2]),
             pgid: Number(match[3]),
-            stat: match[4],
+            stat,
             lstart,
             startedAt: Date.parse(lstart),
         };
         if (fromPsEnv) {
-            proc.tagged = tagToken.test(match[6] ?? "");
+            proc.uid = Number(match[4]);
+            proc.command = match[7] ?? "";
+            proc.tagged = tagToken.test(proc.command);
         }
         processes.set(proc.pid, proc);
     }
     if (processes.size === 0) {
         throw new Error("ps listed no processes");
+    }
+    if (fromPsEnv) {
+        const listed = new Map();
+        for (const line of plain.split("\n")) {
+            const match = /^\s*(\d+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)(?:\s(.*))?$/.exec(line);
+            if (match) {
+                listed.set(Number(match[1]), { lstart: match[2].trim(), command: match[3] ?? "" });
+            }
+        }
+        for (const proc of processes.values()) {
+            const bare = listed.get(proc.pid);
+            // Shown only when the environment listing is the bare command plus more; a
+            // process missing from the second listing, or changed, cannot be told apart.
+            proc.envShown = Boolean(
+                bare && bare.lstart === proc.lstart && proc.command.length > bare.command.length && proc.command.startsWith(`${bare.command} `),
+            );
+            delete proc.command;
+        }
+        classifyHiddenEnvironments(processes, { since });
     }
     if (withTag && !fromPsEnv) {
         await markTaggedFromProc(processes, tag);
@@ -605,13 +690,15 @@ export async function processSnapshot({ tag } = {}) {
 /**
  * Takes a snapshot; with a tag, only one in which every process says whether it
  * carries it -- a snapshot without that evidence cannot rule out an unseen
- * executor, so it is an error rather than an empty answer.
+ * executor, so it is an error rather than an empty answer. A process whose
+ * environment the system hid (`envHidden`, see classifyHiddenEnvironments) is
+ * left undecided for undecidedProcesses().
  */
-async function takeSnapshot(snapshot, tag) {
-    const snap = await snapshot(tag === undefined ? undefined : { tag });
+async function takeSnapshot(snapshot, tag, since) {
+    const snap = await snapshot(tag === undefined ? undefined : { tag, since });
     if (tag !== undefined) {
         for (const proc of snap.values()) {
-            if (typeof proc.tagged !== "boolean") {
+            if (typeof proc.tagged !== "boolean" && proc.envHidden !== true) {
                 throw new Error(`the environment of pid ${proc.pid} was not read, so this build's processes cannot all be identified`);
             }
         }
@@ -621,6 +708,21 @@ async function takeSnapshot(snapshot, tag) {
 
 function isZombie(proc) {
     return proc.stat.startsWith("Z");
+}
+
+/**
+ * Live processes that could be this build's -- their environment was hidden --
+ * but that nothing else shows to be: while any remain, the build's processes
+ * cannot be said to be gone.
+ */
+function undecidedProcesses(snapshot, owned) {
+    return Array.from(snapshot.values())
+        .filter((proc) => proc.envHidden === true && proc.tagged !== true && !owned.has(proc.pid) && !isZombie(proc))
+        .map((proc) => proc.pid);
+}
+
+function undecidedDetail(pids) {
+    return `the environment of pid(s) ${pids.join(", ")} is hidden by the system, so they cannot be told apart from this build's`;
 }
 
 /**
@@ -717,7 +819,7 @@ const noMarkers = async () => [];
  */
 async function stopOwnedPosix(
     child,
-    { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS, known = new Map(), tag },
+    { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS, known = new Map(), tag, since },
 ) {
     const wrapperPid = child.pid;
     const exited = () => child.exitCode !== null || child.signalCode !== null;
@@ -732,8 +834,11 @@ async function stopOwnedPosix(
     }
     let lastError = null;
     let settledPasses = 0;
+    // Narrowed after each clean pass; see classifyHiddenEnvironments.
+    let bound = since;
     for (;;) {
         let owned;
+        let undecided = [];
         try {
             const records = await markers();
             for (const record of records) {
@@ -742,11 +847,17 @@ async function stopOwnedPosix(
             // Freeze to a fixed point: a frozen process cannot fork, or exit and
             // orphan its children, so the next snapshot sees all of them.
             for (let round = 0; round < 10; round += 1) {
-                const snap = await takeSnapshot(snapshot, tag);
+                const passStart = Date.now();
+                const snap = await takeSnapshot(snapshot, tag, bound);
                 // exited() only after the snapshot: Node reaps the wrapper only once
                 // its exit is recorded, so a wrapper not yet exited here still held
                 // its pid when the snapshot was taken.
                 owned = ownedProcesses({ snapshot: snap, wrapperPid, wrapperExited: exited(), markers: records, known });
+                // Not signalled: they are not known to be this build's.
+                undecided = undecidedProcesses(snap, owned);
+                if (undecided.length === 0 && bound !== undefined) {
+                    bound = Math.max(bound, passStart);
+                }
                 const fresh = Array.from(owned.values()).filter((proc) => !frozen.has(proc.pid) && !isZombie(proc));
                 for (const proc of owned.values()) {
                     known.set(proc.pid, proc.lstart);
@@ -773,7 +884,7 @@ async function stopOwnedPosix(
             const live = Array.from(owned.values()).filter((proc) => !isZombie(proc));
             // Two clean passes in a row, the second with freshly read records, so a
             // record written while the first was looking is still acted on.
-            settledPasses = live.length === 0 && exited() ? settledPasses + 1 : 0;
+            settledPasses = live.length === 0 && undecided.length === 0 && exited() ? settledPasses + 1 : 0;
             if (settledPasses >= 2) {
                 return {
                     confirmed: true,
@@ -810,7 +921,9 @@ async function stopOwnedPosix(
                 confirmed: false,
                 detail: lastError && !owned
                     ? `its processes could not be listed (${lastError.message})`
-                    : `pid(s) ${remaining.join(", ") || wrapperPid} still running after SIGKILL`,
+                    : remaining.length === 0 && undecided.length > 0
+                      ? undecidedDetail(undecided)
+                      : `pid(s) ${remaining.join(", ") || wrapperPid} still running after SIGKILL`,
                 stopped: Array.from(stopped.values()),
                 executors: Array.from(executors),
             };
@@ -879,6 +992,7 @@ export async function terminateProcessTree(
         pollMs,
         known,
         tag,
+        since,
     } = {},
 ) {
     if (!child?.pid) {
@@ -887,7 +1001,7 @@ export async function terminateProcessTree(
     if (platform === "win32") {
         return stopOwnedWindows(child, { killWaitMs, markers, taskkill });
     }
-    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs, known, tag });
+    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs, known, tag, since });
 }
 
 /**
@@ -914,6 +1028,7 @@ export async function waitForProcessTreeExit(
         kill,
         known,
         tag,
+        since,
     } = {},
 ) {
     const pid = child.pid;
@@ -936,7 +1051,7 @@ export async function waitForProcessTreeExit(
         }
     }
     for (;;) {
-        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, known, tag });
+        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, known, tag, since });
         if (outcome.confirmed) {
             return { ...outcome, detail: `build processes exited after cancellation (${outcome.detail})` };
         }
@@ -957,7 +1072,7 @@ export async function waitForProcessTreeExit(
  */
 export async function liveBuildProcesses(
     child,
-    { platform = process.platform, markers = noMarkers, snapshot = processSnapshot, known = new Map(), tag } = {},
+    { platform = process.platform, markers = noMarkers, snapshot = processSnapshot, known = new Map(), tag, since } = {},
 ) {
     // Read only after every await: the wrapper can exit -- and its pid be reused --
     // while records or the snapshot are being read. Node reaps it only after its
@@ -969,10 +1084,14 @@ export async function liveBuildProcesses(
         return [...(exited() ? [] : [child.pid]), ...records.filter((record) => pidAlive(record.pid)).map((record) => record.pid)];
     }
     const records = await markers();
-    const snap = await takeSnapshot(snapshot, tag);
+    const snap = await takeSnapshot(snapshot, tag, since);
     const owned = ownedProcesses({ snapshot: snap, wrapperPid: child.pid, wrapperExited: exited(), markers: records, known });
     for (const proc of owned.values()) {
         known.set(proc.pid, proc.lstart);
+    }
+    const undecided = undecidedProcesses(snap, owned);
+    if (undecided.length > 0) {
+        throw new Error(undecidedDetail(undecided));
     }
     return Array.from(owned.values())
         .filter((proc) => !isZombie(proc))
@@ -1448,10 +1567,10 @@ export class AppBuildService {
     }
 
     /** Stops a run's processes (see terminateProcessTree); settles with the outcome, never throws. */
-    stopProcesses(child, markers, known, tag) {
+    stopProcesses(child, markers, known, owner) {
         return Promise.resolve()
             .then(() =>
-                this.processTree.terminate(child, { platform: this.platform, killWaitMs: this.terminateKillWaitMs, markers, known, tag }),
+                this.processTree.terminate(child, { platform: this.platform, killWaitMs: this.terminateKillWaitMs, markers, known, ...owner }),
             )
             .catch((error) => ({ confirmed: false, detail: `termination failed: ${error?.message ?? error}` }));
     }
@@ -1460,7 +1579,7 @@ export class AppBuildService {
      * Keeps the run reserved until its processes are seen to exit: `run.exited`
      * holds the project lock and, through the caller, the device.
      */
-    quarantine(run, child, outcome, markers, known, tag) {
+    quarantine(run, child, outcome, markers, known, owner) {
         run.orphanPid = outcome.executors?.[0] ?? child.pid;
         this.onDiagnostic(`Gradle (pid ${run.orphanPid}) could not be confirmed stopped: ${outcome.detail}`);
         run.exited = Promise.resolve(
@@ -1471,7 +1590,7 @@ export class AppBuildService {
                 treeUnreachable: Boolean(outcome.treeUnreachable),
                 markers,
                 known,
-                tag,
+                ...owner,
             }),
         ).catch(() => new Promise(() => {})); // A watcher that fails confirms nothing.
     }
@@ -1482,20 +1601,34 @@ export class AppBuildService {
      * seen gone. One that does not exit in time is stopped like a cancelled
      * build; the wait never counts as confirmation.
      */
-    async confirmBuildProcessesGone(child, markers, known, tag) {
+    async confirmBuildProcessesGone(child, markers, known, owner) {
         const deadline = Date.now() + this.executorExitWaitMs;
         for (;;) {
             const live = await Promise.resolve()
-                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known, tag }))
+                .then(() => this.observe(child, markers, known, owner))
                 .catch(() => null);
             if (live?.length === 0) {
                 return { confirmed: true, detail: "exited with the build" };
             }
             if (Date.now() >= deadline) {
-                return this.stopProcesses(child, markers, known, tag);
+                return this.stopProcesses(child, markers, known, owner);
             }
             await delay(STOP_POLL_MS * 2);
         }
+    }
+
+    /**
+     * Lists the build's live processes; a successful look is a clean one, which
+     * narrows how far back an undecided process can have started (see
+     * classifyHiddenEnvironments).
+     */
+    async observe(child, markers, known, owner) {
+        const startedAt = Date.now();
+        const live = await this.processTree.probe(child, { platform: this.platform, markers, known, ...owner });
+        if (owner.since) {
+            owner.since = Math.max(owner.since, startedAt);
+        }
+        return live;
     }
 
     /**
@@ -1503,11 +1636,11 @@ export class AppBuildService {
      * liveBuildProcesses). Purely additive: a failed observation proves nothing
      * and is ignored, and nothing is ever confirmed from it.
      */
-    async trackLineage(child, markers, known, tag, isDone) {
+    async trackLineage(child, markers, known, owner, isDone) {
         const exited = () => child.exitCode !== null || child.signalCode !== null;
         while (!isDone() && !exited()) {
             await Promise.resolve()
-                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known, tag }))
+                .then(() => this.observe(child, markers, known, owner))
                 .catch(() => {});
             await pause(this.lineagePollMs);
         }
@@ -1533,9 +1666,10 @@ export class AppBuildService {
                 markerDir ? readExecutorMarkers(markerDir, { wrapperPid: child.pid, spawnedAt }) : Promise.resolve([]);
             // Every process seen owned during this run (pid -> start time); see liveBuildProcesses.
             const known = new Map();
-            // In the environment of every process the build starts (see processSnapshot), so
-            // an executor no observation saw before its client died is still found.
-            const tag = randomUUID();
+            // The tag is in the environment of every process the build starts (see
+            // processSnapshot), so an executor no observation saw before its client died
+            // is still found; `since` is set when it starts.
+            const owner = { tag: randomUUID(), since: 0 };
             // Only once the processes they name are confirmed gone.
             const forgetMarkers = () =>
                 markers()
@@ -1551,14 +1685,14 @@ export class AppBuildService {
                     run.message = "Cancelling… stopping Gradle's build process";
                     this.publish(deviceId);
                 }
-                void this.stopProcesses(child, markers, known, tag).then(async (outcome) => {
+                void this.stopProcesses(child, markers, known, owner).then(async (outcome) => {
                     run.termination = outcome;
                     if (outcome.confirmed) {
                         await forgetMarkers();
                         settle(reject, cancelledError(run));
                         return;
                     }
-                    this.quarantine(run, child, outcome, markers, known, tag);
+                    this.quarantine(run, child, outcome, markers, known, owner);
                     settle(
                         reject,
                         new AppError(
@@ -1580,9 +1714,10 @@ export class AppBuildService {
             }
             try {
                 spawnedAt = Date.now();
+                owner.since = spawnedAt;
                 child = spawn(invocation.command, invocation.args, {
                     cwd,
-                    env: { ...process.env, ANDROID_SERIAL: serial, TERM: "dumb", [BUILD_TAG_ENV]: tag },
+                    env: { ...process.env, ANDROID_SERIAL: serial, TERM: "dumb", [BUILD_TAG_ENV]: owner.tag },
                     stdio: ["ignore", "pipe", "pipe"],
                     ...invocation.options,
                 });
@@ -1596,7 +1731,7 @@ export class AppBuildService {
                 run.tracking = { wrapperPid: child.pid, spawnedAt, markerDir };
             }
             if (child.pid && this.platform !== "win32") {
-                void this.trackLineage(child, markers, known, tag, () => settled || stopping);
+                void this.trackLineage(child, markers, known, owner, () => settled || stopping);
             }
 
             let pending = "";
@@ -1624,13 +1759,13 @@ export class AppBuildService {
                     // onAbort settles once every build process is confirmed gone.
                     return;
                 }
-                void this.confirmBuildProcessesGone(child, markers, known, tag).then(async (outcome) => {
+                void this.confirmBuildProcessesGone(child, markers, known, owner).then(async (outcome) => {
                     if (signal?.aborted || settled) {
                         return;
                     }
                     run.termination = outcome;
                     if (!outcome.confirmed) {
-                        this.quarantine(run, child, outcome, markers, known, tag);
+                        this.quarantine(run, child, outcome, markers, known, owner);
                         settle(
                             reject,
                             new AppError(
