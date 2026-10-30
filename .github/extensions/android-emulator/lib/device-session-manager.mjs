@@ -537,6 +537,16 @@ export class DeviceSessionManager {
                     .filter((device) => device.serial)
                     .map((device) => this.controlPool.invalidateIfReplaced(device.serial).catch(() => {})),
             );
+            // A device that disappeared (emulator killed, USB unplugged) leaves a
+            // cached channel to a dead endpoint and possibly a negative verdict.
+            // Dropping both lets a reconnect under the same serial start clean.
+            const present = new Set(discovered.map((device) => device.serial).filter(Boolean));
+            await Promise.all(
+                this.controlPool
+                    .serials()
+                    .filter((serial) => !present.has(serial))
+                    .map((serial) => this.controlPool.release(serial).catch(() => {})),
+            );
             this.lastDiscovery = discovered;
             this.discoveryCompletedAt = Date.now();
             return discovered;

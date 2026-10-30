@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/extension";
 import { CanvasBindingStore } from "./lib/canvas-binding-store.mjs";
+import { KeyedLock, resolveCanvasDevice } from "./lib/canvas-open.mjs";
 import { createCanvasServer } from "./lib/canvas-server.mjs";
 import { DeviceSessionManager } from "./lib/device-session-manager.mjs";
 import { AppError } from "./lib/errors.mjs";
@@ -11,6 +12,7 @@ const CANVAS_ID = "android-emulator";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.join(__dirname, "web");
 const instances = new Map();
+const instanceLocks = new KeyedLock();
 
 let copilotSession;
 let canvasBindings = null;
@@ -388,7 +390,7 @@ const canvas = createCanvas({
         ...leasedActions,
     ],
     open: async (ctx) =>
-        withCanvasError(async () => {
+        withCanvasError(() => instanceLocks.run(ctx.instanceId, async () => {
             // Identifies this session to other sessions sharing the same devices.
             manager.setSessionIdentity({
                 sessionId: ctx.sessionId,
@@ -396,8 +398,12 @@ const canvas = createCanvas({
             });
             const existing = instances.get(ctx.instanceId);
             const savedDeviceId = existing ? undefined : await canvasBindings?.get(ctx.instanceId);
-            const preferred = savedDeviceId !== undefined ? savedDeviceId : (ctx.input?.deviceId ?? null);
-            const deviceId = preferred ? await manager.resolveDeviceId(preferred) : null;
+            const { deviceId, persist } = await resolveCanvasDevice({
+                savedDeviceId,
+                requestedDeviceId: ctx.input?.deviceId ?? null,
+                resolveDeviceId: (preferred) => manager.resolveDeviceId(preferred),
+                onDiagnostic: diagnostic,
+            });
             const autoBoot = Boolean(deviceId) && ctx.input?.autoBoot !== false && ctx.input?.bootAfterOpen !== true;
 
             // Resolve real screen metrics up front so the frame paints at the right
@@ -428,7 +434,9 @@ const canvas = createCanvas({
                 entry = { deviceId, server };
                 instances.set(ctx.instanceId, entry);
             }
-            await canvasBindings?.set(ctx.instanceId, deviceId);
+            if (persist) {
+                await canvasBindings?.set(ctx.instanceId, deviceId);
+            }
             if (autoBoot) {
                 await manager.ensureBooted(deviceId);
             }
@@ -439,11 +447,12 @@ const canvas = createCanvas({
                 status: deviceId ? (device?.state === "Booted" ? "Ready" : "Starting") : "Choose a device",
                 url: entry.server.url,
             };
+        })),
+    onClose: async (ctx) =>
+        instanceLocks.run(ctx.instanceId, async () => {
+            await closeInstance(ctx.instanceId);
+            await canvasBindings?.delete(ctx.instanceId);
         }),
-    onClose: async (ctx) => {
-        await closeInstance(ctx.instanceId);
-        await canvasBindings?.delete(ctx.instanceId);
-    },
 });
 
 copilotSession = await joinSession({ canvases: [canvas] });

@@ -1,9 +1,11 @@
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 function safeFileName(instanceId) {
     return `${String(instanceId).replace(/[^A-Za-z0-9._-]/g, "_")}.json`;
 }
+
+let tempCounter = 0;
 
 export class CanvasBindingStore {
     constructor(root) {
@@ -15,20 +17,37 @@ export class CanvasBindingStore {
     }
 
     async get(instanceId) {
+        let raw;
         try {
-            const payload = JSON.parse(await readFile(this.filePath(instanceId), "utf8"));
-            return typeof payload.deviceId === "string" || payload.deviceId === null ? payload.deviceId : undefined;
-        } catch (error) {
-            if (error?.code === "ENOENT") {
-                return undefined;
-            }
+            raw = await readFile(this.filePath(instanceId), "utf8");
+        } catch {
             return undefined;
         }
+        let payload;
+        try {
+            payload = JSON.parse(raw);
+        } catch {
+            // A truncated or corrupt file (e.g. from a crash before writes were
+            // atomic) would otherwise be re-read, and ignored, on every reopen.
+            await this.delete(instanceId).catch(() => {});
+            return undefined;
+        }
+        return typeof payload?.deviceId === "string" || payload?.deviceId === null ? payload.deviceId : undefined;
     }
 
     async set(instanceId, deviceId) {
         await mkdir(this.root, { recursive: true });
-        await writeFile(this.filePath(instanceId), `${JSON.stringify({ deviceId })}\n`, "utf8");
+        const target = this.filePath(instanceId);
+        // Write then rename so a reopen racing this write, or a crash mid-write,
+        // never observes a half-written binding.
+        const temp = `${target}.${process.pid}.${++tempCounter}.tmp`;
+        try {
+            await writeFile(temp, `${JSON.stringify({ deviceId })}\n`, "utf8");
+            await rename(temp, target);
+        } catch (error) {
+            await unlink(temp).catch(() => {});
+            throw error;
+        }
     }
 
     async delete(instanceId) {
