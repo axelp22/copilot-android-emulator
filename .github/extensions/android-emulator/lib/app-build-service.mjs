@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -269,6 +269,13 @@ const LINEAGE_POLL_MS = 500;
 const EXECUTOR_MARKER_FORMAT = 1;
 /** ps reports start times to the second, Java to the millisecond. */
 const START_MATCH_SLACK_MS = 2_000;
+/**
+ * Set, with a random value, in the environment of every build. Processes inherit
+ * it however they are started -- reparented, in a new session, after the client
+ * that started them has died -- so a live process carrying it is this build's,
+ * even one no observation saw (see processSnapshot).
+ */
+export const BUILD_TAG_ENV = "COPILOT_ANDROID_BUILD_TAG";
 
 function cancelledError(run) {
     return new AppError("build_cancelled", run.cancelReason ?? "The build was cancelled.", 409);
@@ -427,6 +434,11 @@ export async function prepareExecutorTracking(executorDir) {
  * the process started after the wrapper was spawned: a record left by an
  * earlier build, or written by another build sharing the directory, names
  * neither, so it can never point at the wrong process.
+ *
+ * Records are renamed into place whole, so one that cannot be parsed or
+ * attributed was not written by the init script. If it appeared after this
+ * build started it could be this build's, so reading fails rather than taking
+ * it as "no executor"; one older than the build cannot be.
  */
 export async function readExecutorMarkers(markerDir, { wrapperPid, spawnedAt }) {
     const markers = [];
@@ -444,7 +456,9 @@ export async function readExecutorMarkers(markerDir, { wrapperPid, spawnedAt }) 
         }
         const file = path.join(markerDir, name);
         let raw;
+        let info;
         try {
+            info = await stat(file);
             raw = await readFile(file, "utf8");
         } catch (error) {
             if (error?.code === "ENOENT") {
@@ -456,17 +470,25 @@ export async function readExecutorMarkers(markerDir, { wrapperPid, spawnedAt }) 
         try {
             record = JSON.parse(raw);
         } catch {
-            // Records are renamed into place whole; this one is not ours.
+            // Not valid JSON: handled below like any other record that cannot be attributed.
         }
-        if (
-            record?.format !== EXECUTOR_MARKER_FORMAT ||
-            !Number.isInteger(record.pid) ||
-            !Number.isFinite(record.startedAt) ||
-            record.startedAt < spawnedAt - START_MATCH_SLACK_MS
-        ) {
+        const valid =
+            record?.format === EXECUTOR_MARKER_FORMAT &&
+            Number.isInteger(record.pid) &&
+            record.pid > 0 &&
+            Number.isFinite(record.startedAt) &&
+            Array.isArray(record.ancestors) &&
+            record.ancestors.every((pid) => Number.isInteger(pid));
+        if (!valid) {
+            if (info.mtimeMs < spawnedAt - START_MATCH_SLACK_MS) {
+                continue;
+            }
+            throw new Error(`executor record ${file} is malformed, so whether it is this build's cannot be told`);
+        }
+        if (record.startedAt < spawnedAt - START_MATCH_SLACK_MS) {
             continue;
         }
-        const lineage = [record.pid, ...(Array.isArray(record.ancestors) ? record.ancestors : [])];
+        const lineage = [record.pid, ...record.ancestors];
         if (lineage.includes(wrapperPid)) {
             markers.push({ pid: record.pid, startedAt: record.startedAt, file });
         }
@@ -483,39 +505,118 @@ async function psPath() {
     throw new Error("ps was not found in /bin or /usr/bin");
 }
 
+function assertTag(tag) {
+    if (typeof tag !== "string" || !/^[A-Za-z0-9-]{16,}$/.test(tag)) {
+        throw new Error("invalid build tag");
+    }
+}
+
+/**
+ * Linux: marks each process whose initial environment (/proc/<pid>/environ)
+ * carries the build tag. A process that is gone, or not this user's, cannot be
+ * read and is not marked; any other failure to read fails the whole snapshot.
+ */
+export async function markTaggedFromProc(processes, tag, { procRoot = "/proc" } = {}) {
+    assertTag(tag);
+    const needle = Buffer.from(`\0${BUILD_TAG_ENV}=${tag}\0`);
+    await Promise.all(
+        Array.from(processes.values()).map(async (proc) => {
+            let environ;
+            try {
+                environ = await readFile(path.join(procRoot, String(proc.pid), "environ"));
+            } catch (error) {
+                if (["ENOENT", "ESRCH", "EACCES", "EPERM"].includes(error?.code)) {
+                    proc.tagged = false;
+                    return;
+                }
+                throw error;
+            }
+            proc.tagged = Buffer.concat([Buffer.from("\0"), environ, Buffer.from("\0")]).includes(needle);
+        }),
+    );
+    return processes;
+}
+
 /**
  * Every process on the machine: pid, parent, group, state and start time. The
  * start time is what tells a process from a later one that reused its pid.
+ *
+ * With `tag`, every process also says whether its environment carries this
+ * build's tag (BUILD_TAG_ENV), which identifies a build process no earlier
+ * observation saw. macOS appends the environment to `ps -E`'s command column
+ * (escaping newlines, so one process stays one line); Linux reads /proc.
+ * Elsewhere environments cannot be read and a tagged snapshot fails, so nothing
+ * is ever confirmed gone without that evidence.
  */
-export async function processSnapshot() {
+export async function processSnapshot({ tag } = {}) {
+    const withTag = tag !== undefined;
+    if (withTag) {
+        assertTag(tag);
+        if (process.platform !== "darwin" && process.platform !== "linux") {
+            throw new Error(`process environments cannot be read on ${process.platform}`);
+        }
+    }
+    const fromPsEnv = withTag && process.platform === "darwin";
     const ps = await psPath();
     const stdout = await new Promise((resolve, reject) => {
         execFile(
             ps,
-            ["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
-            { env: { ...process.env, LC_ALL: "C", LANG: "C" }, maxBuffer: 32 * 1024 * 1024, timeout: 5_000 },
+            fromPsEnv ? ["-A", "-ww", "-E", "-o", "pid=,ppid=,pgid=,stat=,lstart=,command="] : ["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
+            { env: { ...process.env, LC_ALL: "C", LANG: "C" }, maxBuffer: 64 * 1024 * 1024, timeout: 5_000 },
             (error, out) => (error ? reject(error) : resolve(out)),
         );
     });
+    const tagToken = fromPsEnv ? new RegExp(`(?:^|\\s)${BUILD_TAG_ENV}=${tag}(?=\\s|$)`) : null;
     const processes = new Map();
     for (const line of stdout.split("\n")) {
-        const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
-        if (match) {
-            const lstart = match[5];
-            processes.set(Number(match[1]), {
-                pid: Number(match[1]),
-                ppid: Number(match[2]),
-                pgid: Number(match[3]),
-                stat: match[4],
-                lstart,
-                startedAt: Date.parse(lstart),
-            });
+        const match = fromPsEnv
+            ? /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)(?:\s(.*))?$/.exec(line)
+            : /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
+        if (!match) {
+            if (fromPsEnv && line.trim()) {
+                // A process that cannot be parsed could be one carrying the tag.
+                throw new Error("ps printed a process line that could not be read");
+            }
+            continue;
         }
+        const lstart = match[5].trim();
+        const proc = {
+            pid: Number(match[1]),
+            ppid: Number(match[2]),
+            pgid: Number(match[3]),
+            stat: match[4],
+            lstart,
+            startedAt: Date.parse(lstart),
+        };
+        if (fromPsEnv) {
+            proc.tagged = tagToken.test(match[6] ?? "");
+        }
+        processes.set(proc.pid, proc);
     }
     if (processes.size === 0) {
         throw new Error("ps listed no processes");
     }
+    if (withTag && !fromPsEnv) {
+        await markTaggedFromProc(processes, tag);
+    }
     return processes;
+}
+
+/**
+ * Takes a snapshot; with a tag, only one in which every process says whether it
+ * carries it -- a snapshot without that evidence cannot rule out an unseen
+ * executor, so it is an error rather than an empty answer.
+ */
+async function takeSnapshot(snapshot, tag) {
+    const snap = await snapshot(tag === undefined ? undefined : { tag });
+    if (tag !== undefined) {
+        for (const proc of snap.values()) {
+            if (typeof proc.tagged !== "boolean") {
+                throw new Error(`the environment of pid ${proc.pid} was not read, so this build's processes cannot all be identified`);
+            }
+        }
+    }
+    return snap;
 }
 
 function isZombie(proc) {
@@ -532,6 +633,9 @@ function isZombie(proc) {
  *     while the group has members, unless a new process holds the wrapper's pid;
  *   * the executors recorded for this build (readExecutorMarkers), when the pid's
  *     start time matches the record;
+ *   * every process whose environment carries this build's tag (`tagged`, see
+ *     processSnapshot) -- an executor no earlier observation saw, reparented
+ *     after its client died, still carries it;
  *   * then, to a fixed point, the children of owned processes and members of
  *     groups owned processes lead. Gradle's single-use daemon is a child of its
  *     client: after setsid() it leaves the client's group, not its parentage.
@@ -542,6 +646,12 @@ function isZombie(proc) {
  */
 export function ownedProcesses({ snapshot, wrapperPid, wrapperExited, markers = [], known = new Map() }) {
     const owned = new Map();
+    for (const proc of snapshot.values()) {
+        // Carries this build's tag (processSnapshot), which no unrelated process has.
+        if (proc.tagged === true) {
+            owned.set(proc.pid, proc);
+        }
+    }
     for (const [pid, lstart] of known) {
         const proc = snapshot.get(pid);
         if (proc?.lstart === lstart) {
@@ -607,7 +717,7 @@ const noMarkers = async () => [];
  */
 async function stopOwnedPosix(
     child,
-    { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS, known = new Map() },
+    { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS, known = new Map(), tag },
 ) {
     const wrapperPid = child.pid;
     const exited = () => child.exitCode !== null || child.signalCode !== null;
@@ -632,7 +742,10 @@ async function stopOwnedPosix(
             // Freeze to a fixed point: a frozen process cannot fork, or exit and
             // orphan its children, so the next snapshot sees all of them.
             for (let round = 0; round < 10; round += 1) {
-                const snap = await snapshot();
+                const snap = await takeSnapshot(snapshot, tag);
+                // exited() only after the snapshot: Node reaps the wrapper only once
+                // its exit is recorded, so a wrapper not yet exited here still held
+                // its pid when the snapshot was taken.
                 owned = ownedProcesses({ snapshot: snap, wrapperPid, wrapperExited: exited(), markers: records, known });
                 const fresh = Array.from(owned.values()).filter((proc) => !frozen.has(proc.pid) && !isZombie(proc));
                 for (const proc of owned.values()) {
@@ -765,6 +878,7 @@ export async function terminateProcessTree(
         kill,
         pollMs,
         known,
+        tag,
     } = {},
 ) {
     if (!child?.pid) {
@@ -773,7 +887,7 @@ export async function terminateProcessTree(
     if (platform === "win32") {
         return stopOwnedWindows(child, { killWaitMs, markers, taskkill });
     }
-    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs, known });
+    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs, known, tag });
 }
 
 /**
@@ -799,6 +913,7 @@ export async function waitForProcessTreeExit(
         killWaitMs = TERMINATE_KILL_WAIT_MS,
         kill,
         known,
+        tag,
     } = {},
 ) {
     const pid = child.pid;
@@ -821,7 +936,7 @@ export async function waitForProcessTreeExit(
         }
     }
     for (;;) {
-        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, known });
+        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, known, tag });
         if (outcome.confirmed) {
             return { ...outcome, detail: `build processes exited after cancellation (${outcome.detail})` };
         }
@@ -842,16 +957,20 @@ export async function waitForProcessTreeExit(
  */
 export async function liveBuildProcesses(
     child,
-    { platform = process.platform, markers = noMarkers, snapshot = processSnapshot, known = new Map() } = {},
+    { platform = process.platform, markers = noMarkers, snapshot = processSnapshot, known = new Map(), tag } = {},
 ) {
-    const exited = child.exitCode !== null || child.signalCode !== null;
+    // Read only after every await: the wrapper can exit -- and its pid be reused --
+    // while records or the snapshot are being read. Node reaps it only after its
+    // exit is recorded, so "not exited" read here means the snapshot's process
+    // with the wrapper's pid was still the wrapper.
+    const exited = () => child.exitCode !== null || child.signalCode !== null;
     if (platform === "win32") {
         const records = await markers();
-        return [...(exited ? [] : [child.pid]), ...records.filter((record) => pidAlive(record.pid)).map((record) => record.pid)];
+        return [...(exited() ? [] : [child.pid]), ...records.filter((record) => pidAlive(record.pid)).map((record) => record.pid)];
     }
     const records = await markers();
-    const snap = await snapshot();
-    const owned = ownedProcesses({ snapshot: snap, wrapperPid: child.pid, wrapperExited: exited, markers: records, known });
+    const snap = await takeSnapshot(snapshot, tag);
+    const owned = ownedProcesses({ snapshot: snap, wrapperPid: child.pid, wrapperExited: exited(), markers: records, known });
     for (const proc of owned.values()) {
         known.set(proc.pid, proc.lstart);
     }
@@ -1329,10 +1448,10 @@ export class AppBuildService {
     }
 
     /** Stops a run's processes (see terminateProcessTree); settles with the outcome, never throws. */
-    stopProcesses(child, markers, known) {
+    stopProcesses(child, markers, known, tag) {
         return Promise.resolve()
             .then(() =>
-                this.processTree.terminate(child, { platform: this.platform, killWaitMs: this.terminateKillWaitMs, markers, known }),
+                this.processTree.terminate(child, { platform: this.platform, killWaitMs: this.terminateKillWaitMs, markers, known, tag }),
             )
             .catch((error) => ({ confirmed: false, detail: `termination failed: ${error?.message ?? error}` }));
     }
@@ -1341,7 +1460,7 @@ export class AppBuildService {
      * Keeps the run reserved until its processes are seen to exit: `run.exited`
      * holds the project lock and, through the caller, the device.
      */
-    quarantine(run, child, outcome, markers, known) {
+    quarantine(run, child, outcome, markers, known, tag) {
         run.orphanPid = outcome.executors?.[0] ?? child.pid;
         this.onDiagnostic(`Gradle (pid ${run.orphanPid}) could not be confirmed stopped: ${outcome.detail}`);
         run.exited = Promise.resolve(
@@ -1352,6 +1471,7 @@ export class AppBuildService {
                 treeUnreachable: Boolean(outcome.treeUnreachable),
                 markers,
                 known,
+                tag,
             }),
         ).catch(() => new Promise(() => {})); // A watcher that fails confirms nothing.
     }
@@ -1362,17 +1482,17 @@ export class AppBuildService {
      * seen gone. One that does not exit in time is stopped like a cancelled
      * build; the wait never counts as confirmation.
      */
-    async confirmBuildProcessesGone(child, markers, known) {
+    async confirmBuildProcessesGone(child, markers, known, tag) {
         const deadline = Date.now() + this.executorExitWaitMs;
         for (;;) {
             const live = await Promise.resolve()
-                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known }))
+                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known, tag }))
                 .catch(() => null);
             if (live?.length === 0) {
                 return { confirmed: true, detail: "exited with the build" };
             }
             if (Date.now() >= deadline) {
-                return this.stopProcesses(child, markers, known);
+                return this.stopProcesses(child, markers, known, tag);
             }
             await delay(STOP_POLL_MS * 2);
         }
@@ -1383,11 +1503,11 @@ export class AppBuildService {
      * liveBuildProcesses). Purely additive: a failed observation proves nothing
      * and is ignored, and nothing is ever confirmed from it.
      */
-    async trackLineage(child, markers, known, isDone) {
+    async trackLineage(child, markers, known, tag, isDone) {
         const exited = () => child.exitCode !== null || child.signalCode !== null;
         while (!isDone() && !exited()) {
             await Promise.resolve()
-                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known }))
+                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known, tag }))
                 .catch(() => {});
             await pause(this.lineagePollMs);
         }
@@ -1413,6 +1533,9 @@ export class AppBuildService {
                 markerDir ? readExecutorMarkers(markerDir, { wrapperPid: child.pid, spawnedAt }) : Promise.resolve([]);
             // Every process seen owned during this run (pid -> start time); see liveBuildProcesses.
             const known = new Map();
+            // In the environment of every process the build starts (see processSnapshot), so
+            // an executor no observation saw before its client died is still found.
+            const tag = randomUUID();
             // Only once the processes they name are confirmed gone.
             const forgetMarkers = () =>
                 markers()
@@ -1428,14 +1551,14 @@ export class AppBuildService {
                     run.message = "Cancelling… stopping Gradle's build process";
                     this.publish(deviceId);
                 }
-                void this.stopProcesses(child, markers, known).then(async (outcome) => {
+                void this.stopProcesses(child, markers, known, tag).then(async (outcome) => {
                     run.termination = outcome;
                     if (outcome.confirmed) {
                         await forgetMarkers();
                         settle(reject, cancelledError(run));
                         return;
                     }
-                    this.quarantine(run, child, outcome, markers, known);
+                    this.quarantine(run, child, outcome, markers, known, tag);
                     settle(
                         reject,
                         new AppError(
@@ -1459,7 +1582,7 @@ export class AppBuildService {
                 spawnedAt = Date.now();
                 child = spawn(invocation.command, invocation.args, {
                     cwd,
-                    env: { ...process.env, ANDROID_SERIAL: serial, TERM: "dumb" },
+                    env: { ...process.env, ANDROID_SERIAL: serial, TERM: "dumb", [BUILD_TAG_ENV]: tag },
                     stdio: ["ignore", "pipe", "pipe"],
                     ...invocation.options,
                 });
@@ -1473,7 +1596,7 @@ export class AppBuildService {
                 run.tracking = { wrapperPid: child.pid, spawnedAt, markerDir };
             }
             if (child.pid && this.platform !== "win32") {
-                void this.trackLineage(child, markers, known, () => settled || stopping);
+                void this.trackLineage(child, markers, known, tag, () => settled || stopping);
             }
 
             let pending = "";
@@ -1501,13 +1624,13 @@ export class AppBuildService {
                     // onAbort settles once every build process is confirmed gone.
                     return;
                 }
-                void this.confirmBuildProcessesGone(child, markers, known).then(async (outcome) => {
+                void this.confirmBuildProcessesGone(child, markers, known, tag).then(async (outcome) => {
                     if (signal?.aborted || settled) {
                         return;
                     }
                     run.termination = outcome;
                     if (!outcome.confirmed) {
-                        this.quarantine(run, child, outcome, markers, known);
+                        this.quarantine(run, child, outcome, markers, known, tag);
                         settle(
                             reject,
                             new AppError(

@@ -17,12 +17,15 @@ import { extensionModule, extensionRoot, isAlive, sleep, tempDir, waitUntil } fr
 
 const {
     AppBuildService,
+    BUILD_TAG_ENV,
     executorInitScript,
     executorPaths,
     findGradleRoot,
     gradleInvocation,
     liveBuildProcesses,
+    markTaggedFromProc,
     ownedProcesses,
+    processSnapshot,
     parseTaskPath,
     readExecutorMarkers,
     resolveApplicationId,
@@ -846,12 +849,47 @@ test("executor records count only when written by this build's wrapper lineage a
     await write("10.json", { format: 1, pid: 10, ancestors: [4242, 1], startedAt: spawnedAt + 500 }); // ours
     await write("11.json", { format: 1, pid: 11, ancestors: [4242, 1], startedAt: spawnedAt - 60_000 }); // stale
     await write("12.json", { format: 1, pid: 12, ancestors: [777, 1], startedAt: spawnedAt + 500 }); // another build's
+    // Malformed, but written long before this build started: an earlier build's leftovers.
     await write("13.json", "{ not json");
     await write("14.json", { format: 2, pid: 14, ancestors: [4242], startedAt: spawnedAt + 500 });
+    const old = new Date(spawnedAt - 60_000);
+    await utimes(path.join(dir, "13.json"), old, old);
+    await utimes(path.join(dir, "14.json"), old, old);
     await write("15.json.tmp", { format: 1, pid: 15, ancestors: [4242], startedAt: spawnedAt + 500 });
     await write("4242.json", { format: 1, pid: 4242, ancestors: [1], startedAt: spawnedAt + 100 }); // in-process build
     const records = await readExecutorMarkers(dir, { wrapperPid: 4242, spawnedAt });
     assert.deepEqual(records.map((record) => record.pid).sort((a, b) => a - b), [10, 4242]);
+});
+
+test("a malformed executor record written during this build fails closed instead of being skipped", async (t) => {
+    const spawnedAt = Date.now();
+    for (const [name, body] of [
+        ["13.json", "{ not json"],
+        ["14.json", JSON.stringify({ format: 2, pid: 14, ancestors: [4242], startedAt: spawnedAt + 500 })],
+        ["16.json", JSON.stringify({ format: 1, pid: "16", ancestors: [4242], startedAt: spawnedAt + 500 })],
+        ["17.json", JSON.stringify({ format: 1, pid: 17, ancestors: "4242", startedAt: spawnedAt + 500 })],
+    ]) {
+        const dir = await tempDir(t, "executor-records-");
+        await writeFile(path.join(dir, "10.json"), JSON.stringify({ format: 1, pid: 10, ancestors: [4242], startedAt: spawnedAt + 500 }));
+        await writeFile(path.join(dir, name), body);
+        // It could name this build's executor, so it cannot count as "no executor".
+        await assert.rejects(readExecutorMarkers(dir, { wrapperPid: 4242, spawnedAt }), /malformed/, name);
+
+        const fake = fakeProcesses([proc(1, 0, 1)]);
+        const outcome = await terminateProcessTree(
+            { pid: 4242, exitCode: 0, signalCode: null },
+            {
+                platform: "linux",
+                snapshot: fake.snapshot,
+                kill: fake.kill,
+                markers: () => readExecutorMarkers(dir, { wrapperPid: 4242, spawnedAt }),
+                killWaitMs: 60,
+                pollMs: 5,
+            },
+        );
+        assert.equal(outcome.confirmed, false, `${name}: ${outcome.detail}`);
+        assert.equal(fake.signals.length, 0, "nothing is signalled on its account");
+    }
 });
 
 test("the init script records pid, ancestry and start time atomically, and quotes its directory", () => {
@@ -1012,6 +1050,124 @@ test("an unkillable executor known only from the build stays unconfirmed", async
     assert.match(outcome.detail, /200/);
 });
 
+test("a wrapper that exits while ownership is being read is not confused with a process that reused its pid", async () => {
+    // The wrapper is alive when the probe starts, exits during markers(), and the
+    // snapshot that follows shows its pid reused by an unrelated process.
+    const child = { pid: 100, exitCode: null, signalCode: null };
+    const reusedAt = "Thu Oct 22 11:00:00 2026";
+    const table = [proc(1, 0, 1), proc(100, 1, 100, reusedAt), proc(101, 100, 100, reusedAt), proc(900, 1, 900)];
+    const known = new Map();
+    const markers = async () => {
+        child.exitCode = 0;
+        return [];
+    };
+    const live = await liveBuildProcesses(child, { platform: "linux", markers, snapshot: async () => new Map(table), known });
+    assert.deepEqual(live, [], "the replacement is not this build's");
+    assert.equal(known.size, 0, "nor is it remembered as owned");
+
+    const fake = fakeProcesses(table);
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: fake.snapshot, kill: fake.kill, known, killWaitMs: 200, pollMs: 5 });
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(
+        fake.signals.every(([target]) => ![100, -100, 101, -101].includes(target)),
+        `an unrelated process was signalled: ${JSON.stringify(fake.signals)}`,
+    );
+});
+
+test("a wrapper that exits while the snapshot is taken is judged by its state after it", async () => {
+    const child = { pid: 100, exitCode: null, signalCode: null };
+    const reusedAt = "Thu Oct 22 11:00:00 2026";
+    const known = new Map();
+    const snapshot = async () => {
+        child.signalCode = "SIGKILL";
+        return new Map([proc(1, 0, 1), proc(100, 1, 100, reusedAt)]);
+    };
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot, known }), []);
+    assert.equal(known.size, 0);
+});
+
+test("ownership: a process carrying this build's tag is owned without any other evidence", () => {
+    const snapshot = new Map([
+        proc(1, 0, 1),
+        [200, { ...proc(200, 1, 200)[1], tagged: true }], // reparented executor, no record, never seen
+        [201, { ...proc(201, 200, 200)[1], tagged: true }],
+        [900, { ...proc(900, 1, 900)[1], tagged: false }], // another daemon
+    ]);
+    const owned = ownedProcesses({ snapshot, wrapperPid: 100, wrapperExited: true, known: new Map([[100, "Thu Oct 22 10:00:00 2026"]]) });
+    assert.deepEqual(Array.from(owned.keys()).sort((a, b) => a - b), [200, 201]);
+});
+
+const TAG = "0123456789abcdef-tag";
+
+test("an executor no observation saw is found by its tag after its client died, and stopped", async () => {
+    // The reviewer's case: the wrapper (100) has exited, the executor (200) is alive,
+    // reparented, with no record; the only observation saw the wrapper alone.
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const table = [[1, { ...proc(1, 0, 1)[1], tagged: false }], [200, { ...proc(200, 1, 200)[1], tagged: true }], [900, { ...proc(900, 1, 900)[1], tagged: false }]];
+    const known = new Map([[100, "Thu Oct 22 10:00:00 2026"]]);
+    const fake = fakeProcesses(table);
+    const tagged = async (options) => {
+        assert.equal(options?.tag, TAG, "the snapshot is asked for the build's tag");
+        return fake.snapshot();
+    };
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot: tagged, known, tag: TAG }), [200], "not gone");
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: tagged, kill: fake.kill, known, tag: TAG, killWaitMs: 500, pollMs: 5 });
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    assert.ok(fake.signals.some(([target, name]) => target === 200 && name === "SIGKILL"));
+    assert.ok(fake.signals.every(([target]) => Math.abs(target) !== 900), JSON.stringify(fake.signals));
+});
+
+test("without the tag in a snapshot, an unseen executor is never reported gone", async () => {
+    // Same case, but the snapshot cannot say which processes carry the tag.
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const fake = fakeProcesses([proc(1, 0, 1), proc(200, 1, 200), proc(900, 1, 900)]);
+    const known = new Map([[100, "Thu Oct 22 10:00:00 2026"]]);
+    await assert.rejects(liveBuildProcesses(child, { platform: "linux", snapshot: fake.snapshot, known, tag: TAG }), /was not read/);
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: fake.snapshot, kill: fake.kill, known, tag: TAG, killWaitMs: 60, pollMs: 5 });
+    assert.equal(outcome.confirmed, false, outcome.detail);
+    assert.equal(fake.signals.length, 0, "nothing is signalled without identifying it");
+});
+
+test("the snapshot reads the build tag from real process environments", { skip: ["darwin", "linux"].includes(process.platform) ? false : "environments are read on macOS and Linux only" }, async (t) => {
+    const tag = `${Date.now()}-0123456789abcdef`;
+    const tagged = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        env: { ...process.env, [BUILD_TAG_ENV]: tag },
+        detached: true,
+        stdio: "ignore",
+    });
+    const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        env: { ...process.env, [BUILD_TAG_ENV]: `${tag}x` }, // a prefix match is not a match
+        stdio: "ignore",
+    });
+    t.after(() => {
+        tagged.kill("SIGKILL");
+        other.kill("SIGKILL");
+    });
+    await waitUntil(async () => (await processSnapshot({ tag })).get(tagged.pid)?.tagged === true, { message: "the tag to be visible" });
+    const snap = await processSnapshot({ tag });
+    assert.equal(snap.get(other.pid)?.tagged, false);
+    assert.equal(snap.get(process.pid)?.tagged, false);
+    assert.ok(Array.from(snap.values()).every((entry) => typeof entry.tagged === "boolean"));
+    assert.ok(Number.isFinite(snap.get(tagged.pid).startedAt));
+    await assert.rejects(processSnapshot({ tag: "short" }), /invalid build tag/);
+});
+
+test("reading tags from /proc: unreadable others are not ours, any other failure fails the snapshot", async (t) => {
+    const root = await tempDir(t, "proc-");
+    const environ = (pid, body) => mkdir(path.join(root, String(pid)), { recursive: true }).then(() => writeFile(path.join(root, String(pid), "environ"), body));
+    await environ(10, `PATH=/bin\0${BUILD_TAG_ENV}=${TAG}\0HOME=/h\0`);
+    await environ(11, `${BUILD_TAG_ENV}=${TAG}x\0`);
+    await environ(12, `${BUILD_TAG_ENV}=${TAG}`); // first and last, without a trailing NUL
+    const processes = new Map([proc(10, 1, 10), proc(11, 1, 11), proc(12, 1, 12), proc(13, 1, 13)]); // 13: exited meanwhile
+    await markTaggedFromProc(processes, TAG, { procRoot: root });
+    assert.deepEqual(
+        Array.from(processes.values()).map((entry) => [entry.pid, entry.tagged]),
+        [[10, true], [11, false], [12, true], [13, false]],
+    );
+    await mkdir(path.join(root, "14", "environ"), { recursive: true }); // EISDIR
+    await assert.rejects(markTaggedFromProc(new Map([proc(14, 1, 14)]), TAG, { procRoot: root }), { code: "EISDIR" });
+});
+
 test("a process list that fails after one clean pass does not confirm, and the deadline still applies", { timeout: 5_000 }, async () => {
     const child = { pid: 100, exitCode: 0, signalCode: null };
     let calls = 0;
@@ -1156,6 +1312,48 @@ test("a recordless executor left behind by a killed client is stopped before the
     const termination = service.runs.get("dev").termination;
     assert.equal(termination.confirmed, true, termination.detail);
     assert.ok(termination.stopped?.some((entry) => entry.pid === daemon), JSON.stringify(termination));
+});
+
+test("an executor started and orphaned between observations is still found and stopped", posixOnly, async (t) => {
+    // Every observation while the client lives fails, and the client dies as soon
+    // as the daemon is up: nothing ever saw the daemon, which wrote no record.
+    const root = await recordlessProject(t, { clientDiesAfterMs: 0 });
+    let tracked = 0;
+    const service = newService(fakeManager(), {
+        executorExitWaitMs: 300,
+        lineagePollMs: 5,
+        processTree: {
+            probe: async (child, options) => {
+                if (child.exitCode === null && child.signalCode === null) {
+                    tracked += 1;
+                    throw new Error("ps is unavailable");
+                }
+                return liveBuildProcesses(child, options);
+            },
+        },
+    });
+    service.setWorkingDirectory(root);
+    const failure = await rejection(service.buildInstallLaunch({ deviceId: "dev", launch: false }));
+    const daemon = await daemonPid(root);
+    t.after(() => {
+        try {
+            process.kill(daemon, "SIGKILL");
+        } catch {
+            // Gone, as expected.
+        }
+    });
+    assert.ok(tracked > 0, "observations failed while the client ran");
+    const termination = service.runs.get("dev").termination;
+    if (["darwin", "linux"].includes(process.platform)) {
+        assert.equal(failure.code, "build_failed", failure.message);
+        assert.equal(isAlive(daemon), false, "the daemon was gone before the build was reported over");
+        assert.equal(termination.confirmed, true, termination.detail);
+        assert.ok(termination.stopped?.some((entry) => entry.pid === daemon), JSON.stringify(termination));
+    } else {
+        // No way to read the tag: the build stays reserved rather than guessing.
+        assert.equal(failure.code, "build_executor_unconfirmed", failure.message);
+        assert.equal(termination.confirmed, false);
+    }
 });
 
 test("cancelling during wrapper startup confirms the stop before anything it would start can run", posixOnly, async (t) => {
