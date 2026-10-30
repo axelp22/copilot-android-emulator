@@ -1049,3 +1049,39 @@ test("R5: overlapping closes share one cleanup, and disposeAll waits for a hold'
     assert.equal(tokens.disposed, true);
     assert.equal(disposals, 1, "closed once");
 });
+
+test("R2: a failed binding rollback surfaces both the switch rejection and the rollback cause", async () => {
+    const set = deferred();
+    const { controller, manager, leases, store } = leasingHarness({ devices: THREE_BOOTED, saved: { c: "A" } });
+    const diagnostics = [];
+    controller.diagnostic = (message) => diagnostics.push(message);
+    await controller.open({ instanceId: "c", input: {} });
+    const bindings = controller.getBindings();
+    const write = bindings.set.bind(bindings);
+    let calls = 0;
+    bindings.set = async (...args) => {
+        calls += 1;
+        if (calls === 1) {
+            await set.promise;
+            return write(...args);
+        }
+        throw new Error("disk full");
+    };
+    const switching = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "B" });
+    await tick();
+    leases.add("A");
+    set.resolve();
+    const error = await switching.then(
+        () => assert.fail("switch should reject"),
+        (e) => e,
+    );
+    assert.equal(error.code, "canvas_switch_rollback_failed");
+    assert.equal(error.details.switchError.code, "device_leased");
+    assert.equal(error.details.rollbackError.message, "disk full");
+    assert.deepEqual(error.cause.errors.map((e) => e.code ?? e.message), ["device_leased", "disk full"]);
+    assert.equal(diagnostics.length, 1);
+    assert.match(diagnostics[0], /device_leased|leased/);
+    assert.match(diagnostics[0], /disk full/);
+    assert.equal(manager.attached.get("c"), "A", "the canvas still shows A");
+    assert.equal(store.get("c"), "B", "the unrestored binding is reported, not hidden");
+});

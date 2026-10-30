@@ -158,7 +158,11 @@ export class CanvasInstanceController {
                 this.manager.assertNoActiveLease(resolvedId);
             } catch (error) {
                 if (this.instances.get(instanceId) === entry) {
-                    await bindings?.set(instanceId, entry.deviceId ?? null)?.catch?.(() => {});
+                    try {
+                        await bindings?.set(instanceId, entry.deviceId ?? null);
+                    } catch (rollbackError) {
+                        throw rollbackFailedError(instanceId, entry.deviceId ?? null, error, rollbackError, this.diagnostic);
+                    }
                 }
                 throw error;
             }
@@ -239,4 +243,21 @@ export class CanvasInstanceController {
         }
         await entry.server.close();
     }
+}
+
+/**
+ * The switch was refused but its binding write could not be undone, so the
+ * saved binding no longer matches what the canvas shows. Both causes are kept.
+ */
+function rollbackFailedError(instanceId, deviceId, switchError, rollbackError, diagnostic) {
+    const message =
+        `Canvas ${instanceId} switch was rejected (${switchError?.message ?? switchError}) ` +
+        `and restoring its saved binding to ${deviceId ?? "none"} failed: ${rollbackError?.message ?? rollbackError}`;
+    diagnostic?.(message);
+    const error = new AppError("canvas_switch_rollback_failed", message, 500, {
+        switchError: { code: switchError?.code, message: switchError?.message ?? String(switchError) },
+        rollbackError: { code: rollbackError?.code, message: rollbackError?.message ?? String(rollbackError) },
+    });
+    error.cause = new AggregateError([switchError, rollbackError], message);
+    return error;
 }
