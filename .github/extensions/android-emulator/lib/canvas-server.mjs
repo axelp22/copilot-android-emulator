@@ -713,10 +713,19 @@ export async function createCanvasServer({
     }
 
     let closing = null;
+    function assertNotClosing() {
+        if (closing) {
+            throw new AppError("canvas_closed", "The device canvas is closing.", 409);
+        }
+    }
     return {
         url: `http://127.0.0.1:${port}${basePath}/${bootstrapQuery()}`,
         async rebindDevice(nextDeviceId) {
+            assertNotClosing();
             await stopActiveConnections({ blockManualInput: true });
+            // A close that began while connections were stopping wins; rebinding
+            // would resubscribe a server that is being torn down.
+            assertNotClosing();
             deviceId = nextDeviceId;
             acceptingManualInput = true;
             subscribeToDevice();

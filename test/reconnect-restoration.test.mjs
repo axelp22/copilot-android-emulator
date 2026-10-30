@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { readdir, readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
-import { extensionModule, tempDir } from "./helpers.mjs";
+import { extensionModule, extensionRoot, tempDir } from "./helpers.mjs";
 
 const { EmulatorControlPool } = await extensionModule("lib", "emulator-control-pool.mjs");
 const { CanvasBindingStore } = await extensionModule("lib", "canvas-binding-store.mjs");
@@ -16,6 +16,9 @@ const { ScreenService, isConnectionFailure } = await extensionModule("lib", "scr
 const { KeyedLock, resolveCanvasDevice } = await extensionModule("lib", "canvas-open.mjs");
 const { AppError } = await extensionModule("lib", "errors.mjs");
 const { GRPC_STATUS } = await extensionModule("lib", "grpc-client.mjs");
+const { InputDispatcher } = await extensionModule("lib", "input-dispatcher.mjs");
+const { CanvasInstanceController } = await extensionModule("lib", "canvas-instances.mjs");
+const { DeviceSessionManager } = await extensionModule("lib", "device-session-manager.mjs");
 
 function grpcError(status, message = `status ${status}`) {
     return Object.assign(new Error(message), { grpcStatus: status });
@@ -351,7 +354,8 @@ test("reopen with a stale saved device falls back to the requested device", asyn
         requestedDeviceId: "avd:Pixel",
         resolveDeviceId: resolverFor(["avd:Pixel"]),
     });
-    assert.deepEqual(result, { deviceId: "avd:Pixel", persist: true });
+    // The fallback is temporary: only an explicit switch replaces the saved device.
+    assert.deepEqual(result, { deviceId: "avd:Pixel", persist: false });
 });
 
 test("reopen surfaces unexpected resolution errors", async () => {
@@ -400,4 +404,444 @@ test("keyed lock serializes work per key and releases on failure", async () => {
     assert.equal(await second, 2);
     assert.deepEqual(order, ["first:start", "other", "first:end", "second"]);
     assert.equal(lock.has("canvas"), false, "no lock state retained");
+});
+
+// --- Review regressions (PR #9) -------------------------------------------
+
+function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
+const TWO_EMULATORS = { "emulator-5554": { pid: 1, grpcPort: 8554 }, "emulator-5556": { pid: 2, grpcPort: 8556 } };
+
+test("F1: a failing video stream does not close the connection an active touch is using", async (t) => {
+    const pressures = [];
+    const { pool } = fakePool({
+        emulators: TWO_EMULATORS,
+        connect: async () => {
+            const channel = { closed: false, close() { this.closed = true; } };
+            return {
+                channel,
+                tokens: { dispose() {} },
+                controller: {
+                    sendTouch: async ({ touches }) => {
+                        if (channel.closed) {
+                            throw new Error("channel closed");
+                        }
+                        pressures.push(touches[0].pressure);
+                    },
+                },
+            };
+        },
+    });
+    const { service, registry } = screenServiceWith({
+        pool,
+        createFrameStream: async () => {
+            throw grpcError(GRPC_STATUS.deadlineExceeded);
+        },
+    });
+    const input = new InputDispatcher({
+        state: registry,
+        ensureBooted: async () => {},
+        screenSize: async () => ({ width: 1080, height: 1920 }),
+        refreshScreenMetrics: async () => {},
+        controlPool: pool,
+    });
+    const touch = { deviceId: "avd:A", x: 0.5, y: 0.5 };
+    await input.notifyTouch({ ...touch, phase: "down" });
+    await assert.rejects(service.createVideoStream({ deviceId: "avd:A", fps: 30, resolution: 50, transport: "grpc" }));
+    await input.notifyTouch({ ...touch, phase: "up" });
+    assert.deepEqual(pressures, [1, 0], "release delivered on the held connection");
+    t.after(() => pool.disposeAll());
+});
+
+test("F2: a delayed failure on an old stream does not close its replacement", async (t) => {
+    const { pool, opened, table } = fakePool({ emulators: TWO_EMULATORS });
+    const gate = deferred();
+    let calls = 0;
+    const { service } = screenServiceWith({
+        pool,
+        createFrameStream: async ({ controller }) => {
+            calls += 1;
+            if (calls === 1) {
+                await gate.promise;
+            }
+            return { controller };
+        },
+    });
+    const old = service.createVideoStream({ deviceId: "avd:A", fps: 30, resolution: 50, transport: "grpc" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(opened.length, 1);
+    await pool.release("emulator-5554");
+    table.set("emulator-5554", { pid: 9, grpcPort: 8600 });
+    const fresh = await service.createVideoStream({ deviceId: "avd:A", fps: 30, resolution: 50, transport: "grpc" });
+    assert.equal(fresh.controller, opened[1].controller);
+    gate.reject(grpcError(GRPC_STATUS.unavailable));
+    await assert.rejects(old);
+    assert.equal(opened[1].channel.closed, false, "replacement kept open");
+    assert.equal((await pool.get("emulator-5554")).controller, opened[1].controller);
+    t.after(() => pool.disposeAll());
+});
+
+test("F3: an obsolete failed handshake does not poison its replacement", async (t) => {
+    const handshakes = [];
+    const { pool } = fakePool({
+        emulators: TWO_EMULATORS,
+        connect: () => {
+            const gate = deferred();
+            handshakes.push(gate);
+            return gate.promise;
+        },
+    });
+    const stale = pool.get("emulator-5554");
+    await new Promise((resolve) => setImmediate(resolve));
+    await Promise.race([pool.release("emulator-5554"), new Promise((resolve) => setImmediate(resolve))]);
+    const replacement = pool.get("emulator-5554");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(handshakes.length, 2);
+    const channel = { closed: false, close() { this.closed = true; } };
+    handshakes[1].resolve({ controller: { id: "new" }, channel, tokens: { dispose() {} } });
+    assert.equal((await replacement).controller.id, "new");
+    handshakes[0].reject(grpcError(GRPC_STATUS.unauthenticated));
+    assert.equal(await stale, null);
+    assert.equal(pool.unavailableUntil.size, 0, "no negative verdict recorded");
+    assert.equal(pool.failureCounts.size, 0, "no failure counted");
+    assert.equal(channel.closed, false);
+    assert.equal((await pool.get("emulator-5554")).controller.id, "new");
+    t.after(() => pool.disposeAll());
+});
+
+test("F4: wrapped transport AppErrors without a gRPC status invalidate the connection", async (t) => {
+    assert.equal(isConnectionFailure(new AppError("grpc_transport_error", "http2 session broken")), true);
+    assert.equal(isConnectionFailure(new AppError("grpc_closed", "closed")), true);
+    const { pool, opened } = fakePool({ emulators: TWO_EMULATORS });
+    const { service } = screenServiceWith({
+        pool,
+        createFrameStream: async () => {
+            throw new AppError("grpc_transport_error", "http2 session broken", 502);
+        },
+    });
+    await assert.rejects(service.createVideoStream({ deviceId: "avd:A", fps: 30, resolution: 50, transport: "grpc" }));
+    assert.equal(opened[0].channel.closed, true, "broken session not reused");
+    t.after(() => pool.disposeAll());
+});
+
+test("F5: a fatal error after the first frame invalidates the pooled connection", async (t) => {
+    const { EventEmitter } = await import("node:events");
+    const { pool, opened } = fakePool({ emulators: TWO_EMULATORS });
+    let stream;
+    const { service } = screenServiceWith({
+        pool,
+        createFrameStream: async ({ controller }) => {
+            stream = Object.assign(new EventEmitter(), { controller });
+            return stream;
+        },
+    });
+    await service.createVideoStream({ deviceId: "avd:A", fps: 30, resolution: 50, transport: "grpc" });
+    stream.on("error", () => {});
+    stream.emit("error", grpcError(GRPC_STATUS.unavailable, "reset after first frame"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(opened[0].channel.closed, true);
+    const next = await service.createVideoStream({ deviceId: "avd:A", fps: 30, resolution: 50, transport: "grpc" });
+    assert.equal(next.controller, opened[1].controller, "next stream reconnects");
+    t.after(() => pool.disposeAll());
+});
+
+test("F6: a handshake settling at the disposal boundary is closed, not handed out", async () => {
+    const handshake = deferred();
+    let connectStarted;
+    const started = new Promise((resolve) => {
+        connectStarted = resolve;
+    });
+    const { pool } = fakePool({
+        emulators: { s: { pid: 1, grpcPort: 1 } },
+        connect: () => {
+            connectStarted();
+            return handshake.promise;
+        },
+    });
+    const acquiring = pool.get("s");
+    await started;
+    const channel = { closed: false, close() { this.closed = true; } };
+    const tokens = { disposed: false, dispose() { this.disposed = true; } };
+    handshake.resolve({ controller: {}, channel, tokens });
+    let disposing;
+    queueMicrotask(() => {
+        disposing = pool.disposeAll();
+    });
+    const result = await acquiring;
+    await disposing;
+    assert.equal(result, null);
+    assert.equal(channel.closed, true);
+    assert.equal(tokens.disposed, true);
+});
+
+/** An in-memory manager, server factory and binding store for the controller. */
+function instanceHarness({ devices = {}, saved = {}, gates = {} } = {}) {
+    const events = [];
+    const servers = [];
+    const deviceTable = new Map(Object.entries(devices));
+    const store = new Map(Object.entries(saved));
+    const manager = {
+        attached: new Map(),
+        async resolveDeviceId(preferred) {
+            if (deviceTable.size === 0) {
+                throw new AppError("no_devices", "none", 404);
+            }
+            const id = preferred ?? deviceTable.keys().next().value;
+            if (!deviceTable.has(id)) {
+                throw new AppError("unknown_device", `missing ${id}`, 404);
+            }
+            return id;
+        },
+        getCachedDeviceState: (id) => deviceTable.get(id) ?? { kind: "emulator", state: "Shutdown", name: id },
+        async refreshDeviceGeometry() {},
+        attachInstance(deviceId, instanceId) {
+            events.push(`attach:${deviceId}`);
+            manager.attached.set(instanceId, deviceId);
+        },
+        detachInstance(deviceId, instanceId) {
+            events.push(`detach:${deviceId}`);
+            if (manager.attached.get(instanceId) === deviceId) {
+                manager.attached.delete(instanceId);
+            }
+        },
+        async assertDeviceAvailable(id) {
+            return deviceTable.get(id);
+        },
+        assertNoActiveLease() {},
+        prepareBoot: (id) => events.push(`prepare:${id}`),
+        completePreparedBoot: async (id) => events.push(`boot:${id}`),
+        async ensureBooted(id) {
+            events.push(`ensureBooted:${id}`);
+            await gates.boot?.promise;
+        },
+    };
+    const bindings = {
+        writes: [],
+        async get(id) {
+            await gates.get?.promise;
+            return store.get(id);
+        },
+        async set(id, deviceId) {
+            bindings.writes.push(deviceId);
+            await gates.set?.promise;
+            store.set(id, deviceId);
+        },
+        async delete(id) {
+            store.delete(id);
+        },
+    };
+    const controller = new CanvasInstanceController({
+        manager,
+        getBindings: () => bindings,
+        webRoot: "/web",
+        openDeviceCanvas: async () => {},
+        createCanvasServer: async ({ deviceId }) => {
+            await gates.server?.promise;
+            const server = {
+                deviceId,
+                closed: false,
+                rebinds: [],
+                url: `http://127.0.0.1/${servers.length}`,
+                async close() {
+                    server.closed = true;
+                },
+                async rebindDevice(next) {
+                    if (server.closed) {
+                        throw new AppError("canvas_closed", "closing", 409);
+                    }
+                    server.rebinds.push(next);
+                },
+            };
+            servers.push(server);
+            return server;
+        },
+    });
+    return { controller, manager, servers, store, bindings, events, deviceTable };
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("F7: open and close complete without waiting for an emulator boot", async () => {
+    const boot = deferred();
+    const { controller, servers } = instanceHarness({
+        devices: { slow: { kind: "emulator", state: "Shutdown", name: "Slow" } },
+        gates: { boot },
+    });
+    const opened = await controller.open({ instanceId: "c", input: { deviceId: "slow" } });
+    assert.equal(opened.status, "Starting");
+    await controller.close("c");
+    assert.equal(servers[0].closed, true);
+    assert.equal(controller.instances.size, 0);
+    boot.resolve();
+});
+
+test("F8: opens queued behind a slow open do not outlive session shutdown", async () => {
+    const server = deferred();
+    const { controller, servers } = instanceHarness({
+        devices: { A: { kind: "emulator", state: "Booted", name: "A" } },
+        gates: { server },
+    });
+    const first = controller.open({ instanceId: "c", input: { deviceId: "A" } });
+    const second = controller.open({ instanceId: "c", input: { deviceId: "A" } });
+    const other = controller.open({ instanceId: "d", input: { deviceId: "A" } });
+    await tick();
+    const shutdown = controller.shutdown();
+    server.resolve();
+    await Promise.allSettled([first, second, other]);
+    await shutdown;
+    await assert.rejects(controller.open({ instanceId: "e", input: {} }), { code: "session_shutting_down" });
+    assert.equal(servers.filter((s) => !s.closed).length, 0, "no live servers remain");
+    assert.equal(controller.instances.size, 0);
+});
+
+test("F9: a close issued while a switch's binding write is pending leaves nothing behind", async () => {
+    const set = deferred();
+    const { controller, servers, store, manager } = instanceHarness({
+        devices: {
+            A: { kind: "emulator", state: "Booted", name: "A" },
+            B: { kind: "emulator", state: "Booted", name: "B" },
+        },
+        saved: { c: "A" },
+    });
+    await controller.open({ instanceId: "c", input: {} });
+    const bindings = controller.getBindings();
+    const write = bindings.set.bind(bindings);
+    bindings.set = async (...args) => {
+        await set.promise;
+        return write(...args);
+    };
+    const switching = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "B" });
+    await tick();
+    const closing = controller.close("c");
+    set.resolve();
+    // Switch and close are serialized per instance: the switch commits, then
+    // the close tears it down -- the late write cannot outlive the close.
+    await Promise.allSettled([switching]);
+    await closing;
+    assert.equal(store.has("c"), false, "no binding left behind");
+    assert.equal(manager.attached.has("c"), false, "no B attachment");
+    assert.equal(servers[0].closed, true);
+    assert.equal(controller.instances.size, 0);
+});
+
+test("F9: a switch queued behind a close is rejected without writing a binding", async () => {
+    const { controller, servers, store, manager, bindings } = instanceHarness({
+        devices: {
+            A: { kind: "emulator", state: "Booted", name: "A" },
+            B: { kind: "emulator", state: "Booted", name: "B" },
+        },
+        saved: { c: "A" },
+    });
+    await controller.open({ instanceId: "c", input: {} });
+    const closing = controller.close("c");
+    const switching = controller.switch({ instanceId: "c", fromDeviceId: "A", toDeviceId: "B" });
+    await assert.rejects(switching, { code: "canvas_instance_missing" });
+    await closing;
+    assert.equal(bindings.writes.includes("B"), false);
+    assert.equal(store.has("c"), false);
+    assert.equal(manager.attached.has("c"), false);
+    assert.deepEqual(servers[0].rebinds, []);
+});
+
+test("F9: a closing canvas server refuses to rebind", async () => {
+    const { createCanvasServer } = await extensionModule("lib", "canvas-server.mjs");
+    const subscribed = [];
+    const manager = {
+        refreshSharing: async () => {},
+        subscribe: (id) => {
+            subscribed.push(id);
+            return () => {};
+        },
+        registerManualInputStop: () => () => {},
+        snapshot: () => ({}),
+    };
+    const server = await createCanvasServer({
+        manager,
+        instanceId: "c",
+        deviceId: null,
+        webRoot: path.join(extensionRoot, "web"),
+    });
+    const closing = server.close();
+    await assert.rejects(server.rebindDevice("B"), { code: "canvas_closed" });
+    await closing;
+    await assert.rejects(server.rebindDevice("B"), { code: "canvas_closed" });
+    assert.deepEqual(subscribed, [], "a closed server is never resubscribed");
+});
+
+test("F10/F11: a missing saved device is retained and restored when it returns", async () => {
+    const { controller, store, bindings, deviceTable } = instanceHarness({
+        devices: { A: { kind: "emulator", state: "Booted", name: "A" } },
+        saved: { c: "B" },
+    });
+    const first = await controller.open({ instanceId: "c", input: {} });
+    assert.equal(first.deviceId, null, "B missing opens unbound");
+    assert.equal(store.get("c"), "B");
+    deviceTable.set("B", { kind: "emulator", state: "Booted", name: "B" });
+    const second = await controller.open({ instanceId: "c", input: {} });
+    assert.equal(second.deviceId, "B", "restored once B returns");
+    assert.equal(store.get("c"), "B");
+    assert.equal(bindings.writes.includes(null), false, "never erased");
+});
+
+test("F11: a replayed original device is a temporary fallback, not a new saved choice", async () => {
+    const { controller, store, deviceTable } = instanceHarness({
+        devices: { A: { kind: "emulator", state: "Booted", name: "A" } },
+        saved: { c: "B" },
+    });
+    const first = await controller.open({ instanceId: "c", input: { deviceId: "A" } });
+    assert.equal(first.deviceId, "A");
+    assert.equal(store.get("c"), "B", "last switched device kept");
+    await controller.close("c");
+    store.set("c", "B");
+    deviceTable.set("B", { kind: "emulator", state: "Booted", name: "B" });
+    assert.equal((await controller.open({ instanceId: "c", input: { deviceId: "A" } })).deviceId, "B");
+});
+
+test("F12: an offline physical device opens a recoverable canvas without booting", async () => {
+    const { controller, servers, events } = instanceHarness({
+        devices: { "usb:abc": { kind: "physical", state: "Offline", name: "Phone" } },
+    });
+    const opened = await controller.open({ instanceId: "c", input: { deviceId: "usb:abc" } });
+    await tick();
+    assert.equal(opened.deviceId, "usb:abc");
+    assert.equal(servers.length, 1);
+    assert.equal(events.some((event) => event.startsWith("ensureBooted")), false);
+});
+
+test("F13: removing an emulator with a pending handshake does not stall discovery", async () => {
+    const handshake = deferred();
+    const { pool } = fakePool({
+        emulators: { "emulator-5554": { pid: 1, grpcPort: 8554 } },
+        connect: () => handshake.promise,
+    });
+    const pending = pool.get("emulator-5554");
+    await tick();
+    const manager = Object.create(DeviceSessionManager.prototype);
+    Object.assign(manager, {
+        state: new DeviceRegistry(),
+        controlPool: pool,
+        discoveryInFlight: null,
+        lastDiscovery: null,
+        discoveryCompletedAt: 0,
+        discoverDevices: async () => [],
+    });
+    const result = await Promise.race([
+        manager.refreshDevices({ force: true }).then(() => "done"),
+        new Promise((resolve) => setTimeout(() => resolve("stalled"), 200)),
+    ]);
+    assert.equal(result, "done");
+    assert.deepEqual(pool.serials(), [], "cache cleared immediately");
+    const channel = { closed: false, close() { this.closed = true; } };
+    handshake.resolve({ controller: {}, channel, tokens: { dispose() {} } });
+    assert.equal(await pending, null, "stale completion not handed out");
+    await tick();
+    assert.equal(channel.closed, true, "late connection closed on settlement");
 });

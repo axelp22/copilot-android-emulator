@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/extension";
 import { CanvasBindingStore } from "./lib/canvas-binding-store.mjs";
-import { KeyedLock, resolveCanvasDevice } from "./lib/canvas-open.mjs";
+import { CanvasInstanceController } from "./lib/canvas-instances.mjs";
 import { createCanvasServer } from "./lib/canvas-server.mjs";
 import { DeviceSessionManager } from "./lib/device-session-manager.mjs";
 import { AppError } from "./lib/errors.mjs";
@@ -11,8 +11,6 @@ import { actionSchemas, openInputSchema } from "./lib/schemas.mjs";
 const CANVAS_ID = "android-emulator";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.join(__dirname, "web");
-const instances = new Map();
-const instanceLocks = new KeyedLock();
 
 let copilotSession;
 let canvasBindings = null;
@@ -22,6 +20,14 @@ function diagnostic(message) {
 }
 
 const manager = new DeviceSessionManager({ onDiagnostic: diagnostic });
+const canvasInstances = new CanvasInstanceController({
+    manager,
+    createCanvasServer,
+    getBindings: () => canvasBindings,
+    webRoot,
+    openDeviceCanvas: (args) => openDeviceCanvas(args),
+    onDiagnostic: diagnostic,
+});
 
 function toCanvasError(error) {
     if (error instanceof CanvasError) {
@@ -39,18 +45,6 @@ async function withCanvasError(fn) {
     } catch (error) {
         throw toCanvasError(error);
     }
-}
-
-async function closeInstance(instanceId) {
-    const entry = instances.get(instanceId);
-    if (!entry) {
-        return;
-    }
-    instances.delete(instanceId);
-    if (entry.deviceId) {
-        manager.detachInstance(entry.deviceId, instanceId);
-    }
-    await entry.server.close();
 }
 
 function deviceInstanceId(deviceId) {
@@ -100,54 +94,8 @@ async function openDeviceCanvas({ deviceId, instanceId = deviceInstanceId(device
     return { deviceId, instanceId: opened.instanceId, focusedExisting: true };
 }
 
-async function switchDeviceCanvas({ instanceId, fromDeviceId, toDeviceId }) {
-    const resolvedId = await manager.resolveDeviceId(toDeviceId);
-    const target = await manager.assertDeviceAvailable(resolvedId);
-    if (fromDeviceId) {
-        manager.assertNoActiveLease(fromDeviceId);
-    }
-    manager.assertNoActiveLease(resolvedId);
-
-    const entry = instances.get(instanceId);
-    if (!entry) {
-        throw new AppError("canvas_instance_missing", "The device canvas is no longer available.", 404);
-    }
-
-    const needsBoot = target.state !== "Booted" && target.kind === "emulator";
-    if (needsBoot) {
-        manager.prepareBoot(resolvedId);
-    }
-
-    await canvasBindings?.set(instanceId, resolvedId);
-    if (fromDeviceId) {
-        manager.detachInstance(fromDeviceId, instanceId);
-    }
-    manager.attachInstance(resolvedId, instanceId);
-    await entry.server.rebindDevice(resolvedId);
-    entry.deviceId = resolvedId;
-
-    if (needsBoot) {
-        queueMicrotask(() => {
-            void manager.completePreparedBoot(resolvedId).catch((error) => {
-                diagnostic(`Failed to boot the switched emulator: ${error.message ?? String(error)}`);
-            });
-        });
-    }
-
-    return {
-        deviceId: resolvedId,
-        switching: fromDeviceId !== resolvedId,
-        opening: false,
-        state: needsBoot ? "Booting" : target.state,
-    };
-}
-
 function ensureString(value, fallback = "") {
     return typeof value === "string" ? value : fallback;
-}
-
-function canvasTitleForDevice(device, deviceId) {
-    return device?.name || `Android ${deviceId}`;
 }
 
 /** Wraps an action so it runs inside the caller's control lease and reports progress. */
@@ -390,69 +338,16 @@ const canvas = createCanvas({
         ...leasedActions,
     ],
     open: async (ctx) =>
-        withCanvasError(() => instanceLocks.run(ctx.instanceId, async () => {
+        withCanvasError(async () => {
             // Identifies this session to other sessions sharing the same devices.
             manager.setSessionIdentity({
                 sessionId: ctx.sessionId,
                 workingDirectory: ctx.session?.workingDirectory ?? process.cwd(),
             });
-            const existing = instances.get(ctx.instanceId);
-            const savedDeviceId = existing ? undefined : await canvasBindings?.get(ctx.instanceId);
-            const { deviceId, persist } = await resolveCanvasDevice({
-                savedDeviceId,
-                requestedDeviceId: ctx.input?.deviceId ?? null,
-                resolveDeviceId: (preferred) => manager.resolveDeviceId(preferred),
-                onDiagnostic: diagnostic,
-            });
-            const autoBoot = Boolean(deviceId) && ctx.input?.autoBoot !== false && ctx.input?.bootAfterOpen !== true;
-
-            // Resolve real screen metrics up front so the frame paints at the right
-            // aspect ratio instead of briefly using the placeholder geometry.
-            if (deviceId && manager.getCachedDeviceState(deviceId).state === "Booted") {
-                await manager.refreshDeviceGeometry(deviceId).catch(() => {});
-            }
-
-            if (existing && existing.deviceId !== deviceId) {
-                await closeInstance(ctx.instanceId);
-            }
-
-            let entry = instances.get(ctx.instanceId);
-            if (!entry) {
-                const server = await createCanvasServer({
-                    manager,
-                    instanceId: ctx.instanceId,
-                    deviceId,
-                    webRoot,
-                    openDeviceCanvas,
-                    switchDeviceCanvas,
-                    bootAfterOpen: ctx.input?.bootAfterOpen === true,
-                    onDiagnostic: diagnostic,
-                });
-                if (deviceId) {
-                    manager.attachInstance(deviceId, ctx.instanceId);
-                }
-                entry = { deviceId, server };
-                instances.set(ctx.instanceId, entry);
-            }
-            if (persist) {
-                await canvasBindings?.set(ctx.instanceId, deviceId);
-            }
-            if (autoBoot) {
-                await manager.ensureBooted(deviceId);
-            }
-
-            const device = deviceId ? manager.getCachedDeviceState(deviceId) : null;
-            return {
-                title: deviceId ? canvasTitleForDevice(device, deviceId) : "Android Emulator",
-                status: deviceId ? (device?.state === "Booted" ? "Ready" : "Starting") : "Choose a device",
-                url: entry.server.url,
-            };
-        })),
-    onClose: async (ctx) =>
-        instanceLocks.run(ctx.instanceId, async () => {
-            await closeInstance(ctx.instanceId);
-            await canvasBindings?.delete(ctx.instanceId);
+            const { title, status, url } = await canvasInstances.open({ instanceId: ctx.instanceId, input: ctx.input });
+            return { title, status, url };
         }),
+    onClose: async (ctx) => canvasInstances.close(ctx.instanceId),
 });
 
 copilotSession = await joinSession({ canvases: [canvas] });
@@ -467,7 +362,7 @@ if (workspacePath) {
 await copilotSession.log("Android Emulator extension loaded.");
 
 copilotSession.on("session.shutdown", async () => {
-    await Promise.allSettled(Array.from(instances.keys(), (instanceId) => closeInstance(instanceId)));
+    await canvasInstances.shutdown();
     try {
         await manager.dispose();
     } catch (error) {

@@ -17,8 +17,10 @@ export function isStaleDeviceError(error) {
  * was looking at. But that device may be unplugged, shut down and deleted, or
  * unauthorized since; failing the open would leave a canvas that can never be
  * reopened. Instead the requested device is tried, and failing that the canvas
- * opens unbound. The saved binding is kept (`persist: false`) in that case, so
- * replugging the device and reopening restores it.
+ * opens unbound. Either way the saved binding is kept (`persist: false`): the
+ * requested device is the host replaying the canvas's original input, only a
+ * temporary stand-in, and only an explicit switch replaces the user's choice.
+ * Replugging the saved device and reopening then restores it.
  */
 export async function resolveCanvasDevice({ savedDeviceId, requestedDeviceId, resolveDeviceId, onDiagnostic = () => {} }) {
     if (savedDeviceId === undefined) {
@@ -38,7 +40,7 @@ export async function resolveCanvasDevice({ savedDeviceId, requestedDeviceId, re
     }
     if (requestedDeviceId && requestedDeviceId !== savedDeviceId) {
         try {
-            return { deviceId: await resolveDeviceId(requestedDeviceId), persist: true };
+            return { deviceId: await resolveDeviceId(requestedDeviceId), persist: false };
         } catch (error) {
             if (!isStaleDeviceError(error)) {
                 throw error;

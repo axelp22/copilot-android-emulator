@@ -540,13 +540,15 @@ export class DeviceSessionManager {
             // A device that disappeared (emulator killed, USB unplugged) leaves a
             // cached channel to a dead endpoint and possibly a negative verdict.
             // Dropping both lets a reconnect under the same serial start clean.
+            // `release` clears the cache synchronously; the close of a handshake
+            // still in flight is left to settle on its own, so one removed
+            // emulator cannot stall discovery of every other device.
             const present = new Set(discovered.map((device) => device.serial).filter(Boolean));
-            await Promise.all(
-                this.controlPool
-                    .serials()
-                    .filter((serial) => !present.has(serial))
-                    .map((serial) => this.controlPool.release(serial).catch(() => {})),
-            );
+            for (const serial of this.controlPool.serials()) {
+                if (!present.has(serial)) {
+                    void this.controlPool.release(serial).catch(() => {});
+                }
+            }
             this.lastDiscovery = discovered;
             this.discoveryCompletedAt = Date.now();
             return discovered;

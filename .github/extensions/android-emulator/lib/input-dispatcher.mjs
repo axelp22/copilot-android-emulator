@@ -167,6 +167,7 @@ export class InputDispatcher {
      */
     abandonPointerBackend(deviceId, error) {
         this.pointerDisabled.set(deviceId, Date.now() + POINTER_RETRY_BACKOFF_MS);
+        this.touchSessions.get(deviceId)?.releaseHold?.();
         this.touchSessions.delete(deviceId);
         return { deviceId, action: "touch", degraded: true, reason: error?.message ?? String(error) };
     }
@@ -393,7 +394,11 @@ export class InputDispatcher {
                 if (phase === "down") {
                     // Hold the controller for the gesture's lifetime so a later
                     // pool change cannot strand the slot we are about to open.
-                    this.touchSessions.set(deviceId, { grpc: true, controller, startX: x, startY: y });
+                    // The pool hold also keeps the channel open if the video
+                    // stream reports it failed while the finger is down.
+                    existing?.releaseHold?.();
+                    const releaseHold = this.controlPool?.hold?.(controller) ?? (() => {});
+                    this.touchSessions.set(deviceId, { grpc: true, controller, releaseHold, startX: x, startY: y });
                     await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: GRPC_TOUCH_PRESSURE });
                     return { deviceId, action: "touch", phase, x, y, transport: "grpc" };
                 }
@@ -406,11 +411,16 @@ export class InputDispatcher {
                 }
                 // phase === "up": release the slot at the final position.
                 this.touchSessions.delete(deviceId);
-                await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 });
+                try {
+                    await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 });
+                } finally {
+                    existing.releaseHold?.();
+                }
                 return { deviceId, action: "touch", phase, x, y, transport: "grpc" };
             } catch (error) {
                 // Release the slot on a best-effort basis before giving up on it.
                 await this.sendGrpcTouch(deviceId, controller, { x, y, pressure: 0 }).catch(() => {});
+                existing?.releaseHold?.();
                 return this.abandonPointerBackend(deviceId, error);
             }
         }
@@ -508,6 +518,7 @@ export class InputDispatcher {
                     pressure: 0,
                 }).catch(() => {});
             }
+            session.releaseHold?.();
             return;
         }
 
@@ -569,7 +580,9 @@ export class InputDispatcher {
                     x: session.startX,
                     y: session.startY,
                     pressure: 0,
-                }).catch(() => {});
+                })
+                    .catch(() => {})
+                    .finally(() => session.releaseHold?.());
             }
             this.touchSessions.delete(target);
         }

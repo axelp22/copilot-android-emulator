@@ -183,6 +183,15 @@ export class ScreenService {
                 onDiagnostic: (message) => this.onDiagnostic(`[${deviceId}] ${message}`),
             });
             this.grpcFailures.delete(deviceId);
+            // A stream can die long after its first frame (a liveness probe
+            // fails, the socket resets). Retire the connection it borrowed then
+            // too, or every later stream would reuse the broken channel.
+            const borrowed = entry;
+            stream.on?.("error", (error) => {
+                if (isConnectionFailure(error)) {
+                    void this.controlPool?.reportFailure?.(serial, error, borrowed)?.catch?.(() => {});
+                }
+            });
             return stream;
         } catch (error) {
             // A borrowed connection that failed to stream is probably stale (the
@@ -190,7 +199,7 @@ export class ScreenService {
             // socket died). Drop it so the next attempt reconnects instead of
             // mirroring forever against a dead channel.
             if (entry?.controller && serial && isConnectionFailure(error)) {
-                await this.controlPool?.reportFailure?.(serial, error).catch(() => {});
+                await this.controlPool?.reportFailure?.(serial, error, entry)?.catch?.(() => {});
             }
             if (required) {
                 throw error;
@@ -204,6 +213,19 @@ export class ScreenService {
 }
 
 /**
+ * AppError codes the gRPC client and frame stream use for a broken channel. Not
+ * `grpc_unavailable` (that is "this device has no endpoint") nor
+ * `grpc_cancelled` (our own abort).
+ */
+const TRANSPORT_ERROR_CODES = new Set([
+    "grpc_transport_error",
+    "grpc_closed",
+    "grpc_http_error",
+    "grpc_stream_dead",
+    "grpc_stream_failed",
+]);
+
+/**
  * Whether an error means the channel itself is unusable rather than the call
  * being refused. Errors without a gRPC status are transport-level (a reset
  * socket, a closed session).
@@ -211,7 +233,11 @@ export class ScreenService {
 export function isConnectionFailure(error) {
     const status = error?.grpcStatus;
     if (status === undefined || status === null) {
-        return !(error instanceof AppError);
+        if (error instanceof AppError) {
+            // The client wraps transport faults in AppErrors without a status.
+            return TRANSPORT_ERROR_CODES.has(error.code);
+        }
+        return true;
     }
     return status === GRPC_STATUS.unavailable || status === GRPC_STATUS.deadlineExceeded || status === GRPC_STATUS.cancelled;
 }
