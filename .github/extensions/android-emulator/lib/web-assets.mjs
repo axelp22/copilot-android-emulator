@@ -12,6 +12,7 @@ const ASSETS = [
     ["/icons.js", "icons.js", "application/javascript; charset=utf-8"],
     ["/device-frame.js", "device-frame.js", "application/javascript; charset=utf-8"],
     ["/status-tray.js", "status-tray.js", "application/javascript; charset=utf-8"],
+    ["/connection-diagnostics.js", "connection-diagnostics.js", "application/javascript; charset=utf-8"],
     ["/styles.css", "styles.css", "text/css; charset=utf-8"],
 ];
 

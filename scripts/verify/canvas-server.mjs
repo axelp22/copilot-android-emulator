@@ -6,10 +6,10 @@
  */
 import net from "node:net";
 import path from "node:path";
-import { config, createFrameReader, createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { config, createFrameReader, createReporter, extensionImport, extensionRoot, sleep } from "./_shared.mjs";
 
-const { createCanvasServer } = await import(path.join(extensionRoot, "lib", "canvas-server.mjs"));
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
+const { createCanvasServer } = await extensionImport("lib", "canvas-server.mjs");
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
 
 const report = createReporter("CANVAS SERVER");
 const manager = new DeviceSessionManager({ onDiagnostic: (message) => report.note(message) });

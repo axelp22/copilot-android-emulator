@@ -5,11 +5,10 @@
  *
  *   node scripts/verify/device-layer.mjs
  */
-import path from "node:path";
-import { adb, config, createFrameReader, createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { adb, config, createFrameReader, createReporter, extensionImport, sleep } from "./_shared.mjs";
 
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
-const { FRAME_TAGS } = await import(path.join(extensionRoot, "lib", "h264-stream.mjs"));
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
+const { FRAME_TAGS } = await extensionImport("lib", "h264-stream.mjs");
 
 const report = createReporter("DEVICE LAYER");
 /**

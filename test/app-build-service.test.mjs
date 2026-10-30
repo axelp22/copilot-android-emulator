@@ -1649,7 +1649,7 @@ test("waiting for a lingering executor keeps the process alive until the build s
     await writeFile(
         script,
         [
-            `const { AppBuildService } = await import(${JSON.stringify(path.join(extensionRoot, "lib", "app-build-service.mjs"))});`,
+            `const { AppBuildService } = await import(${JSON.stringify(pathToFileURL(path.join(extensionRoot, "lib", "app-build-service.mjs")).href)});`,
             "const manager = { snapshot: (id) => ({ id, serial: 's' }), notifyDevice() {}, async launchApp() {} };",
             `const service = new AppBuildService({ manager, executorDir: ${JSON.stringify(executorDir)} });`,
             `service.setWorkingDirectory(${JSON.stringify(root)});`,
