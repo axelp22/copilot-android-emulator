@@ -5,20 +5,16 @@
  *   node scripts/verify/grpc-stream.mjs
  */
 import path from "node:path";
-import { config, createFrameReader, createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { config, createFrameReader, createReporter, extensionImport, extensionRoot, sleep } from "./_shared.mjs";
 
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
-const { FRAME_TAGS } = await import(path.join(extensionRoot, "lib", "h264-stream.mjs"));
-const { Writer, decodeFields, readMessage } = await import(path.join(extensionRoot, "lib", "protobuf.mjs"));
-const { createGrpcMessageParser, encodeGrpcMessage } = await import(path.join(extensionRoot, "lib", "grpc-client.mjs"));
-const { decodeImage, encodeImageFormat, encodeTouchEvent, IMG_FORMAT } = await import(
-    path.join(extensionRoot, "lib", "emulator-controller.mjs")
-);
-const { findEmulatorBySerial, listRunningEmulators, parseDiscoveryIni } = await import(
-    path.join(extensionRoot, "lib", "emulator-discovery.mjs")
-);
-const { issuerForEmulator } = await import(path.join(extensionRoot, "lib", "emulator-access.mjs"));
-const { signEmulatorJwt } = await import(path.join(extensionRoot, "lib", "emulator-jwt.mjs"));
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
+const { FRAME_TAGS } = await extensionImport("lib", "h264-stream.mjs");
+const { Writer, decodeFields, readMessage } = await extensionImport("lib", "protobuf.mjs");
+const { createGrpcMessageParser, encodeGrpcMessage } = await extensionImport("lib", "grpc-client.mjs");
+const { decodeImage, encodeImageFormat, encodeTouchEvent, IMG_FORMAT } = await extensionImport("lib", "emulator-controller.mjs");
+const { findEmulatorBySerial, listRunningEmulators, parseDiscoveryIni } = await extensionImport("lib", "emulator-discovery.mjs");
+const { issuerForEmulator } = await extensionImport("lib", "emulator-access.mjs");
+const { signEmulatorJwt } = await extensionImport("lib", "emulator-jwt.mjs");
 
 const report = createReporter("GRPC STREAM");
 

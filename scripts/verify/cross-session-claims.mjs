@@ -8,11 +8,11 @@
 import { mkdtemp, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { config, createReporter, extensionRoot } from "./_shared.mjs";
+import { config, createReporter, extensionImport } from "./_shared.mjs";
 
-const { DeviceClaimStore } = await import(path.join(extensionRoot, "lib", "device-claims.mjs"));
-const { DeviceQueue } = await import(path.join(extensionRoot, "lib", "device-queue.mjs"));
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
+const { DeviceClaimStore } = await extensionImport("lib", "device-claims.mjs");
+const { DeviceQueue } = await extensionImport("lib", "device-queue.mjs");
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
 
 const report = createReporter("CROSS-SESSION CLAIMS");
 const root = await mkdtemp(path.join(os.tmpdir(), "android-claims-"));
@@ -156,7 +156,7 @@ await otherQueue.releaseAll();
 // --- capture started outside the extension entirely ---------------------------
 // Claims only reveal sessions that publish one. Android Studio, scrcpy or a plain
 // adb command publish nothing, which is exactly when "is it free?" matters.
-const { listForeignCaptures } = await import(path.join(extensionRoot, "lib", "adb.mjs"));
+const { listForeignCaptures } = await extensionImport("lib", "adb.mjs");
 const { adb } = await import("./_shared.mjs");
 
 const before = await listForeignCaptures(config.serial).catch(() => []);

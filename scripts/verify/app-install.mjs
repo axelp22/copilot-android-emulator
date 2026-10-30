@@ -11,10 +11,10 @@
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { config, createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { config, createReporter, extensionImport, sleep } from "./_shared.mjs";
 
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
-const { DeviceQueue } = await import(path.join(extensionRoot, "lib", "device-queue.mjs"));
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
+const { DeviceQueue } = await extensionImport("lib", "device-queue.mjs");
 
 const report = createReporter("APP INSTALL");
 const queueRoot = await mkdtemp(path.join(os.tmpdir(), "install-queue-"));
