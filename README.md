@@ -333,42 +333,43 @@ dismiss it. Build failures and refused controls appear there and in a small noti
 rather than replacing the device picture, which keeps streaming.
 
 The app to launch is read from the `output-metadata.json` that AGP writes beside the
-APK, for **the module and variant the task names**: `:app:installDebug`
-reads `app`'s `debug` output, `:feature:shop:installPaidDebug` reads that module's
-`paidDebug` output, and an older release build lying around is never mistaken for
-what was just installed. A task that names no module, like the default
-`installDebug`, works when exactly one module has that variant. When the task does
-not pin down one app — two app modules with a debug variant, or a custom task name —
-the build is reported as failed with the candidates listed instead of launching a
-guess. Set `packageName`, or use a module-qualified `gradleTask`, to resolve it.
+APK, for **the module and variant that was actually installed**, never from a
+recorded or guessed application id, so an older release build lying around is never
+mistaken for what was just installed.
 
-Modules are found where Gradle says they are. Each build also runs a small trusted
-init script (written beside the executor one under `~/.copilot/android-emulator/gradle/`)
-that records, at configuration time and without running any extra task, every
-project's Gradle path, `projectDir` and `buildDir`, and for Android application
-projects every variant with its configured application id. So a module remapped in
-`settings.gradle` (`project(":app").projectDir = file("android/phone")`), a custom
-`buildDir`, and flavored application ids all resolve, even before any APK
-metadata exists. The script only reads and never fails the build, but it does not
-hide its own failures either: each step that cannot be read (a project's directories,
-variants or an application id) is recorded with the error, and the record is marked
-`partial` or `failed`. A failure touching the project a task runs in is reported as
-`app_layout_failed` with Gradle's error, rather than falling back to the path
-convention; failures confined to other projects do not block resolution. When
-a task does not pin one app, the error lists each candidate as
-`project variant: applicationId` and the exact module-qualified `gradleTask` values
-to choose from (for example `":app:installDebug", ":wear:installDebug"`).
+Each build runs a small trusted init script (written beside the executor one under
+`~/.copilot/android-emulator/gradle/`). It adds no tasks and reads no application id
+providers. It records two things:
 
-Limits: the record is written when Gradle configures the build. When the
-configuration cache is reused Gradle skips init scripts, so the record left by the
-build that stored that cache entry is used; if that record reported errors, fix the
-build or run once without the configuration cache to rewrite it. The script is
-configuration-cache compatible (checked with Gradle 9.5.0 and AGP 8.13.2: stored
-with no problems, then reused). With no record at all (the init script could not be
-written, or Gradle failed before configuring the build), the module directory
-is assumed from the task path (`:feature:shop` is `feature/shop`, outputs under its
-`build/`), and a failure says so; set `packageName` in the config file to launch a
-fixed app. Abbreviated project or task names (`:a:iD`) are not expanded.
+- **Layout**, at configuration time: every project's Gradle path, `projectDir`,
+  `buildDir` and Android variant names, plus included builds. A module remapped in
+  `settings.gradle` (`project(":app").projectDir = file("android/phone")`) and a
+  custom `buildDir` are therefore found where Gradle puts them.
+- **Install evidence**, when an AGP install task starts: the project, task and
+  directories, written to a file for this build only. This runs on configuration
+  cache hits too, so it always describes the current build.
+
+When install evidence exists, it decides the app: a custom task like
+`:app:deployWear` that runs `:wear:installDebug`, a bare `deployToDevice`, or an
+install in an included build launches what was installed. Without evidence, a
+module-qualified task such as `:app:installDebug` or `:feature:shop:installPaidDebug`
+is resolved from the layout. An unqualified task like `installDebug` works when
+exactly one app module has that variant. Any module whose application id cannot be
+read counts as a candidate, so an unreadable module never makes another look unique.
+When the task does not pin down one app (two modules installed, two candidates, or
+a custom task that installed nothing recorded), the build is reported as failed
+with the candidates and exact module-qualified `gradleTask` values, instead of
+launching a guess. Set `packageName`, or use a module-qualified `gradleTask`, to
+resolve it.
+
+Failures are explicit. If the layout or evidence could not be written (or is
+malformed), the build reports `app_layout_failed` with the error rather than falling
+back to the path convention. A reused configuration cache keeps the layout from the
+build that stored it; that is safe because the layout holds only structure, not
+application ids. With no layout at all (the init script could not be written, or
+Gradle failed before configuring the build), the module directory is assumed from
+the task path (`:feature:shop` is `feature/shop`, outputs under its `build/`), and a
+failure says so. Abbreviated project or task names (`:a:iD`) are not expanded.
 
 Override the defaults with a config file at the root of the working directory,
 named `.android-emulator.json`, `android-emulator.json` or
@@ -537,14 +538,18 @@ hardware, so treat it as unproven rather than working:
   afterwards and never signalling another Gradle daemon; the canvas's Install and
   Cancel buttons and a failing build were driven through headless Chrome. The project
   layout init script was run separately, without a device, against a throwaway AGP
-  8.13.2 build (Gradle 9.5.0, JDK 17) with a remapped `projectDir`, a custom
-  `buildDir`, flavored application ids and a Wear module: the recorded directories and
-  ids matched the build, the configuration cache was stored and then reused with no
-  reported problems, and providers made to throw were recorded as a `partial` layout
-  with their root causes. A reused configuration cache keeps the earlier record until
-  the configuration changes. Those fixtures and harnesses are not checked in, so this
-  is not repeatable from the repository, and other AGP and Gradle versions are
-  untested.
+  8.13.2 build (Gradle 9.5.0, JDK 17, `--offline`) with a remapped `projectDir`, a
+  custom `buildDir`, flavored application ids, a Wear module and an included build.
+  Recorded directories matched the build. Configuration cache runs
+  `assembleFreeDebug` → `assembleFreeRelease` → `assembleFreeDebug`, where the id
+  depends on the requested task, ended in a cache reuse that still resolved the
+  debug APK's id. A release-only provider that throws did not affect a debug build,
+  with `android.compatibility.enableLegacyApi` true or false. Install evidence was
+  recorded on cache hits for `:phone:deployWear` (resolved the Wear app),
+  `deployToDevice` and `installDebug`, and `--parallel` recorded every project. The
+  install step was stubbed out, so no device was used. Java 8, isolated projects,
+  other AGP and Gradle versions, and real installs are untested. Those fixtures are
+  not checked in.
 - **Windows.** Tests for starting `gradlew.bat` through `cmd.exe`, quoting paths with
   spaces and metacharacters, passing `--no-daemon` and the init script, and cancelling
   with `taskkill` are included and scheduled
