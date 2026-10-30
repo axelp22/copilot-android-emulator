@@ -342,11 +342,33 @@ not pin down one app — two app modules with a debug variant, or a custom task 
 the build is reported as failed with the candidates listed instead of launching a
 guess. Set `packageName`, or use a module-qualified `gradleTask`, to resolve it.
 
-The module's directory is assumed from the task path (`:feature:shop` is
-`feature/shop` under the project root) and is not read from Gradle. A module whose
-`projectDir` is remapped in `settings.gradle`, or a custom `buildDir`, is therefore
-not found: the build is reported as failed with "no build output", nothing is
-launched, and setting `packageName` in the config file is the fix.
+Modules are found where Gradle says they are. Each build also runs a small trusted
+init script (written beside the executor one under `~/.copilot/android-emulator/gradle/`)
+that records, at configuration time and without running any extra task, every
+project's Gradle path, `projectDir` and `buildDir`, and for Android application
+projects every variant with its configured application id. So a module remapped in
+`settings.gradle` (`project(":app").projectDir = file("android/phone")`), a custom
+`buildDir`, and flavored application ids all resolve, even before any APK
+metadata exists. The script only reads and never fails the build, but it does not
+hide its own failures either: each step that cannot be read (a project's directories,
+variants or an application id) is recorded with the error, and the record is marked
+`partial` or `failed`. A failure touching the project a task runs in is reported as
+`app_layout_failed` with Gradle's error, rather than falling back to the path
+convention; failures confined to other projects do not block resolution. When
+a task does not pin one app, the error lists each candidate as
+`project variant: applicationId` and the exact module-qualified `gradleTask` values
+to choose from (for example `":app:installDebug", ":wear:installDebug"`).
+
+Limits: the record is written when Gradle configures the build. When the
+configuration cache is reused Gradle skips init scripts, so the record left by the
+build that stored that cache entry is used; if that record reported errors, fix the
+build or run once without the configuration cache to rewrite it. The script is
+configuration-cache compatible (checked with Gradle 9.5.0 and AGP 8.13.2: stored
+with no problems, then reused). With no record at all (the init script could not be
+written, or Gradle failed before configuring the build), the module directory
+is assumed from the task path (`:feature:shop` is `feature/shop`, outputs under its
+`build/`), and a failure says so; set `packageName` in the config file to launch a
+fixed app. Abbreviated project or task names (`:a:iD`) are not expanded.
 
 Override the defaults with a config file at the root of the working directory,
 named `.android-emulator.json`, `android-emulator.json` or
@@ -513,10 +535,16 @@ hardware, so treat it as unproven rather than working:
   stopped the recorded single-use daemon (a child of the client, in its own process
   group) and confirmed it gone before the device was released, never installing
   afterwards and never signalling another Gradle daemon; the canvas's Install and
-  Cancel buttons and a failing build were driven through headless Chrome. A reused
-  configuration cache was not exercised against real Gradle. That fixture and
-  harness are not checked in, so this is not repeatable from the repository, and
-  other AGP and Gradle versions are untested.
+  Cancel buttons and a failing build were driven through headless Chrome. The project
+  layout init script was run separately, without a device, against a throwaway AGP
+  8.13.2 build (Gradle 9.5.0, JDK 17) with a remapped `projectDir`, a custom
+  `buildDir`, flavored application ids and a Wear module: the recorded directories and
+  ids matched the build, the configuration cache was stored and then reused with no
+  reported problems, and providers made to throw were recorded as a `partial` layout
+  with their root causes. A reused configuration cache keeps the earlier record until
+  the configuration changes. Those fixtures and harnesses are not checked in, so this
+  is not repeatable from the repository, and other AGP and Gradle versions are
+  untested.
 - **Windows.** Tests for starting `gradlew.bat` through `cmd.exe`, quoting paths with
   spaces and metacharacters, passing `--no-daemon` and the init script, and cancelling
   with `taskkill` are included and scheduled

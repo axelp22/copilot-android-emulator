@@ -8,7 +8,8 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -22,7 +23,12 @@ const {
     gradleInvocation,
     ownedProcesses,
     parseTaskPath,
+    prepareProjectLayout,
+    projectLayoutInitScript,
+    layoutRecordName,
+    projectLayoutPaths,
     readExecutorMarkers,
+    readProjectLayout,
     resolveApplicationId,
     terminateProcessTree,
     variantFromTask,
@@ -91,6 +97,40 @@ async function posixProject(t, body, { config } = {}) {
     return root;
 }
 
+/**
+ * What the layout init script records for the build rooted at `root`. `projects`
+ * use paths relative to `root`; `buildDir` defaults to `<projectDir>/build`.
+ */
+async function writeLayout(layoutDir, root, projects, { writtenAt = Date.now(), rootDir, status = "ok", errors = [], name } = {}) {
+    const canonical = rootDir ?? (await realpath(root));
+    await mkdir(layoutDir, { recursive: true });
+    const record = {
+        format: 2,
+        rootDir: canonical,
+        gradleVersion: "8.10",
+        writtenAt,
+        status,
+        errors,
+        projects: projects.map((project) => ({
+            path: project.path,
+            projectDir: path.join(canonical, ...project.dir.split("/").filter(Boolean)),
+            buildDir: project.buildDir ? path.join(canonical, ...project.buildDir.split("/")) : null,
+            tasks: project.tasks ?? null,
+            android: project.android ?? (project.variants ? "application" : null),
+            variants: project.variants ?? [],
+        })),
+    };
+    const file = name ?? `${createHash("sha256").update(`${canonical}:${writtenAt}`).digest("hex").slice(0, 24)}.json`;
+    await writeFile(path.join(layoutDir, file), JSON.stringify(record));
+    return record;
+}
+
+async function layoutFor(t, root, projects) {
+    const layoutDir = await tempDir(t, "layout-");
+    await writeLayout(layoutDir, root, projects);
+    return readProjectLayout(layoutDir, root);
+}
+
 function rejection(promise) {
     return promise.then(
         () => {
@@ -113,6 +153,38 @@ test("POSIX runs the wrapper directly, in its own process group, without a share
     assert.deepEqual(invocation.args, ["--no-daemon", "--init-script", "/state/build-executor.init.gradle", ":app:installDebug"]);
     assert.equal(invocation.options.detached, true);
     assert.equal(invocation.options.shell, undefined);
+});
+
+test("the layout init script is passed after the executor one, quoted the same way", () => {
+    const posix = gradleInvocation({
+        wrapper: "/work/gradlew",
+        task: "installDebug",
+        initScript: "/state/build-executor.init.gradle",
+        layoutInitScript: "/state/project-layout.init.gradle",
+        platform: "darwin",
+    });
+    assert.deepEqual(posix.args, [
+        "--no-daemon",
+        "--init-script",
+        "/state/build-executor.init.gradle",
+        "--init-script",
+        "/state/project-layout.init.gradle",
+        "installDebug",
+    ]);
+    const windows = gradleInvocation({
+        wrapper: "C:\\p\\gradlew.bat",
+        task: "installDebug",
+        initScript: "C:\\s\\a.gradle",
+        layoutInitScript: "C:\\s\\b.gradle",
+        platform: "win32",
+        comSpec: "cmd.exe",
+    });
+    assert.equal(windows.args[4], `""C:\\p\\gradlew.bat" --no-daemon --init-script "C:\\s\\a.gradle" --init-script "C:\\s\\b.gradle" "installDebug""`);
+    assert.throws(
+        () => gradleInvocation({ wrapper: "C:\\p\\gradlew.bat", task: "x", initScript: "C:\\a", layoutInitScript: 'C:\\"b', platform: "win32" }),
+        /./,
+        "the second script gets the same path check",
+    );
 });
 
 test("Windows runs gradlew.bat through cmd.exe with the path and task quoted", () => {
@@ -208,8 +280,11 @@ test("Gradle gets the device serial and the task verbatim, and output is publish
     const result = await running;
     assert.equal(result.state, "succeeded");
     const { initScript } = executorPaths(executorDir);
+    const layoutScript = projectLayoutPaths(executorDir).initScript;
     assert.ok(
-        result.log.includes(`serial=serial-dev argc=4 args=--no-daemon --init-script ${initScript} :app:installDebug`),
+        result.log.includes(
+            `serial=serial-dev argc=6 args=--no-daemon --init-script ${initScript} --init-script ${layoutScript} :app:installDebug`,
+        ),
         result.log.join("\n"),
     );
     assert.equal(result.command, "./gradlew --no-daemon :app:installDebug");
@@ -308,6 +383,317 @@ test("a configured packageName overrides resolution, and launch:false never need
     assert.equal(installed.message, "Installed");
     assert.equal(installed.packageName, null, "ambiguity is just unknown when nothing is launched");
     assert.equal(manager.calls.launch.length, 1);
+});
+
+// --- resolving against the layout Gradle recorded ---------------------------------
+
+test("a remapped projectDir and custom buildDir are read where Gradle says they are", async (t) => {
+    const root = await tempDir(t);
+    // settings.gradle: project(":app").projectDir = file("android/application"), buildDir = out/app
+    await writeMetadata(root, "out/app/outputs/apk/debug", { applicationId: "com.remapped", variantName: "debug" });
+    // A decoy where the task path would conventionally point.
+    await writeMetadata(root, "app/build/outputs/apk/debug", { applicationId: "com.decoy", variantName: "debug" });
+    const layout = await layoutFor(t, root, [
+        { path: ":", dir: "" },
+        { path: ":app", dir: "android/application", buildDir: "out/app", android: "application" },
+    ]);
+
+    const resolved = await resolveApplicationId(root, ":app:installDebug", { layout });
+    assert.equal(resolved.applicationId, "com.remapped");
+    assert.equal(resolved.projectPath, ":app");
+    assert.equal(resolved.metadataFile, path.join(await realpath(root), "out/app/outputs/apk/debug/output-metadata.json"));
+    assert.equal((await resolveApplicationId(root, ":app:installDebug")).applicationId, "com.decoy", "without a layout: convention");
+});
+
+test("nested project paths map to Gradle's directories, not to their segments", async (t) => {
+    const root = await tempDir(t);
+    await writeMetadata(root, "modules/shop-app/build/outputs/apk/debug", { applicationId: "com.shop", variantName: "debug" });
+    const layout = await layoutFor(t, root, [
+        { path: ":", dir: "" },
+        { path: ":feature", dir: "feature" },
+        { path: ":feature:shop", dir: "modules/shop-app", android: "application" },
+    ]);
+    assert.equal((await resolveApplicationId(root, ":feature:shop:installDebug", { layout })).applicationId, "com.shop");
+    const missing = await rejection(resolveApplicationId(root, ":features:shop:installDebug", { layout }));
+    assert.equal(missing.code, "app_not_resolved");
+    assert.match(missing.message, /no project ":features:shop"/);
+    assert.match(missing.message, /application projects: ":feature:shop"/);
+});
+
+test("flavored application ids come from the variants Gradle configured, even before any output exists", async (t) => {
+    const root = await tempDir(t);
+    const layout = await layoutFor(t, root, [
+        { path: ":", dir: "" },
+        {
+            path: ":app",
+            dir: "app",
+            buildDir: "out/app",
+            variants: [
+                { name: "freeDebug", applicationId: "com.example.free.debug" },
+                { name: "paidDebug", applicationId: "com.example.paid.debug" },
+                { name: "paidRelease", applicationId: "com.example.paid" },
+            ],
+        },
+    ]);
+    assert.equal((await resolveApplicationId(root, ":app:installPaidDebug", { layout })).applicationId, "com.example.paid.debug");
+    assert.equal((await resolveApplicationId(root, "app:installFreeDebug", { layout })).applicationId, "com.example.free.debug");
+    assert.equal((await resolveApplicationId(root, "installPaidRelease", { layout })).applicationId, "com.example.paid");
+
+    const unknown = await rejection(resolveApplicationId(root, ":app:installDebug", { layout }));
+    assert.equal(unknown.code, "app_not_resolved");
+    assert.match(unknown.message, /no variant "debug"/);
+    assert.match(unknown.message, /":app:installFreeDebug", ":app:installPaidDebug", ":app:installPaidRelease"/);
+});
+
+test("a variant Gradle names without an id falls back to its output under the real buildDir", async (t) => {
+    const root = await tempDir(t);
+    await writeMetadata(root, "out/app/outputs/apk/free/debug", { applicationId: "com.from.output" });
+    const layout = await layoutFor(t, root, [
+        { path: ":app", dir: "app", buildDir: "out/app", variants: [{ name: "freeDebug", applicationId: null }, { name: "paidDebug" }] },
+    ]);
+    assert.equal((await resolveApplicationId(root, ":app:installFreeDebug", { layout })).applicationId, "com.from.output");
+    const error = await rejection(resolveApplicationId(root, ":app:installPaidDebug", { layout }));
+    assert.equal(error.code, "app_not_resolved");
+    assert.match(error.message, /reports variant "paidDebug" in project ":app" \(app\) but not its application id/);
+});
+
+test("an unqualified task that several apps have is ambiguous, and the error lists the exact tasks to pick", async (t) => {
+    const root = await tempDir(t);
+    const layout = await layoutFor(t, root, [
+        { path: ":", dir: "", tasks: [] },
+        { path: ":app", dir: "phone", tasks: ["installDebug"], variants: [{ name: "debug", applicationId: "com.example" }] },
+        { path: ":wear", dir: "watch", tasks: ["installDebug"], variants: [{ name: "debug", applicationId: "com.example.wear" }] },
+        // Has the variant but not the task: an unqualified task does not run here.
+        { path: ":tv", dir: "tv", tasks: ["installRelease"], variants: [{ name: "debug", applicationId: "com.example.tv" }] },
+    ]);
+    const error = await rejection(resolveApplicationId(root, "installDebug", { layout }));
+    assert.equal(error.code, "app_ambiguous");
+    assert.equal(error.status, 409);
+    assert.match(error.message, /:app debug: com\.example; :wear debug: com\.example\.wear/);
+    assert.match(error.message, /Set "gradleTask" to one of ":app:installDebug", ":wear:installDebug"/);
+    assert.doesNotMatch(error.message, /com\.example\.tv/);
+    assert.deepEqual(error.details.candidates, [
+        { project: ":app", variant: "debug", applicationId: "com.example" },
+        { project: ":wear", variant: "debug", applicationId: "com.example.wear" },
+    ]);
+
+    const single = await layoutFor(t, root, [
+        { path: ":app", dir: "phone", tasks: ["installDebug"], variants: [{ name: "debug", applicationId: "com.example" }] },
+        { path: ":wear", dir: "watch", tasks: [], variants: [{ name: "debug", applicationId: "com.example.wear" }] },
+    ]);
+    assert.equal((await resolveApplicationId(root, "installDebug", { layout: single })).applicationId, "com.example");
+});
+
+test("the same application id in several matches is not ambiguous", async (t) => {
+    const root = await tempDir(t);
+    const layout = await layoutFor(t, root, [
+        { path: ":app", dir: "app", tasks: ["installDebug"], variants: [{ name: "debug", applicationId: "com.example" }] },
+        { path: ":app2", dir: "app2", tasks: ["installDebug"], variants: [{ name: "debug", applicationId: "com.example" }] },
+    ]);
+    assert.equal((await resolveApplicationId(root, "installDebug", { layout })).applicationId, "com.example");
+});
+
+test("a custom task resolves only when its project has exactly one app", async (t) => {
+    const root = await tempDir(t);
+    const one = await layoutFor(t, root, [{ path: ":app", dir: "app", variants: [{ name: "debug", applicationId: "com.only" }] }]);
+    assert.equal((await resolveApplicationId(root, ":app:deployToDevice", { layout: one })).applicationId, "com.only");
+
+    const two = await layoutFor(t, root, [
+        { path: ":app", dir: "app", variants: [{ name: "debug", applicationId: "com.a" }, { name: "release", applicationId: "com.b" }] },
+    ]);
+    const error = await rejection(resolveApplicationId(root, ":app:deployToDevice", { layout: two }));
+    assert.equal(error.code, "app_not_resolved");
+    assert.match(error.message, /"deployToDevice" does not name an Android variant/);
+    assert.match(error.message, /":app:installDebug", ":app:installRelease"/);
+    assert.match(error.message, /packageName/);
+});
+
+test("without a recorded layout, the convention's failures say so", async (t) => {
+    const root = await tempDir(t);
+    const error = await rejection(resolveApplicationId(root, ":app:installDebug"));
+    assert.equal(error.code, "app_not_resolved");
+    assert.match(error.message, /Gradle did not record this build's project layout/);
+});
+
+test("the recorded layout is the newest one for this exact root", async (t) => {
+    const root = await tempDir(t);
+    const other = await tempDir(t);
+    const layoutDir = await tempDir(t, "layout-");
+    assert.equal(await readProjectLayout(layoutDir, root), null);
+    assert.equal(await readProjectLayout(path.join(layoutDir, "missing"), root), null);
+
+    await writeLayout(layoutDir, root, [{ path: ":old", dir: "old" }], { writtenAt: 1 });
+    await writeLayout(layoutDir, root, [{ path: ":app", dir: "android/app" }], { writtenAt: 2 });
+    await writeLayout(layoutDir, other, [{ path: ":other", dir: "x" }], { writtenAt: 3 });
+    await writeFile(path.join(layoutDir, "abc.json"), "{ not json");
+    await writeFile(path.join(layoutDir, "def.json"), JSON.stringify({ format: 99, rootDir: await realpath(root), projects: [] }));
+    await writeFile(path.join(layoutDir, "notes.txt"), "ignored");
+
+    const layout = await readProjectLayout(layoutDir, root);
+    const canonical = await realpath(root);
+    assert.equal(layout.rootDir, canonical);
+    assert.deepEqual(layout.projects, [
+        {
+            path: ":app",
+            projectDir: path.join(canonical, "android", "app"),
+            buildDir: path.join(canonical, "android", "app", "build"),
+            tasks: null,
+            android: null,
+            variants: [],
+        },
+    ]);
+
+    // Entries that are not usable are dropped rather than trusted.
+    await writeFile(
+        path.join(layoutDir, "ffff.json"),
+        JSON.stringify({
+            format: 2,
+            rootDir: canonical,
+            writtenAt: 10,
+            status: "ok",
+            projects: [
+                { path: "app", projectDir: canonical },
+                { path: ":rel", projectDir: "relative/dir" },
+                { path: ":ok", projectDir: canonical, variants: [{ name: "debug", applicationId: "not an id" }, { applicationId: "com.x" }] },
+            ],
+        }),
+    );
+    const filtered = await readProjectLayout(layoutDir, root);
+    assert.deepEqual(filtered.projects.map((project) => project.path), [":ok"]);
+    assert.deepEqual(filtered.projects[0].variants, [{ name: "debug", applicationId: null }]);
+    assert.equal(filtered.status, "partial", "dropped entries are reported, not hidden");
+    assert.match(filtered.errors[0].message, /2 project entries have no usable path/);
+});
+
+test("records written by an older format are ignored rather than misread", async (t) => {
+    const root = await tempDir(t);
+    const layoutDir = await tempDir(t, "layout-");
+    const canonical = await realpath(root);
+    await writeFile(
+        path.join(layoutDir, layoutRecordName(canonical)),
+        JSON.stringify({ format: 1, rootDir: canonical, writtenAt: 1, projects: [{ path: ":app", projectDir: canonical }] }),
+    );
+    assert.equal(await readProjectLayout(layoutDir, root), null);
+});
+
+test("this build's own record being unreadable is an error, not a missing layout", async (t) => {
+    const root = await tempDir(t);
+    const layoutDir = await tempDir(t, "layout-");
+    const own = path.join(layoutDir, layoutRecordName(await realpath(root)));
+    await writeFile(own, "{ truncated");
+    let error = await rejection(readProjectLayout(layoutDir, root));
+    assert.equal(error.code, "app_layout_failed");
+    assert.match(error.message, /could not be read/);
+
+    await writeFile(own, JSON.stringify({ format: 2, rootDir: await realpath(root), projects: [] }));
+    error = await rejection(readProjectLayout(layoutDir, root));
+    assert.match(error.message, /missing its projects or status/);
+
+    // Another build's unreadable record says nothing about this one.
+    await rm(own);
+    await writeFile(path.join(layoutDir, "0123abcd.json"), "{ truncated");
+    assert.equal(await readProjectLayout(layoutDir, root), null);
+});
+
+test("a failed collection is reported with Gradle's errors instead of falling back to the path convention", async (t) => {
+    const root = await tempDir(t);
+    // The convention would find this, which is exactly what must not happen.
+    await writeMetadata(root, "app/build/outputs/apk/debug", { applicationId: "com.example.wrong", variantName: "debug" });
+    const layoutDir = await tempDir(t, "layout-");
+    await writeLayout(layoutDir, root, [], {
+        status: "failed",
+        errors: [{ project: ":", step: "projects", message: "java.lang.IllegalStateException: boom" }],
+    });
+    const layout = await readProjectLayout(layoutDir, root);
+    assert.equal(layout.status, "failed");
+    const error = await rejection(resolveApplicationId(root, ":app:installDebug", { layout }));
+    assert.equal(error.code, "app_layout_failed");
+    assert.equal(error.status, 422);
+    assert.match(error.message, /boom/);
+    assert.deepEqual(error.details.errors, layout.errors);
+});
+
+test("a partial collection fails only when the error touches a project the task could mean", async (t) => {
+    const root = await tempDir(t);
+    const layoutDir = await tempDir(t, "layout-");
+    await writeLayout(
+        layoutDir,
+        root,
+        [
+            { path: ":", dir: "" },
+            { path: ":app", dir: "app", variants: [{ name: "debug", applicationId: "com.example.app" }] },
+            { path: ":broken", dir: "broken", variants: [{ name: "debug", applicationId: null }] },
+        ],
+        { status: "partial", errors: [{ project: ":broken", step: "applicationId", message: "provider threw" }] },
+    );
+    const layout = await readProjectLayout(layoutDir, root);
+    assert.equal(layout.status, "partial");
+
+    assert.equal((await resolveApplicationId(root, ":app:installDebug", { layout })).applicationId, "com.example.app");
+
+    const scoped = await rejection(resolveApplicationId(root, ":broken:installDebug", { layout }));
+    assert.equal(scoped.code, "app_layout_failed");
+    assert.match(scoped.message, /:broken.*applicationId.*provider threw/s);
+
+    // An unqualified task could mean :broken too.
+    const unqualified = await rejection(resolveApplicationId(root, "installDebug", { layout }));
+    assert.equal(unqualified.code, "app_layout_failed");
+
+    // Suggested tasks only name variants whose application id is known.
+    const elsewhere = await rejection(resolveApplicationId(root, ":app:installRelease", { layout }));
+    assert.equal(elsewhere.code, "app_not_resolved");
+    assert.match(elsewhere.message, /":app:installDebug"/);
+    assert.doesNotMatch(elsewhere.message, /:broken:install/);
+});
+
+test("a layout without status or errors fields is treated as not failed", async () => {
+    // Older in-memory callers may pass a layout built by hand.
+    const root = "/nonexistent-root";
+    const layout = { rootDir: root, projects: [{ path: ":app", projectDir: "/x/app", buildDir: "/x/app/build", tasks: null, android: "application", variants: [{ name: "debug", applicationId: "com.example.x" }] }] };
+    assert.equal((await resolveApplicationId(root, ":app:installDebug", { layout })).applicationId, "com.example.x");
+});
+
+test("the layout init script is stable, quotes its directory, and guards every step", async (t) => {
+    const dir = "/tmp/it's a \\dir";
+    const script = projectLayoutInitScript(dir);
+    assert.equal(script, projectLayoutInitScript(dir), "stable content keeps the configuration cache valid");
+    assert.ok(script.includes(String.raw`new File('/tmp/it\'s a \\dir')`), script);
+    assert.ok(!/LAYOUT_DIR/.test(script));
+    assert.equal((script.match(/try \{/g) ?? []).length, (script.match(/catch \(Throwable/g) ?? []).length);
+    assert.doesNotMatch(script, /catch \(Throwable ignored/, "every caught failure is recorded, not swallowed");
+    for (const piece of ["copilotErrors", "status:", "errors:", "'failed'", "'partial'", "t.cause"]) {
+        assert.ok(script.includes(piece), `records ${piece}`);
+    }
+    assert.match(script, /gradle\.projectsEvaluated/);
+    assert.doesNotMatch(script, /ANDROID_SERIAL|adb|exec\(|tasks\.register|dependsOn/, "records only; runs nothing");
+
+    const home = await tempDir(t, "layout-home-");
+    const paths = await prepareProjectLayout(home);
+    assert.equal(await readFile(paths.initScript, "utf8"), projectLayoutInitScript(paths.layoutDir));
+    const before = (await stat(paths.initScript)).mtimeMs;
+    await sleep(20);
+    await prepareProjectLayout(home);
+    assert.equal((await stat(paths.initScript)).mtimeMs, before, "unchanged content is not rewritten");
+    assert.ok((await stat(paths.layoutDir)).isDirectory());
+});
+
+test("a build launches the app from the layout Gradle recorded", posixOnly, async (t) => {
+    // The fake wrapper stands in for the init script by writing the record itself.
+    const root = await posixProject(t, "exit 0");
+    const { layoutDir } = projectLayoutPaths(executorDir);
+    await writeMetadata(root, "out/phone/outputs/apk/debug", { applicationId: "com.example.phone", variantName: "debug" });
+    await writeLayout(layoutDir, root, [
+        { path: ":", dir: "" },
+        { path: ":app", dir: "android/phone", buildDir: "out/phone", android: "application" },
+    ]);
+    const manager = fakeManager();
+    const service = newService(manager);
+    service.setWorkingDirectory(root);
+
+    const result = await service.buildInstallLaunch({ deviceId: "dev", task: ":app:installDebug" });
+    assert.equal(result.state, "succeeded");
+    assert.equal(result.packageName, "com.example.phone", "not com.example.app from the conventional app/build");
+    assert.deepEqual(manager.calls.launch, [{ deviceId: "dev", packageName: "com.example.phone", activity: undefined }]);
 });
 
 // --- cancelling ---------------------------------------------------------------------
