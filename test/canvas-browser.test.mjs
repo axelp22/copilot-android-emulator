@@ -113,8 +113,15 @@ async function connect(url) {
     });
     let nextId = 0;
     const pending = new Map();
+    const listeners = new Set();
     socket.addEventListener("message", (event) => {
         const message = JSON.parse(event.data);
+        if (message.method) {
+            for (const listener of listeners) {
+                listener(message);
+            }
+            return;
+        }
         const entry = pending.get(message.id);
         if (entry) {
             pending.delete(message.id);
@@ -140,7 +147,20 @@ async function connect(url) {
     };
     const until = (expression, message, timeoutMs = 15_000) =>
         waitUntil(() => evaluate(expression), { timeoutMs, intervalMs: 100, message });
-    return { send, evaluate, until, close: () => socket.close() };
+    // Subscribe before triggering the event: CDP does not replay ones already sent.
+    const nextEvent = (method, timeoutMs = 15_000) => {
+        let listener;
+        let timer;
+        return new Promise((resolve, reject) => {
+            listener = (message) => message.method === method && resolve(message.params);
+            listeners.add(listener);
+            timer = setTimeout(() => reject(new Error(`Timed out waiting for ${method}`)), timeoutMs);
+        }).finally(() => {
+            listeners.delete(listener);
+            clearTimeout(timer);
+        });
+    };
+    return { send, evaluate, until, nextEvent, close: () => socket.close() };
 }
 
 const seedPng = solidPng(40, 80, [61, 220, 132]);
@@ -148,8 +168,9 @@ const avcC = Buffer.from([0x01, 0x64, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x04, 0x67, 
 
 /**
  * A device whose stream sends `frames` and then stays open, like an idle screen.
- * `others` adds more devices by id, each `{ transport, frames, reportedTransport }`,
- * for tests that switch the canvas to another device.
+ * `others` adds more devices by id, each `{ transport, frames, reportedTransport, holdFrames }`,
+ * for tests that switch the canvas to another device. `holdFrames` is a promise
+ * the stream waits on before sending anything, for a device slow to show a frame.
  */
 function scriptedDevice({ transport, frames, others = {} }) {
     const handlers = new Set();
@@ -272,17 +293,24 @@ function scriptedDevice({ transport, frames, others = {} }) {
                 },
             };
             calls.children.push(child);
-            setImmediate(() => {
+            const send = () => {
                 for (const chunk of spec.frames) {
-                    stdout.write(chunk);
+                    if (!child.killed) {
+                        stdout.write(chunk);
+                    }
                 }
-            });
+            };
+            if (spec.holdFrames) {
+                void spec.holdFrames.then(send);
+            } else {
+                setImmediate(send);
+            }
             return child;
         },
     };
 }
 
-async function openCanvas(t, device, { withoutVideoDecoder = false } = {}) {
+async function openCanvas(t, device, { withoutVideoDecoder = false, latencyMs = 0 } = {}) {
     // The browser is registered for cleanup first so it is gone before the
     // server closes: a live page would otherwise keep reconnecting to it.
     const page = await launchChrome(t);
@@ -296,7 +324,23 @@ async function openCanvas(t, device, { withoutVideoDecoder = false } = {}) {
             source: "delete window.VideoDecoder; delete window.EncodedVideoChunk;",
         });
     }
-    await page.send("Page.navigate", { url: server.url });
+    if (latencyMs > 0) {
+        await page.send("Network.enable");
+        await page.send("Network.emulateNetworkConditions", { offline: false, latency: latencyMs, downloadThroughput: -1, uploadThroughput: -1 });
+    }
+    // Page.navigate answers once the navigation starts, while the old about:blank
+    // document (or a half-parsed canvas) may still be what Runtime.evaluate sees.
+    // Polls that read canvas elements must not run until the canvas has loaded.
+    const loaded = page.nextEvent("Page.loadEventFired");
+    const navigation = await page.send("Page.navigate", { url: server.url });
+    if (navigation.errorText) {
+        throw new Error(`Could not open the canvas: ${navigation.errorText}`);
+    }
+    await loaded;
+    const origin = await page.evaluate("location.origin");
+    if (origin !== new URL(server.url).origin || !(await page.evaluate(`Boolean(document.getElementById("notice-text"))`))) {
+        throw new Error(`The canvas page did not load (at ${origin})`);
+    }
     page.server = server;
     return page;
 }
@@ -306,6 +350,20 @@ const painted = `(() => {
     return win.classList.contains("has-frame") && win.classList.contains("h264-active");
 })()`;
 const screenErrorShown = `document.getElementById("screen-message").classList.contains("error")`;
+
+test("openCanvas hands over the loaded canvas, even when it is slow to arrive", { skip, timeout: 60_000 }, async (t) => {
+    const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
+    // Slow enough that a check right after Page.navigate still sees about:blank.
+    const page = await openCanvas(t, device, { latencyMs: 400 });
+    // Read once, without polling: every later page.until relies on this state.
+    const ready = await page.evaluate(`({
+        origin: location.origin,
+        readyState: document.readyState,
+        notice: typeof document.getElementById("notice-text")?.textContent,
+        screen: Boolean(document.querySelector(".screen-window")),
+    })`);
+    assert.deepEqual(ready, { origin: new URL(page.server.url).origin, readyState: "complete", notice: "string", screen: true });
+});
 
 test("build progress, cancel and errors show in the tray without disturbing the picture", { skip, timeout: 60_000 }, async (t) => {
     const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
@@ -432,4 +490,131 @@ test("a decoder failure on one device does not keep a newly picked emulator off 
     await waitUntil(() => device.calls.screenshots > screenshotsBefore, { message: "screenshots for the mirrored device", timeoutMs: 10_000 });
     await sleep(1_000);
     assert.equal(device.calls.streamsByDevice.Pixel_A, mirroredStreams, "no new stream for video this runtime cannot decode");
+});
+
+test("the diagnostics panel names the transport and why, and copies an allowlisted report", { skip, timeout: 60_000 }, async (t) => {
+    const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
+    const page = await openCanvas(t, device);
+    await page.until(painted, "the first frame");
+    await page.evaluate(`(() => {
+        window.__copied = [];
+        Object.defineProperty(navigator, "clipboard", {
+            configurable: true,
+            value: { writeText: async (text) => { window.__copied.push(text); } },
+        });
+    })()`);
+    device.update({
+        stream: {
+            codec: "h264",
+            fps: 60,
+            resolution: 100,
+            transport: "mirror",
+            transportReason:
+                "emulator-5554 Pixel_8_API_34 R58N47XC8HP refused: http://admin:hunter2@localhost:8554 token=sk-SECRET123 at /Users/someone/.android/avd/Pixel_A.avd",
+        },
+    });
+
+    const toggle = `document.getElementById("diagnostics-toggle")`;
+    assert.equal(await page.evaluate(`${toggle}.getAttribute("aria-expanded")`), "false");
+    assert.equal(await page.evaluate(`document.getElementById("diagnostics-panel").hidden`), true);
+    await page.evaluate(`${toggle}.click()`);
+    await page.until(`!document.getElementById("diagnostics-panel").hidden`, "the diagnostics panel");
+    assert.equal(await page.evaluate(`${toggle}.getAttribute("aria-expanded")`), "true");
+    await page.until(`document.getElementById("diagnostics-transport").textContent === "Screen mirror video"`, "the mirror transport");
+    assert.equal(await page.evaluate(`document.getElementById("diagnostics-reason").textContent`), "gRPC unavailable: the connection failed");
+
+    await page.evaluate(`document.getElementById("diagnostics-copy").click()`);
+    await page.until(`document.getElementById("diagnostics-copy-status").textContent === "Diagnostic report copied."`, "the copy status");
+    const copied = await page.evaluate(`window.__copied.at(-1)`);
+    assert.match(copied, /Screen mirror video/);
+    for (const leak of ["sk-SECRET123", "/Users/someone", "Pixel_A", "Pixel_8", "R58N47XC8HP", "hunter2", "admin", "5554", "Pixel A", "127.0.0.1", "localhost"]) {
+        assert.ok(!copied.includes(leak), `copied report leaks ${leak}`);
+    }
+    assert.equal(await page.evaluate(`document.getElementById("diagnostics-copy-status").getAttribute("role")`), "status");
+    assert.equal(await page.evaluate(screenErrorShown), false, "opening diagnostics is not a display error");
+});
+
+test("when the clipboard is blocked, the report is shown selected and stays selected across refreshes", { skip, timeout: 60_000 }, async (t) => {
+    const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
+    const page = await openCanvas(t, device);
+    await page.until(painted, "the first frame");
+    await page.evaluate(`Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async () => { throw new DOMException("Write permission denied.", "NotAllowedError"); } },
+    })`);
+    await page.evaluate(`document.getElementById("diagnostics-toggle").click()`);
+    await page.until(`!document.getElementById("diagnostics-panel").hidden`, "the diagnostics panel");
+    const details = `document.querySelector(".diagnostics-report-details")`;
+    assert.equal(await page.evaluate(`${details}.open`), false, "the preview starts collapsed");
+
+    await page.evaluate(`document.getElementById("diagnostics-copy").click()`);
+    await page.until(
+        `document.getElementById("diagnostics-copy-status").textContent === "Copy was blocked. The report is selected; copy it manually."`,
+        "the blocked-copy status",
+    );
+    const selectionState = `(() => {
+        const report = document.getElementById("diagnostics-report");
+        const box = report.getBoundingClientRect();
+        return {
+            open: ${details}.open,
+            visible: box.width > 0 && box.height > 0,
+            focused: document.activeElement === report,
+            report: report.textContent,
+            selected: getSelection().toString(),
+        };
+    })()`;
+    // Keyboard users land on the selected report (focus may take one frame to apply).
+    await page.until(`document.activeElement === document.getElementById("diagnostics-report")`, "focus on the report");
+    const before = await page.evaluate(selectionState);
+    assert.equal(before.open, true, "the preview opens so the selection can be seen");
+    assert.equal(before.visible, true);
+    assert.equal(before.focused, true);
+    assert.match(before.report, /^Android Emulator canvas diagnostics/);
+    assert.equal(before.selected, before.report);
+
+    // Outlast more than one of the panel's one-second refreshes.
+    await sleep(2_500);
+    const after = await page.evaluate(selectionState);
+    assert.equal(after.report, before.report, "the refresh leaves the selected report alone");
+    assert.equal(after.selected, before.report, "the selection is still whole");
+    assert.equal(await page.evaluate(`document.getElementById("diagnostics-copy-status").textContent`), "Copy was blocked. The report is selected; copy it manually.");
+
+    // Closing releases the pinned report, so the next look is current again.
+    await page.evaluate(`document.getElementById("diagnostics-close").click()`);
+    await page.evaluate(`document.getElementById("diagnostics-toggle").click()`);
+    await page.until(`!document.getElementById("diagnostics-panel").hidden`, "the reopened panel");
+    assert.notEqual(await page.evaluate(`document.getElementById("diagnostics-report").textContent`), before.report);
+});
+
+test("after switching devices, diagnostics wait for the new device's own first frame", { skip, timeout: 60_000 }, async (t) => {
+    let releaseFrames;
+    const holdFrames = new Promise((resolve) => {
+        releaseFrames = resolve;
+    });
+    const device = scriptedDevice({
+        transport: "mirror",
+        frames: [frame(FRAME_TAGS.seed, seedPng), frame(FRAME_TAGS.config, avcC)],
+        others: { Pixel_B: { reportedTransport: "grpc", transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)], holdFrames } },
+    });
+    t.after(() => releaseFrames());
+    // Pixel_A ends up on screenshots, which is the frame clock a switch used to inherit.
+    const page = await openCanvas(t, device, { withoutVideoDecoder: true });
+    await page.evaluate(`document.getElementById("diagnostics-toggle").click()`);
+    const connection = `document.getElementById("diagnostics-connection").textContent`;
+    const transport = `document.getElementById("diagnostics-transport").textContent`;
+    await page.until(`${transport} === "Screenshots" && ${connection} === "Live"`, "Pixel_A live on screenshots");
+
+    await page.server.rebindDevice("Pixel_B");
+    await waitUntil(() => (device.calls.streamsByDevice.Pixel_B ?? 0) > 0, { message: "a stream for Pixel_B", timeoutMs: 10_000 });
+    await page.until(`${transport} === "Emulator gRPC video"`, "the new device's transport");
+    // Hold across the panel's refreshes: nothing from Pixel_B has arrived yet.
+    for (let i = 0; i < 3; i += 1) {
+        assert.equal(await page.evaluate(connection), "Connecting", "no frame from the new device yet");
+        assert.match(await page.evaluate(`document.getElementById("diagnostics-report").textContent`), /^Last frame: none yet$/m);
+        await sleep(600);
+    }
+
+    releaseFrames();
+    await page.until(`${connection} === "Live"`, "Live once the new device's first frame arrives");
+    await page.until(painted, "Pixel_B's first frame");
 });

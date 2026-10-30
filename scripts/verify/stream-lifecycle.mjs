@@ -9,10 +9,9 @@
  *
  *   node scripts/verify/stream-lifecycle.mjs
  */
-import path from "node:path";
-import { adb, config, createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { adb, config, createReporter, extensionImport, sleep } from "./_shared.mjs";
 
-const { DeviceSessionManager } = await import(path.join(extensionRoot, "lib", "device-session-manager.mjs"));
+const { DeviceSessionManager } = await extensionImport("lib", "device-session-manager.mjs");
 
 const report = createReporter("STREAM LIFECYCLE");
 const manager = new DeviceSessionManager({ onDiagnostic: (message) => report.note(message) });

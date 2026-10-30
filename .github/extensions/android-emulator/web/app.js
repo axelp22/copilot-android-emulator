@@ -10,6 +10,7 @@ import {
 } from "./h264-stream.js";
 import { createInputController } from "./input-controller.js";
 import { createBuildPanel, createNotice } from "./status-tray.js";
+import { createConnectionDiagnostics } from "./connection-diagnostics.js";
 
 const elements = {
     deviceName: document.getElementById("device-name"),
@@ -48,6 +49,18 @@ const elements = {
     buildLogDetails: document.getElementById("build-log-details"),
     buildLog: document.getElementById("build-log"),
     buildLogNote: document.getElementById("build-log-note"),
+    diagnosticsToggle: document.getElementById("diagnostics-toggle"),
+    diagnosticsToggleLabel: document.getElementById("diagnostics-toggle-label"),
+    diagnosticsPanel: document.getElementById("diagnostics-panel"),
+    diagnosticsClose: document.getElementById("diagnostics-close"),
+    diagnosticsCopy: document.getElementById("diagnostics-copy"),
+    diagnosticsCopyStatus: document.getElementById("diagnostics-copy-status"),
+    diagnosticsReport: document.getElementById("diagnostics-report"),
+    diagnosticsTransport: document.getElementById("diagnostics-transport"),
+    diagnosticsConnection: document.getElementById("diagnostics-connection"),
+    diagnosticsReason: document.getElementById("diagnostics-reason"),
+    diagnosticsReconnects: document.getElementById("diagnostics-reconnects"),
+    diagnosticsFps: document.getElementById("diagnostics-fps"),
 };
 
 const toolbarButtons = {
@@ -110,6 +123,15 @@ let h264StallTimer = null;
 let lastVideoFrameAt = 0;
 let pngFallbackGeneration = 0;
 let recentFrameTimes = [];
+/** Connection facts for the diagnostics panel; never shown raw, only through its redacting view. */
+let eventsState = "connecting";
+let eventErrors = 0;
+let streamReconnects = 0;
+let screenSource = null;
+let clientFallbackReason = null;
+let lastFrameAt = 0;
+let diagnosticsTimer = null;
+const DIAGNOSTICS_REFRESH_MS = 1_000;
 /**
  * Devices whose stream has proved to be H.264 that this runtime cannot decode.
  * Per device: a mirrored phone failing says nothing about an emulator picked
@@ -171,6 +193,7 @@ function showScreenError(details) {
     elements.errorDetails.textContent = screenError;
     elements.errorDetails.closest("details").open = false;
     setScreenStatus("Device error. Retry or show details.", { error: true, stateName: "error" });
+    diagnostics.render();
 }
 
 function clearScreenError() {
@@ -298,6 +321,7 @@ function render() {
     }
 
     ensureStream();
+    diagnostics.render();
 }
 
 async function loadState() {
@@ -341,6 +365,17 @@ async function lightweightToolbarAction(path, body = {}) {
 function connectEvents() {
     eventSource?.close();
     eventSource = new EventSource(apiUrl("api/events"));
+    eventsState = "connecting";
+    eventSource.onopen = () => {
+        eventsState = "open";
+        diagnostics.render();
+    };
+    eventSource.onerror = () => {
+        eventErrors += 1;
+        // EventSource retries on its own unless the server refused it outright.
+        eventsState = eventSource?.readyState === EventSource.CLOSED ? "closed" : "reconnecting";
+        diagnostics.render();
+    };
     eventSource.onmessage = (event) => {
         try {
             state = JSON.parse(event.data);
@@ -371,11 +406,15 @@ function stopH264Watchdog() {
     h264StallTimer = null;
 }
 
-function fallBackToScreenshots(reason) {
+/** `code` is one of CLIENT_FALLBACK_LABELS, so diagnostics never carry the raw error. */
+function fallBackToScreenshots(reason, code) {
     stopH264Watchdog();
     h264Stream.stop();
+    screenSource = "screenshots";
+    clientFallbackReason = code;
     setScreenStatus(reason);
     startPngFallback();
+    diagnostics.render();
 }
 
 /**
@@ -391,7 +430,7 @@ function startH264StallWatchdog() {
             return;
         }
         if (Date.now() - lastVideoFrameAt > H264_STALL_TIMEOUT_MS && !h264Stream.isStillStream()) {
-            fallBackToScreenshots("Video stalled; streaming screenshots instead");
+            fallBackToScreenshots("Video stalled; streaming screenshots instead", "stalled");
             return;
         }
 
@@ -441,6 +480,7 @@ function startPngFallback() {
                 return;
             }
             consecutiveFailures = 0;
+            lastFrameAt = Date.now();
             elements.screen.src = image.src;
             elements.screen.classList.add("has-frame");
             elements.screenWindow.classList.add("has-frame");
@@ -465,12 +505,26 @@ function startPngFallback() {
     refreshFrame();
 }
 
+/**
+ * Frame times and the chosen source describe one stream. Without this reset a
+ * newly picked device would report "Live" off the previous device's last frame
+ * until its own first frame arrived.
+ */
+function resetStreamDiagnostics() {
+    screenSource = null;
+    clientFallbackReason = null;
+    lastFrameAt = 0;
+    lastVideoFrameAt = 0;
+    recentFrameTimes = [];
+}
+
 function ensureStream() {
     if (screenError) {
         return;
     }
     if (!state || state.state !== "Booted") {
         activeStreamKey = "";
+        resetStreamDiagnostics();
         h264Stream.stop();
         stopPngFallback();
         stopH264Watchdog();
@@ -492,6 +546,7 @@ function ensureStream() {
         return;
     }
     activeStreamKey = nextKey;
+    resetStreamDiagnostics();
 
     const source = chooseScreenSource({
         hasVideoDecoder: useVideoDecoder,
@@ -499,10 +554,14 @@ function ensureStream() {
         lastTransport: state.stream?.transport ?? null,
     });
     if (source === "screenshots") {
+        screenSource = "screenshots";
+        clientFallbackReason = "decoder-unavailable";
         setScreenStatus("Streaming screenshots (this canvas cannot decode video)");
         startPngFallback();
         return;
     }
+    screenSource = "video";
+    clientFallbackReason = null;
     startH264Stream(fps);
 }
 
@@ -561,12 +620,12 @@ function handleH264StreamError(error) {
         }
         const reason = "This canvas cannot decode video; streaming screenshots instead";
         setNotice(reason);
-        fallBackToScreenshots(reason);
+        fallBackToScreenshots(reason, "decoder-unavailable");
         return;
     }
     const reason = `Device stream failed (${error?.message ?? String(error)}); streaming screenshots instead`;
     setNotice(reason);
-    fallBackToScreenshots(reason);
+    fallBackToScreenshots(reason, "stream-failed");
 }
 
 function startH264Stream(fps) {
@@ -585,7 +644,7 @@ function startH264Stream(fps) {
             return;
         }
         // Never leave the canvas blank because video decoding failed.
-        fallBackToScreenshots("Video unavailable; streaming screenshots instead");
+        fallBackToScreenshots("Video unavailable; streaming screenshots instead", "first-frame-timeout");
     }, H264_WATCHDOG_MS);
     lastVideoFrameAt = 0;
     startH264StallWatchdog();
@@ -593,6 +652,10 @@ function startH264Stream(fps) {
 }
 
 function reconnectStream() {
+    // The first call after load opens the stream; only later ones are reconnects.
+    if (activeStreamKey) {
+        streamReconnects += 1;
+    }
     streamRevision += 1;
     activeStreamKey = "";
     ensureStream();
@@ -729,7 +792,7 @@ function bindSelectionGuards() {
         document.addEventListener(eventName, (event) => {
             // The build log is the one thing worth copying out of the canvas.
             const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-            if (eventName === "selectstart" && target?.closest?.(".build-log")) {
+            if (eventName === "selectstart" && target?.closest?.(".build-log, .diagnostics-report")) {
                 return;
             }
             event.preventDefault();
@@ -796,6 +859,70 @@ const buildPanel = createBuildPanel({
     onCancel: cancelBuild,
 });
 
+function measuredFps() {
+    if (screenSource !== "video") {
+        return null;
+    }
+    const since = Date.now() - SLOW_CAPTURE_WINDOW_MS;
+    const frames = recentFrameTimes.filter((time) => time >= since).length;
+    return frames / (SLOW_CAPTURE_WINDOW_MS / 1_000);
+}
+
+function diagnosticsSnapshot() {
+    return {
+        screenSource,
+        transport: state?.stream?.transport ?? null,
+        transportReason: state?.stream?.transportReason ?? null,
+        clientFallbackReason,
+        hasVideoDecoder: useVideoDecoder,
+        decoderFailed: decoderFailedDevices.has(state?.deviceId),
+        deviceKind: state?.kind ?? null,
+        deviceState: state?.state ?? null,
+        events: eventsState,
+        eventErrors,
+        streamReconnects,
+        measuredFps: measuredFps(),
+        lastFrameAt: Math.max(lastFrameAt, lastVideoFrameAt),
+        screenError,
+        requestedFps: state?.stream?.fps ?? null,
+        resolution: state?.stream?.resolution ?? null,
+        androidVersion: state?.androidVersion ?? null,
+        apiLevel: state?.apiLevel ?? null,
+    };
+}
+
+const diagnostics = createConnectionDiagnostics({
+    elements: {
+        toggle: elements.diagnosticsToggle,
+        toggleLabel: elements.diagnosticsToggleLabel,
+        panel: elements.diagnosticsPanel,
+        close: elements.diagnosticsClose,
+        copy: elements.diagnosticsCopy,
+        copyStatus: elements.diagnosticsCopyStatus,
+        report: elements.diagnosticsReport,
+        reportDetails: elements.diagnosticsReport?.closest("details") ?? null,
+        transport: elements.diagnosticsTransport,
+        connection: elements.diagnosticsConnection,
+        reason: elements.diagnosticsReason,
+        reconnects: elements.diagnosticsReconnects,
+        fps: elements.diagnosticsFps,
+    },
+    getSnapshot: diagnosticsSnapshot,
+});
+
+function bindDiagnostics() {
+    diagnostics.bind();
+    // Measured fps and frame age only move while the panel is open to read them.
+    const syncRefresh = () => {
+        clearInterval(diagnosticsTimer);
+        diagnosticsTimer = elements.diagnosticsPanel.hidden
+            ? null
+            : setInterval(() => diagnostics.render(), DIAGNOSTICS_REFRESH_MS);
+    };
+    elements.diagnosticsToggle.addEventListener("click", syncRefresh);
+    elements.diagnosticsClose.addEventListener("click", syncRefresh);
+}
+
 const devicePicker = createDevicePicker({
     elements: {
         root: elements.devicePicker,
@@ -831,6 +958,7 @@ async function init() {
         hydrateIcons();
         notice.bind();
         buildPanel.bind();
+        bindDiagnostics();
         applyDeviceMetrics(frameElements, bootstrapMetrics.screen, bootstrapMetrics.family);
         requestAnimationFrame(() => {
             requestAnimationFrame(() => document.documentElement.classList.remove("awaiting-initial-paint"));

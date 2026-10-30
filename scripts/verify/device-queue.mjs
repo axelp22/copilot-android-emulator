@@ -11,9 +11,9 @@ import { mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { createReporter, extensionRoot, sleep } from "./_shared.mjs";
+import { createReporter, extensionImport, sleep } from "./_shared.mjs";
 
-const { DeviceQueue } = await import(path.join(extensionRoot, "lib", "device-queue.mjs"));
+const { DeviceQueue } = await extensionImport("lib", "device-queue.mjs");
 
 const report = createReporter("DEVICE QUEUE");
 const root = await mkdtemp(path.join(os.tmpdir(), "device-queue-"));

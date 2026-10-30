@@ -39,6 +39,18 @@
                 </div>
                 <div class="stream-actions">
                     <button
+                        id="diagnostics-toggle"
+                        class="header-action diagnostics-toggle"
+                        type="button"
+                        aria-expanded="false"
+                        aria-controls="diagnostics-panel"
+                        aria-label="Connection diagnostics"
+                        title="Connection diagnostics"
+                    >
+                        <span class="diagnostics-dot" aria-hidden="true"></span>
+                        <span id="diagnostics-toggle-label" class="header-action-label">Connecting</span>
+                    </button>
+                    <button
                         id="install-button"
                         class="header-action"
                         type="button"
@@ -178,6 +190,40 @@
                             <span id="notice-text" class="notice-text"></span>
                             <button id="notice-dismiss" class="tray-dismiss" type="button" aria-label="Dismiss message">×</button>
                         </div>
+                        <section id="diagnostics-panel" class="diagnostics-panel" aria-labelledby="diagnostics-heading" hidden>
+                            <div class="diagnostics-head">
+                                <h2 id="diagnostics-heading" class="diagnostics-heading">Connection</h2>
+                                <button id="diagnostics-close" class="tray-dismiss" type="button" aria-label="Close connection diagnostics">×</button>
+                            </div>
+                            <dl class="diagnostics-facts">
+                                <dt>Transport</dt>
+                                <dd id="diagnostics-transport"></dd>
+                                <dt>Status</dt>
+                                <dd id="diagnostics-connection"></dd>
+                                <dt>Fallback reason</dt>
+                                <dd id="diagnostics-reason"></dd>
+                                <dt>Measured</dt>
+                                <dd id="diagnostics-fps"></dd>
+                                <dt>Reconnects</dt>
+                                <dd id="diagnostics-reconnects"></dd>
+                            </dl>
+                            <details class="diagnostics-report-details">
+                                <summary>Report preview</summary>
+                                <pre id="diagnostics-report" class="diagnostics-report" tabindex="0" aria-label="Diagnostic report"></pre>
+                            </details>
+                            <div class="diagnostics-actions">
+                                <button
+                                    id="diagnostics-copy"
+                                    class="diagnostics-copy"
+                                    type="button"
+                                    aria-label="Copy diagnostic report to clipboard"
+                                >
+                                    Copy report
+                                </button>
+                                <span id="diagnostics-copy-status" class="diagnostics-copy-status" role="status" aria-live="polite"></span>
+                            </div>
+                            <p class="diagnostics-note">The report leaves out device names, serials, paths and credentials.</p>
+                        </section>
                         <section id="build-panel" class="build-panel" aria-label="App build" hidden>
                             <div class="build-panel-head">
                                 <span class="build-indicator" aria-hidden="true"></span>
