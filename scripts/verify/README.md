@@ -42,7 +42,65 @@ node scripts/verify/device-queue.mjs         # FIFO queue semantics (no device n
 node scripts/verify/lease-holds.mjs          # lease and cross-session hold lifetimes (no device needed)
 node scripts/verify/app-install.mjs            # build, install and launch, and its refusals
 node scripts/verify/boot-lifecycle.mjs         # cold boot and shutdown of an AVD (slow)
+VERIFY_AGP_SERIAL=emulator-5580 \
+  node scripts/verify/agp-fixture.mjs          # real AGP build, install, launch (see below)
 ```
+
+## Real AGP fixture (`agp-fixture.mjs`)
+
+Builds, installs and launches the minimal app in
+[`test/fixtures/agp-app/`](../../test/fixtures/agp-app/) through the extension's own
+build service, using real Gradle and the Android Gradle Plugin instead of the stand-in
+`gradlew` the device-free tests use. The fixture has no dependencies beyond AGP, no
+secrets and no private code; its package is `dev.copilot.androidemulator.fixture`.
+
+**It only targets a device you name.** Unlike the other suites it has no default
+serial and ignores `VERIFY_SERIAL`/`VERIFY_DEVICE_ID`. Before touching anything it
+checks, addressing only that serial with `adb -s`, that:
+
+1. `VERIFY_AGP_SERIAL` is set and looks like `emulator-<port>` (USB, Wi-Fi and
+   `host:port` serials are refused);
+2. adb reports it as `device` (not offline or unauthorized);
+3. it is an emulator (`ro.kernel.qemu` or `ro.boot.qemu` is `1`);
+4. it has finished booting (`sys.boot_completed` is `1`).
+
+Any failure exits with status 2 and a reason code, before a build starts.
+
+Requirements:
+
+- JDK 17 or newer (`JAVA_HOME`), and an Android SDK (`ANDROID_HOME` or
+  `ANDROID_SDK_ROOT`) with platform 34 and matching build-tools installed. The suite
+  never downloads SDK packages or system images.
+- A system `gradle` on `PATH` (or `VERIFY_GRADLE`) to generate the wrapper; the
+  wrapper itself is not checked in.
+- Network access on the first run to fetch the Gradle distribution and AGP from
+  Google Maven and Maven Central; later runs reuse `~/.gradle`.
+- A **throwaway** emulator. Start a dedicated one on a spare port with no snapshot
+  writes, so the run cannot disturb an emulator you are using:
+
+  ```sh
+  emulator -avd <throwaway_avd> -port 5580 -no-snapshot-save -read-only &
+  adb -s emulator-5580 wait-for-device
+  VERIFY_AGP_SERIAL=emulator-5580 node scripts/verify/agp-fixture.mjs
+  adb -s emulator-5580 emu kill   # cleanup
+  ```
+
+The suite copies the fixture into a scratch directory, generates a wrapper there,
+builds `installDebug`, checks that the package is installed and in the foreground,
+then force-stops and uninstalls it and deletes the scratch directory (whether or not
+the checks passed). Nothing is written into the repository.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VERIFY_AGP_SERIAL` | none (required) | serial of the disposable emulator, e.g. `emulator-5580` |
+| `VERIFY_ADB` | `adb` | path to adb |
+| `VERIFY_GRADLE` | `gradle` | Gradle used only to generate the wrapper |
+| `VERIFY_AGP_GRADLE_VERSION` | `8.13` | Gradle version the wrapper pins |
+| `VERIFY_AGP_VERSION` | `fixtureAgpVersion` in the fixture | override the AGP version for this run |
+| `VERIFY_AGP_KEEP` | unset | `1` keeps the scratch directory for inspection |
+
+`test/agp-fixture-harness.test.mjs` (part of `npm test`) covers the target guard and
+the refusals with a fake adb, so the safety checks are exercised without hardware.
 
 `rendered-canvas.mjs` needs a live canvas URL. Ask Copilot to open the Android
 Emulator canvas, take the URL it reports, then:

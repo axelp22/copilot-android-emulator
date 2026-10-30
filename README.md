@@ -479,7 +479,13 @@ node scripts/verify/device-queue.mjs
 node scripts/verify/lease-holds.mjs
 node scripts/verify/app-install.mjs
 node scripts/verify/rendered-canvas.mjs "<canvas url>"
+VERIFY_AGP_SERIAL=emulator-5580 node scripts/verify/agp-fixture.mjs
 ```
+
+`agp-fixture.mjs` builds, installs and launches the checked-in AGP fixture
+([`test/fixtures/agp-app/`](test/fixtures/agp-app/)) with real Gradle. It never picks
+a device on its own: it refuses to start unless `VERIFY_AGP_SERIAL` names a booted
+`emulator-<port>`, and uninstalls the fixture afterwards.
 
 See [`scripts/verify/README.md`](scripts/verify/README.md) for prerequisites and the
 environment variables that select which device to target.
@@ -514,9 +520,13 @@ hardware, so treat it as unproven rather than working:
   group) and confirmed it gone before the device was released, never installing
   afterwards and never signalling another Gradle daemon; the canvas's Install and
   Cancel buttons and a failing build were driven through headless Chrome. A reused
-  configuration cache was not exercised against real Gradle. That fixture and
-  harness are not checked in, so this is not repeatable from the repository, and
-  other AGP and Gradle versions are untested.
+  configuration cache was not exercised against real Gradle. A minimal AGP fixture
+  ([`test/fixtures/agp-app/`](test/fixtures/agp-app/)) and an opt-in suite
+  (`scripts/verify/agp-fixture.mjs`) now make the build, install and launch path
+  repeatable against an explicitly named disposable emulator; the fixture has been
+  built (AGP 8.9.1, Gradle 8.13) but the suite has not yet been run on hardware.
+  Flavors, cancellation against real Gradle, and other AGP and Gradle versions remain
+  manual.
 - **Windows.** Tests for starting `gradlew.bat` through `cmd.exe`, quoting paths with
   spaces and metacharacters, passing `--no-daemon` and the init script, and cancelling
   with `taskkill` are included and scheduled
