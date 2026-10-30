@@ -31,7 +31,9 @@ test("no dynamic import() receives a raw filesystem path", async () => {
                 // Allowed: string literals (relative or node: specifiers) and file: URLs (pathToFileURL / .href).
                 for (const match of line.matchAll(/\bimport\(\s*([^)\s][^)]*)\)/g)) {
                     const arg = match[1];
-                    if (/^["'`]/.test(arg) || /pathToFileURL|\.href\b/.test(line) || /^specifier$|^url$/.test(arg)) continue;
+                    // Generated child-process code embeds the specifier as `${JSON.stringify(name)}`.
+                    const name = arg.replace(/^\$\{JSON\.stringify\((\w+)$/, "$1");
+                    if (/^["'`]/.test(arg) || /pathToFileURL|\.href\b/.test(line) || /^(?:specifier|url|\w+(?:Url|URL))$/.test(name)) continue;
                     offenders.push(`${path.relative(repoRoot, file)}:${index + 1}: ${line.trim()}`);
                 }
             }
