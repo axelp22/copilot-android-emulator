@@ -113,8 +113,15 @@ async function connect(url) {
     });
     let nextId = 0;
     const pending = new Map();
+    const listeners = new Set();
     socket.addEventListener("message", (event) => {
         const message = JSON.parse(event.data);
+        if (message.method) {
+            for (const listener of listeners) {
+                listener(message);
+            }
+            return;
+        }
         const entry = pending.get(message.id);
         if (entry) {
             pending.delete(message.id);
@@ -140,7 +147,20 @@ async function connect(url) {
     };
     const until = (expression, message, timeoutMs = 15_000) =>
         waitUntil(() => evaluate(expression), { timeoutMs, intervalMs: 100, message });
-    return { send, evaluate, until, close: () => socket.close() };
+    // Subscribe before triggering the event: CDP does not replay ones already sent.
+    const nextEvent = (method, timeoutMs = 15_000) => {
+        let listener;
+        let timer;
+        return new Promise((resolve, reject) => {
+            listener = (message) => message.method === method && resolve(message.params);
+            listeners.add(listener);
+            timer = setTimeout(() => reject(new Error(`Timed out waiting for ${method}`)), timeoutMs);
+        }).finally(() => {
+            listeners.delete(listener);
+            clearTimeout(timer);
+        });
+    };
+    return { send, evaluate, until, nextEvent, close: () => socket.close() };
 }
 
 const seedPng = solidPng(40, 80, [61, 220, 132]);
@@ -282,7 +302,7 @@ function scriptedDevice({ transport, frames, others = {} }) {
     };
 }
 
-async function openCanvas(t, device, { withoutVideoDecoder = false } = {}) {
+async function openCanvas(t, device, { withoutVideoDecoder = false, latencyMs = 0 } = {}) {
     // The browser is registered for cleanup first so it is gone before the
     // server closes: a live page would otherwise keep reconnecting to it.
     const page = await launchChrome(t);
@@ -296,7 +316,23 @@ async function openCanvas(t, device, { withoutVideoDecoder = false } = {}) {
             source: "delete window.VideoDecoder; delete window.EncodedVideoChunk;",
         });
     }
-    await page.send("Page.navigate", { url: server.url });
+    if (latencyMs > 0) {
+        await page.send("Network.enable");
+        await page.send("Network.emulateNetworkConditions", { offline: false, latency: latencyMs, downloadThroughput: -1, uploadThroughput: -1 });
+    }
+    // Page.navigate answers once the navigation starts, while the old about:blank
+    // document (or a half-parsed canvas) may still be what Runtime.evaluate sees.
+    // Polls that read canvas elements must not run until the canvas has loaded.
+    const loaded = page.nextEvent("Page.loadEventFired");
+    const navigation = await page.send("Page.navigate", { url: server.url });
+    if (navigation.errorText) {
+        throw new Error(`Could not open the canvas: ${navigation.errorText}`);
+    }
+    await loaded;
+    const origin = await page.evaluate("location.origin");
+    if (origin !== new URL(server.url).origin || !(await page.evaluate(`Boolean(document.getElementById("notice-text"))`))) {
+        throw new Error(`The canvas page did not load (at ${origin})`);
+    }
     page.server = server;
     return page;
 }
@@ -306,6 +342,20 @@ const painted = `(() => {
     return win.classList.contains("has-frame") && win.classList.contains("h264-active");
 })()`;
 const screenErrorShown = `document.getElementById("screen-message").classList.contains("error")`;
+
+test("openCanvas hands over the loaded canvas, even when it is slow to arrive", { skip, timeout: 60_000 }, async (t) => {
+    const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
+    // Slow enough that a check right after Page.navigate still sees about:blank.
+    const page = await openCanvas(t, device, { latencyMs: 400 });
+    // Read once, without polling: every later page.until relies on this state.
+    const ready = await page.evaluate(`({
+        origin: location.origin,
+        readyState: document.readyState,
+        notice: typeof document.getElementById("notice-text")?.textContent,
+        screen: Boolean(document.querySelector(".screen-window")),
+    })`);
+    assert.deepEqual(ready, { origin: new URL(page.server.url).origin, readyState: "complete", notice: "string", screen: true });
+});
 
 test("build progress, cancel and errors show in the tray without disturbing the picture", { skip, timeout: 60_000 }, async (t) => {
     const device = scriptedDevice({ transport: "grpc", frames: [frame(FRAME_TAGS.seed, seedPng)] });
