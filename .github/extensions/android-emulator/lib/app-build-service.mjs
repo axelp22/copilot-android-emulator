@@ -261,6 +261,11 @@ const EXECUTOR_EXIT_WAIT_MS = 5_000;
 const PUBLISH_INTERVAL_MS = 250;
 const EXIT_POLL_MS = 1_000;
 const STOP_POLL_MS = 50;
+/**
+ * How often a running build's process tree is observed, so an executor that
+ * wrote no record is still known after its client exits (liveBuildProcesses).
+ */
+const LINEAGE_POLL_MS = 500;
 const EXECUTOR_MARKER_FORMAT = 1;
 /** ps reports start times to the second, Java to the millisecond. */
 const START_MATCH_SLACK_MS = 2_000;
@@ -425,14 +430,34 @@ export async function prepareExecutorTracking(executorDir) {
  */
 export async function readExecutorMarkers(markerDir, { wrapperPid, spawnedAt }) {
     const markers = [];
-    for (const name of await readdir(markerDir).catch(() => [])) {
+    // Only a missing directory or file means "no record"; any other read error
+    // throws, so it can never be taken as the executor having no record.
+    const names = await readdir(markerDir).catch((error) => {
+        if (error?.code === "ENOENT") {
+            return [];
+        }
+        throw error;
+    });
+    for (const name of names) {
         if (!/^\d+\.json$/.test(name)) {
             continue;
         }
         const file = path.join(markerDir, name);
-        const record = await readFile(file, "utf8")
-            .then((raw) => JSON.parse(raw))
-            .catch(() => null);
+        let raw;
+        try {
+            raw = await readFile(file, "utf8");
+        } catch (error) {
+            if (error?.code === "ENOENT") {
+                continue;
+            }
+            throw error;
+        }
+        let record = null;
+        try {
+            record = JSON.parse(raw);
+        } catch {
+            // Records are renamed into place whole; this one is not ours.
+        }
         if (
             record?.format !== EXECUTOR_MARKER_FORMAT ||
             !Number.isInteger(record.pid) ||
@@ -580,10 +605,15 @@ const noMarkers = async () => [];
  * snapshot shows none of them left (an unreaped zombie can no longer act), the
  * wrapper reaped, and no executor record naming a live process.
  */
-async function stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS }) {
+async function stopOwnedPosix(
+    child,
+    { killWaitMs, markers, snapshot, kill = process.kill.bind(process), pollMs = STOP_POLL_MS, known = new Map() },
+) {
     const wrapperPid = child.pid;
     const exited = () => child.exitCode !== null || child.signalCode !== null;
-    const known = new Map();
+    // `known` may already hold processes seen owned while the build ran (see
+    // liveBuildProcesses); `frozen` is what this stop has already SIGSTOPped.
+    const frozen = new Set();
     const stopped = new Map();
     const executors = new Set();
     const deadline = Date.now() + killWaitMs;
@@ -604,7 +634,7 @@ async function stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill = pro
             for (let round = 0; round < 10; round += 1) {
                 const snap = await snapshot();
                 owned = ownedProcesses({ snapshot: snap, wrapperPid, wrapperExited: exited(), markers: records, known });
-                const fresh = Array.from(owned.values()).filter((proc) => !known.has(proc.pid) && !isZombie(proc));
+                const fresh = Array.from(owned.values()).filter((proc) => !frozen.has(proc.pid) && !isZombie(proc));
                 for (const proc of owned.values()) {
                     known.set(proc.pid, proc.lstart);
                 }
@@ -612,6 +642,7 @@ async function stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill = pro
                     break;
                 }
                 for (const proc of fresh) {
+                    frozen.add(proc.pid);
                     sendSignal(kill, proc.pid, "SIGSTOP");
                     if (proc.pgid === proc.pid) {
                         sendSignal(kill, -proc.pid, "SIGSTOP");
@@ -621,6 +652,9 @@ async function stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill = pro
         } catch (error) {
             lastError = error;
             owned = null;
+            // A pass that could not look is not clean: confirmation needs two
+            // clean passes in a row, and the deadline must still apply.
+            settledPasses = 0;
         }
         if (owned) {
             const live = Array.from(owned.values()).filter((proc) => !isZombie(proc));
@@ -730,6 +764,7 @@ export async function terminateProcessTree(
         snapshot = processSnapshot,
         kill,
         pollMs,
+        known,
     } = {},
 ) {
     if (!child?.pid) {
@@ -738,7 +773,7 @@ export async function terminateProcessTree(
     if (platform === "win32") {
         return stopOwnedWindows(child, { killWaitMs, markers, taskkill });
     }
-    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs });
+    return stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, pollMs, known });
 }
 
 /**
@@ -763,6 +798,7 @@ export async function waitForProcessTreeExit(
         snapshot = processSnapshot,
         killWaitMs = TERMINATE_KILL_WAIT_MS,
         kill,
+        known,
     } = {},
 ) {
     const pid = child.pid;
@@ -785,7 +821,7 @@ export async function waitForProcessTreeExit(
         }
     }
     for (;;) {
-        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill });
+        const outcome = await stopOwnedPosix(child, { killWaitMs, markers, snapshot, kill, known });
         if (outcome.confirmed) {
             return { ...outcome, detail: `build processes exited after cancellation (${outcome.detail})` };
         }
@@ -797,15 +833,28 @@ export async function waitForProcessTreeExit(
  * The build's processes still alive, without signalling any of them. POSIX
  * applies ownedProcesses() to a fresh snapshot; Windows can only check the
  * recorded executors.
+ *
+ * `known` (pid -> start time) is both read and extended: every process seen
+ * owned is recorded, so one seen while its parent lived stays owned after it is
+ * reparented. That is what identifies an executor that wrote no record -- the
+ * configuration cache was reused, or it had not evaluated init scripts yet --
+ * once its client has exited abruptly and left it outside the wrapper's group.
  */
-export async function liveBuildProcesses(child, { platform = process.platform, markers = noMarkers, snapshot = processSnapshot } = {}) {
+export async function liveBuildProcesses(
+    child,
+    { platform = process.platform, markers = noMarkers, snapshot = processSnapshot, known = new Map() } = {},
+) {
     const exited = child.exitCode !== null || child.signalCode !== null;
     if (platform === "win32") {
         const records = await markers();
         return [...(exited ? [] : [child.pid]), ...records.filter((record) => pidAlive(record.pid)).map((record) => record.pid)];
     }
+    const records = await markers();
     const snap = await snapshot();
-    const owned = ownedProcesses({ snapshot: snap, wrapperPid: child.pid, wrapperExited: exited, markers: await markers() });
+    const owned = ownedProcesses({ snapshot: snap, wrapperPid: child.pid, wrapperExited: exited, markers: records, known });
+    for (const proc of owned.values()) {
+        known.set(proc.pid, proc.lstart);
+    }
     return Array.from(owned.values())
         .filter((proc) => !isZombie(proc))
         .map((proc) => proc.pid);
@@ -843,6 +892,7 @@ export class AppBuildService {
         executorExitWaitMs = EXECUTOR_EXIT_WAIT_MS,
         publishIntervalMs = PUBLISH_INTERVAL_MS,
         exitPollMs = EXIT_POLL_MS,
+        lineagePollMs = LINEAGE_POLL_MS,
         executorDir = defaultExecutorDir(),
         processTree = defaultProcessTree,
     } = {}) {
@@ -853,6 +903,7 @@ export class AppBuildService {
         this.executorExitWaitMs = executorExitWaitMs;
         this.publishIntervalMs = publishIntervalMs;
         this.exitPollMs = exitPollMs;
+        this.lineagePollMs = lineagePollMs;
         this.executorDir = executorDir;
         this.processTree = { ...defaultProcessTree, ...processTree };
         this.workingDirectory = process.cwd();
@@ -1278,10 +1329,10 @@ export class AppBuildService {
     }
 
     /** Stops a run's processes (see terminateProcessTree); settles with the outcome, never throws. */
-    stopProcesses(child, markers) {
+    stopProcesses(child, markers, known) {
         return Promise.resolve()
             .then(() =>
-                this.processTree.terminate(child, { platform: this.platform, killWaitMs: this.terminateKillWaitMs, markers }),
+                this.processTree.terminate(child, { platform: this.platform, killWaitMs: this.terminateKillWaitMs, markers, known }),
             )
             .catch((error) => ({ confirmed: false, detail: `termination failed: ${error?.message ?? error}` }));
     }
@@ -1290,7 +1341,7 @@ export class AppBuildService {
      * Keeps the run reserved until its processes are seen to exit: `run.exited`
      * holds the project lock and, through the caller, the device.
      */
-    quarantine(run, child, outcome, markers) {
+    quarantine(run, child, outcome, markers, known) {
         run.orphanPid = outcome.executors?.[0] ?? child.pid;
         this.onDiagnostic(`Gradle (pid ${run.orphanPid}) could not be confirmed stopped: ${outcome.detail}`);
         run.exited = Promise.resolve(
@@ -1300,6 +1351,7 @@ export class AppBuildService {
                 killWaitMs: this.terminateKillWaitMs,
                 treeUnreachable: Boolean(outcome.treeUnreachable),
                 markers,
+                known,
             }),
         ).catch(() => new Promise(() => {})); // A watcher that fails confirms nothing.
     }
@@ -1310,19 +1362,34 @@ export class AppBuildService {
      * seen gone. One that does not exit in time is stopped like a cancelled
      * build; the wait never counts as confirmation.
      */
-    async confirmBuildProcessesGone(child, markers) {
+    async confirmBuildProcessesGone(child, markers, known) {
         const deadline = Date.now() + this.executorExitWaitMs;
         for (;;) {
             const live = await Promise.resolve()
-                .then(() => this.processTree.probe(child, { platform: this.platform, markers }))
+                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known }))
                 .catch(() => null);
             if (live?.length === 0) {
                 return { confirmed: true, detail: "exited with the build" };
             }
             if (Date.now() >= deadline) {
-                return this.stopProcesses(child, markers);
+                return this.stopProcesses(child, markers, known);
             }
             await delay(STOP_POLL_MS * 2);
+        }
+    }
+
+    /**
+     * While the wrapper lives, records every process it owns (see
+     * liveBuildProcesses). Purely additive: a failed observation proves nothing
+     * and is ignored, and nothing is ever confirmed from it.
+     */
+    async trackLineage(child, markers, known, isDone) {
+        const exited = () => child.exitCode !== null || child.signalCode !== null;
+        while (!isDone() && !exited()) {
+            await Promise.resolve()
+                .then(() => this.processTree.probe(child, { platform: this.platform, markers, known }))
+                .catch(() => {});
+            await pause(this.lineagePollMs);
         }
     }
 
@@ -1344,6 +1411,8 @@ export class AppBuildService {
             const launcher = this.platform === "win32" ? `${invocation.display} (through cmd.exe)` : invocation.display;
             const markers = () =>
                 markerDir ? readExecutorMarkers(markerDir, { wrapperPid: child.pid, spawnedAt }) : Promise.resolve([]);
+            // Every process seen owned during this run (pid -> start time); see liveBuildProcesses.
+            const known = new Map();
             // Only once the processes they name are confirmed gone.
             const forgetMarkers = () =>
                 markers()
@@ -1359,14 +1428,14 @@ export class AppBuildService {
                     run.message = "Cancelling… stopping Gradle's build process";
                     this.publish(deviceId);
                 }
-                void this.stopProcesses(child, markers).then(async (outcome) => {
+                void this.stopProcesses(child, markers, known).then(async (outcome) => {
                     run.termination = outcome;
                     if (outcome.confirmed) {
                         await forgetMarkers();
                         settle(reject, cancelledError(run));
                         return;
                     }
-                    this.quarantine(run, child, outcome, markers);
+                    this.quarantine(run, child, outcome, markers, known);
                     settle(
                         reject,
                         new AppError(
@@ -1403,6 +1472,9 @@ export class AppBuildService {
                 run.child = child;
                 run.tracking = { wrapperPid: child.pid, spawnedAt, markerDir };
             }
+            if (child.pid && this.platform !== "win32") {
+                void this.trackLineage(child, markers, known, () => settled || stopping);
+            }
 
             let pending = "";
             const consume = (chunk) => {
@@ -1429,13 +1501,13 @@ export class AppBuildService {
                     // onAbort settles once every build process is confirmed gone.
                     return;
                 }
-                void this.confirmBuildProcessesGone(child, markers).then(async (outcome) => {
+                void this.confirmBuildProcessesGone(child, markers, known).then(async (outcome) => {
                     if (signal?.aborted || settled) {
                         return;
                     }
                     run.termination = outcome;
                     if (!outcome.confirmed) {
-                        this.quarantine(run, child, outcome, markers);
+                        this.quarantine(run, child, outcome, markers, known);
                         settle(
                             reject,
                             new AppError(

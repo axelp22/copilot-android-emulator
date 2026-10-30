@@ -20,6 +20,7 @@ const {
     executorPaths,
     findGradleRoot,
     gradleInvocation,
+    liveBuildProcesses,
     ownedProcesses,
     parseTaskPath,
     readExecutorMarkers,
@@ -887,6 +888,240 @@ test("a process list that cannot be read is never taken as everything having sto
     });
     assert.equal(outcome.confirmed, false);
     assert.match(outcome.detail, /could not be listed/);
+});
+
+// --- executors that wrote no record (configuration cache reused) ------------------
+
+test("an executor seen while its client lived stays owned after an abrupt client exit, by pid and start time", async () => {
+    // Cache reuse: no record. The single-use daemon is a child of the client in its own session.
+    const running = new Map([proc(1, 0, 1), proc(100, 1, 100), proc(200, 100, 200), proc(900, 1, 900)]);
+    const child = { pid: 100, exitCode: null, signalCode: null };
+    const known = new Map();
+    assert.deepEqual((await liveBuildProcesses(child, { platform: "linux", snapshot: async () => running, known })).sort(), [100, 200]);
+    assert.equal(known.get(200), running.get(200).lstart, "observing records what it saw");
+
+    // The client is killed: the daemon is reparented to init, outside the wrapper's group.
+    child.signalCode = "SIGKILL";
+    const reparented = new Map([proc(1, 0, 1), proc(200, 1, 200), proc(900, 1, 900)]);
+    assert.deepEqual(
+        await liveBuildProcesses(child, { platform: "linux", snapshot: async () => reparented }),
+        [],
+        "lineage alone loses it -- the gap this guards",
+    );
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot: async () => reparented, known }), [200]);
+
+    // Its pid reused by an unrelated process: a different start time is not ours.
+    const reused = new Map([proc(1, 0, 1), proc(200, 1, 200, "Thu Oct 22 11:00:00 2026")]);
+    assert.deepEqual(await liveBuildProcesses(child, { platform: "linux", snapshot: async () => reused, known }), []);
+});
+
+test("stopping uses what was seen during the build to stop a reparented executor that wrote no record", async () => {
+    const fake = fakeProcesses([proc(1, 0, 1), proc(200, 1, 200), proc(900, 1, 900)]);
+    const child = { pid: 100, exitCode: null, signalCode: "SIGKILL" };
+    const known = new Map([
+        [100, "Thu Oct 22 10:00:00 2026"],
+        [200, "Thu Oct 22 10:00:00 2026"],
+    ]);
+    const outcome = await terminateProcessTree(child, { platform: "linux", snapshot: fake.snapshot, kill: fake.kill, known, killWaitMs: 500, pollMs: 5 });
+    assert.equal(outcome.confirmed, true, outcome.detail);
+    const stopIndex = fake.signals.findIndex(([target, name]) => target === 200 && name === "SIGSTOP");
+    const killIndex = fake.signals.findIndex(([target, name]) => target === 200 && name === "SIGKILL");
+    assert.ok(stopIndex !== -1 && stopIndex < killIndex, "a seeded process is still frozen before it is killed");
+    assert.ok(fake.signals.every(([target]) => ![1, 900, -1, -900].includes(target)), JSON.stringify(fake.signals));
+
+    // The same pid, now another process: left alone, and nothing to wait for.
+    const other = fakeProcesses([proc(1, 0, 1), proc(200, 1, 200, "Thu Oct 22 11:00:00 2026")]);
+    const reused = await terminateProcessTree(child, {
+        platform: "linux",
+        snapshot: other.snapshot,
+        kill: other.kill,
+        known: new Map([[200, "Thu Oct 22 10:00:00 2026"]]),
+        killWaitMs: 500,
+        pollMs: 5,
+    });
+    assert.equal(reused.confirmed, true, reused.detail);
+    assert.ok(other.signals.every(([target]) => Math.abs(target) !== 200), JSON.stringify(other.signals));
+});
+
+test("an unkillable executor known only from the build stays unconfirmed", async () => {
+    const fake = fakeProcesses([proc(200, 1, 200)]);
+    fake.table.get(200).unkillable = true;
+    const child = { pid: 100, exitCode: 0, signalCode: null };
+    const outcome = await terminateProcessTree(child, {
+        platform: "linux",
+        snapshot: fake.snapshot,
+        kill: fake.kill,
+        known: new Map([[200, "Thu Oct 22 10:00:00 2026"]]),
+        killWaitMs: 150,
+        pollMs: 5,
+    });
+    assert.equal(outcome.confirmed, false);
+    assert.match(outcome.detail, /200/);
+});
+
+test("a process list that fails after one clean pass does not confirm, and the deadline still applies", { timeout: 5_000 }, async () => {
+    const child = { pid: 100, exitCode: 0, signalCode: null };
+    let calls = 0;
+    const startedAt = Date.now();
+    const outcome = await terminateProcessTree(child, {
+        platform: "linux",
+        snapshot: async () => {
+            calls += 1;
+            if (calls === 1) {
+                return new Map([proc(1, 0, 1)]);
+            }
+            throw new Error("ps is unavailable");
+        },
+        kill: () => {},
+        killWaitMs: 100,
+        pollMs: 5,
+    });
+    assert.equal(outcome.confirmed, false, outcome.detail);
+    assert.match(outcome.detail, /could not be listed/);
+    assert.ok(Date.now() - startedAt < 2_000, "it gave up at the deadline instead of spinning");
+});
+
+test("a records directory that cannot be read fails loudly instead of reading as no executor", posixOnly, async (t) => {
+    const dir = await tempDir(t, "executor-records-");
+    assert.deepEqual(await readExecutorMarkers(path.join(dir, "missing"), { wrapperPid: 1, spawnedAt: 0 }), [], "absent is empty");
+
+    const notADir = path.join(dir, "file");
+    await writeFile(notADir, "");
+    await assert.rejects(readExecutorMarkers(notADir, { wrapperPid: 1, spawnedAt: 0 }), { code: "ENOTDIR" });
+
+    const records = path.join(dir, "records");
+    await mkdir(records);
+    await writeFile(path.join(records, "10.json"), JSON.stringify({ format: 1, pid: 10, ancestors: [1], startedAt: 1 }));
+    await chmod(path.join(records, "10.json"), 0o000);
+    t.after(() => chmod(path.join(records, "10.json"), 0o600).catch(() => {}));
+    if (process.getuid?.() !== 0) {
+        await assert.rejects(readExecutorMarkers(records, { wrapperPid: 1, spawnedAt: 0 }), { code: "EACCES" });
+    }
+
+    const fake = fakeProcesses([proc(1, 0, 1)]);
+    const outcome = await terminateProcessTree(
+        { pid: 100, exitCode: 0, signalCode: null },
+        {
+            platform: "linux",
+            snapshot: fake.snapshot,
+            kill: fake.kill,
+            markers: () => readExecutorMarkers(notADir, { wrapperPid: 100, spawnedAt: 0 }),
+            killWaitMs: 100,
+            pollMs: 5,
+        },
+    );
+    assert.equal(outcome.confirmed, false, "an unreadable record is not proof there is no executor");
+});
+
+test("one record of observations is shared by tracking, the post-exit check, and the stop it falls back to", posixOnly, async (t) => {
+    const root = await posixProject(t, "echo started; sleep 0.3");
+    const seen = { probe: new Set(), terminate: new Set(), waitForExit: new Set() };
+    let probes = 0;
+    const service = newService(fakeManager(), {
+        executorExitWaitMs: 200,
+        lineagePollMs: 10,
+        processTree: {
+            probe: async (_child, options) => {
+                seen.probe.add(options.known);
+                probes += 1;
+                throw new Error("ps is unavailable"); // Neither tracking nor the check may treat this as gone.
+            },
+            terminate: async (_child, options) => {
+                seen.terminate.add(options.known);
+                return { confirmed: false, detail: "the test refused to confirm it" };
+            },
+            waitForExit: (_child, options) => {
+                seen.waitForExit.add(options.known);
+                return new Promise(() => {});
+            },
+        },
+    });
+    service.setWorkingDirectory(root);
+    const failure = await rejection(service.buildInstallLaunch({ deviceId: "one", launch: false }));
+    assert.equal(failure.code, "build_executor_unconfirmed");
+    assert.ok(failure.retainHoldUntil instanceof Promise, "the device stays reserved");
+    assert.equal(service.statusFor("one").quarantined, true);
+    assert.equal(service.projectLocks.size, 1, "the project stays reserved");
+    assert.ok(probes > 1, "it was observed while it ran, despite the failures");
+    const maps = new Set([...seen.probe, ...seen.terminate, ...seen.waitForExit]);
+    assert.equal(maps.size, 1, "every stage saw the same map");
+    assert.ok([...maps][0] instanceof Map);
+});
+
+/**
+ * A project whose `gradlew` execs a client that starts a single-use daemon in
+ * its own session and writes no executor record -- as when the configuration
+ * cache is reused -- then is SIGKILLed once the daemon is up, leaving the daemon
+ * reparented outside the wrapper's group with nothing on disk naming it.
+ */
+async function recordlessProject(t, { clientDiesAfterMs = 600 } = {}) {
+    const root = await tempDir(t, "recordless-fixture-");
+    await writeFile(
+        path.join(root, "client.cjs"),
+        `
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[2];
+const out = fs.openSync(path.join(root, "daemon.log"), "a");
+const daemon = spawn(process.execPath, ["-e", \`
+    process.on("SIGTERM", () => {});
+    require("node:fs").writeFileSync(\${JSON.stringify(path.join(root, "daemon.pid"))}, String(process.pid));
+    setTimeout(() => require("node:fs").writeFileSync(\${JSON.stringify(path.join(root, "installed"))}, "x"), 5000);
+    setInterval(() => {}, 1000);
+\`], { detached: true, stdio: ["ignore", out, out] });
+const wait = setInterval(() => {
+    if (fs.existsSync(path.join(root, "daemon.pid"))) {
+        clearInterval(wait);
+        console.log("started");
+        setTimeout(() => process.kill(process.pid, "SIGKILL"), ${clientDiesAfterMs});
+    }
+}, 10);
+`,
+    );
+    await writeFile(path.join(root, "gradlew"), `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/client.cjs" "$(dirname "$0")"\n`);
+    await chmod(path.join(root, "gradlew"), 0o755);
+    await writeMetadata(root, "app/build/outputs/apk/debug", { applicationId: "com.example.app", variantName: "debug" });
+    return root;
+}
+
+test("a recordless executor left behind by a killed client is stopped before the build is reported over", posixOnly, async (t) => {
+    const root = await recordlessProject(t);
+    const service = newService(fakeManager(), { executorExitWaitMs: 300, lineagePollMs: 20 });
+    service.setWorkingDirectory(root);
+    const failure = await rejection(service.buildInstallLaunch({ deviceId: "dev", launch: false }));
+    const daemon = await daemonPid(root);
+    t.after(() => {
+        try {
+            process.kill(daemon, "SIGKILL");
+        } catch {
+            // Gone, as expected.
+        }
+    });
+    assert.equal(failure.code, "build_failed", failure.message);
+    assert.equal(isAlive(daemon), false, "the daemon was gone before the build was reported over");
+    const termination = service.runs.get("dev").termination;
+    assert.equal(termination.confirmed, true, termination.detail);
+    assert.ok(termination.stopped?.some((entry) => entry.pid === daemon), JSON.stringify(termination));
+});
+
+test("cancelling during wrapper startup confirms the stop before anything it would start can run", posixOnly, async (t) => {
+    // The wrapper is still "downloading the distribution" when cancelled.
+    const root = await posixProject(t, ['sleep 0.4', 'echo late > "$(dirname "$0")/daemon-started"'].join("\n"));
+    const service = newService(fakeManager());
+    service.setWorkingDirectory(root);
+    const running = rejection(service.buildInstallLaunch({ deviceId: "dev", launch: false }));
+    await waitUntil(() => service.runs.get("dev")?.child?.pid, { message: "the wrapper to be spawned" });
+    const pid = service.runs.get("dev").child.pid;
+    t.after(() => killGroup(pid));
+    const final = await service.cancel("dev");
+    assert.equal(final.state, "cancelled");
+    assert.equal((await running).code, "build_cancelled");
+    assert.equal(service.runs.get("dev").termination.confirmed, true);
+    assert.equal(isAlive(pid), false);
+    await sleep(700);
+    await assert.rejects(readFile(path.join(root, "daemon-started")), { code: "ENOENT" }, "nothing ran after the cancellation");
+    await waitUntil(() => service.projectLocks.size === 0, { message: "the lock to be dropped" });
 });
 
 /**
