@@ -90,7 +90,7 @@ test("a slow reader gets the newest frame once it drains, not a backlog", async 
 
     const big = (label) => ({ pixels: Buffer.concat([Buffer.from(label), Buffer.alloc(1_200_000)]) });
     controller.onImage(big("one"));
-    controller.onImage(big("two")); // fills both sides of the 1MB stream buffer
+    controller.onImage(big("two")); // each frame alone overfills the stream buffer
     controller.onImage(big("three"));
     controller.onImage(big("four")); // supersedes "three" while the reader is stalled
 
