@@ -283,6 +283,124 @@ test("a stream the host ends is reported, and an HTTP error carries the host's m
     assert.equal(httpErrors[0]?.message, "adb went away");
 });
 
+/** A `createImageBitmap` whose first decode waits until released, reporting each still by its first byte. */
+function gatedDecoder() {
+    const decoded = [];
+    let release;
+    const gate = new Promise((resolve) => {
+        release = resolve;
+    });
+    globalThis.createImageBitmap = async (blob) => {
+        const label = new Uint8Array(await blob.arrayBuffer())[0];
+        decoded.push(label);
+        if (decoded.length === 1) {
+            await gate;
+        }
+        return { label, width: 2, height: 2, close() {} };
+    };
+    return { decoded, release };
+}
+
+test("stills that arrive during a slow decode collapse to the newest", async () => {
+    const { decoded, release } = gatedDecoder();
+    serveStream({ transport: "grpc", frames: [1, 2, 3, 4].map((label) => framed(0x04, new Uint8Array([label]))) });
+    const painted = [];
+    const controller = createH264StreamController({ onFrame: (bitmap) => painted.push(bitmap.label), onError() {} });
+    const started = controller.start({ url: "http://x/api/stream.h264", fps: 60 });
+
+    await waitUntil(() => decoded.length === 1, { message: "the first decode" });
+    await sleep(20);
+    release();
+    await waitUntil(() => painted.length === 2, { message: "the newest still" });
+    await sleep(20);
+    assert.deepEqual(painted, [1, 4], "stills 2 and 3 were superseded, not decoded");
+    assert.deepEqual(decoded, [1, 4]);
+    controller.stop();
+    await started;
+});
+
+test("a still decoded after the stream stopped is not painted", async () => {
+    const { decoded, release } = gatedDecoder();
+    serveStream({ transport: "grpc", frames: [framed(0x04, new Uint8Array([7]))] });
+    const painted = [];
+    const errors = [];
+    const controller = createH264StreamController({ onFrame: (bitmap) => painted.push(bitmap.label), onError: (error) => errors.push(error) });
+    const started = controller.start({ url: "http://x/api/stream.h264", fps: 60 });
+
+    await waitUntil(() => decoded.length === 1, { message: "the decode" });
+    controller.stop();
+    await started;
+    release();
+    await sleep(20);
+    assert.deepEqual(painted, []);
+    assert.deepEqual(errors, []);
+});
+
+test("keystrokes post in order, and keys typed during a request share the next one", async () => {
+    const { createInputController } = await extensionModule("web", "input-controller.js");
+    const originalDocument = globalThis.document;
+    const originalElement = globalThis.Element;
+    let keydown = null;
+    globalThis.document = {
+        addEventListener(type, handler) {
+            if (type === "keydown") {
+                keydown = handler;
+            }
+        },
+    };
+    globalThis.Element = class {};
+    try {
+        const posts = [];
+        const pending = [];
+        const notices = [];
+        const fetchJson = (path, body) => {
+            posts.push([path, body]);
+            return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+        };
+        createInputController({
+            elements: { screenWindow: fakeElement(), takeBack: fakeElement() },
+            apiUrl: (path) => path,
+            fetchJson,
+            getState: () => ({ state: "Booted" }),
+            isControlUnavailable: () => false,
+            setNotice: (message, isError) => notices.push([message, isError]),
+            setState() {},
+            withPending: (task) => task(),
+        }).bind();
+        const press = (key, code = key) => {
+            const event = { key, code, target: null, ctrlKey: false, metaKey: false, altKey: false, prevented: false };
+            event.preventDefault = () => {
+                event.prevented = true;
+            };
+            keydown(event);
+            return event;
+        };
+
+        for (const key of "hello") {
+            assert.equal(press(key, `Key${key.toUpperCase()}`).prevented, true);
+        }
+        press("Enter");
+        press("!", "Digit1");
+        assert.deepEqual(posts, [["api/input/text", { text: "h" }]], "one request at a time");
+
+        pending[0].resolve({});
+        await waitUntil(() => posts.length === 2, { message: "the joined text" });
+        assert.deepEqual(posts[1], ["api/input/text", { text: "ello" }]);
+        pending[1].reject(new Error("device busy"));
+        await waitUntil(() => posts.length === 3, { message: "the key after a failure" });
+        assert.deepEqual(posts[2], ["api/input/key", { code: "Enter" }], "a failure does not stall the queue");
+        pending[2].resolve({});
+        await waitUntil(() => posts.length === 4, { message: "the text after the key" });
+        assert.deepEqual(posts[3], ["api/input/text", { text: "!" }]);
+        pending[3].resolve({});
+        await sleep(10);
+        assert.deepEqual(notices, [["device busy", true]]);
+    } finally {
+        globalThis.document = originalDocument;
+        globalThis.Element = originalElement;
+    }
+});
+
 // --- connection diagnostics ----------------------------------------------------------
 
 const { buildDiagnosticReport, classifyGrpcFailure, createConnectionDiagnostics, describeConnection } =

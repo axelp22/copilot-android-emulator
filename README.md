@@ -114,9 +114,13 @@ The extension picks a transport per device.
 
 **Emulators use the emulator's own gRPC control plane** (`EmulatorController`), the same
 interface Android Studio's embedded emulator uses. Frames are complete PNG stills pushed
-as the guest produces them, and pointer input is delivered as real multitouch events.
-Nothing goes through `adb` on this path, so none of the `screenrecord` limitations below
-apply.
+as the guest produces them, and input — pointer, taps and swipes, keys, hardware buttons
+and typed text — is delivered as real touch and keyboard events. Nothing goes through
+`adb` on this path, so none of the `screenrecord` limitations below apply.
+
+Stills supersede one another rather than queueing. When the canvas or the connection
+falls behind, the frames in between are skipped, so what you see is the device's current
+screen rather than a backlog of older ones.
 
 **Physical devices are mirrored** with `adb exec-out screenrecord`, decoded as H.264 by
 WebCodecs in the canvas. Emulators fall back to this automatically whenever gRPC is not
@@ -171,8 +175,13 @@ presents that identity when attaching to it.
   Emulators default to a 50% capture, which measured fastest on the mirror and keeps
   gRPC latency at ~25ms. Physical devices default to 100%. Either can be changed from
   the canvas toolbar.
-- **Input over adb costs roughly 50-190ms per action**, because every `adb shell input`
-  starts a new process on the device. Emulator input over gRPC does not pay this.
+- **Input over adb costs roughly 50-500ms per action**, because every `adb shell input`
+  starts a new process on the device. This applies to physical devices and to mirrored
+  emulators. Local emulators use gRPC for input and avoid this cost, except for a few
+  keys with no gRPC equivalent (Menu, Camera, letters sent by keycode) and text outside
+  printable ASCII. Typing in the canvas posts one key at a time, in order, and joins
+  any keys typed in the meantime into the next request, so fast typing does not queue
+  up one round trip per character.
 - **Rotation depends on the app.** Rotating writes `user_rotation`, which the window
   manager may ignore when the foreground app pins its orientation. `rotate_device`
   reports whether the rotation was actually applied.

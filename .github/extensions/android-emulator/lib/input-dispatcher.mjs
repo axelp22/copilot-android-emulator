@@ -1,6 +1,8 @@
 import { AppError } from "./errors.mjs";
 import { adbShell } from "./adb.mjs";
 import { ORIENTATIONS, orientationFromRotation, rotationFromOrientation } from "./device-model.mjs";
+import { KEY_EVENT_TYPE } from "./emulator-controller.mjs";
+import { GRPC_STATUS } from "./grpc-client.mjs";
 
 /** Hardware buttons the canvas and agent tools can press. */
 export const BUTTON_KEYCODES = {
@@ -56,8 +58,68 @@ const DRAG_SEGMENT_MAX_MS = 400;
 const GRPC_TOUCH_IDENTIFIER = 0;
 /** Any non-zero value means "in contact"; the emulator does not scale by it. */
 const GRPC_TOUCH_PRESSURE = 1;
-/** How long a failed gRPC gesture keeps a device on the adb input path. */
+/** How long a failed gRPC input keeps a device on the adb input path. */
 const POINTER_RETRY_BACKOFF_MS = 30_000;
+/** Contact time for a gRPC tap; long enough to register, far below long-press. */
+const GRPC_TAP_HOLD_MS = 16;
+/** Spacing of interpolated gRPC swipe samples, about one display frame. */
+const GRPC_SWIPE_STEP_MS = 16;
+
+/**
+ * Android keycodes the emulator's gRPC `sendKey` delivers, keyed to the W3C key
+ * value it expects. These are the names Android Studio's embedded emulator
+ * sends; anything else stays on `adb shell input keyevent`.
+ */
+const GRPC_KEY_NAMES = new Map([
+    [3, "GoHome"],
+    [4, "GoBack"],
+    [187, "AppSwitch"],
+    [26, "Power"],
+    [24, "AudioVolumeUp"],
+    [25, "AudioVolumeDown"],
+    [66, "Enter"],
+    [111, "Escape"],
+    [67, "Backspace"],
+    [61, "Tab"],
+    [19, "ArrowUp"],
+    [20, "ArrowDown"],
+    [21, "ArrowLeft"],
+    [22, "ArrowRight"],
+    [122, "Home"],
+    [123, "End"],
+    [92, "PageUp"],
+    [93, "PageDown"],
+    [112, "Delete"],
+]);
+
+/**
+ * The emulator only translates printable ASCII from `KeyboardEvent.text`, and
+ * warns that large payloads can overrun its keyboard buffer. Text outside
+ * either bound keeps using `adb shell input text`.
+ */
+const GRPC_TEXT_PATTERN = /^[\x20-\x7e]+$/;
+const GRPC_TEXT_MAX_LENGTH = 256;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Statuses the emulator returns instead of acting on a request. A failure with
+ * any other cause, such as a deadline or a connection lost mid-call, may come
+ * after the input already landed, and replaying it over adb would type the text
+ * or tap the button twice.
+ */
+const GRPC_REJECTED_STATUSES = new Set([
+    GRPC_STATUS.invalidArgument,
+    GRPC_STATUS.permissionDenied,
+    GRPC_STATUS.failedPrecondition,
+    GRPC_STATUS.unimplemented,
+    GRPC_STATUS.unavailable,
+    GRPC_STATUS.unauthenticated,
+]);
+
+function grpcInputRejected(error) {
+    return GRPC_REJECTED_STATUSES.has(error?.grpcStatus) || error?.code === "grpc_http_error";
+}
 
 /** Resolve a key identifier to an Android keycode. */
 export function resolveKeyCode(code) {
@@ -172,6 +234,68 @@ export class InputDispatcher {
         return { deviceId, action: "touch", degraded: true, reason: error?.message ?? String(error) };
     }
 
+    /**
+     * Runs one input action over the emulator's gRPC connection when it has
+     * one, falling back to adb otherwise.
+     *
+     * gRPC input is scheduled on the emulator in milliseconds, where every
+     * `adb shell input` starts a process on the device and costs 50-500ms. The
+     * connection is held for the action so a failure reported by the video
+     * stream cannot close it while a finger is still down.
+     *
+     * A failed action is replayed over adb only when the emulator refused it
+     * outright; otherwise the error is reported, since part of it may already
+     * have happened. Either way the device uses adb until the backoff expires.
+     */
+    async grpcOrAdb(deviceId, sendGrpc, sendAdb) {
+        // The transport is chosen inside the queue, so an action that may use
+        // gRPC cannot be overtaken by an adb-only one issued after it.
+        return await this.enqueue(deviceId, async () => {
+            const controller = sendGrpc ? await this.pointerBackend(deviceId) : null;
+            if (controller) {
+                const releaseHold = this.controlPool?.hold?.(controller) ?? (() => {});
+                const attempt = { delivered: false };
+                try {
+                    await sendGrpc(controller, attempt);
+                    return "grpc";
+                } catch (error) {
+                    this.pointerDisabled.set(deviceId, Date.now() + POINTER_RETRY_BACKOFF_MS);
+                    if (attempt.delivered || !grpcInputRejected(error)) {
+                        throw error;
+                    }
+                } finally {
+                    releaseHold();
+                }
+            }
+            await sendAdb();
+            return "adb";
+        });
+    }
+
+    /** One complete gRPC touch, lifting the finger even if a sample fails. */
+    async grpcGesture(controller, attempt, points, stepMs) {
+        const touch = ({ x, y }, pressure) =>
+            controller.sendTouch({
+                touches: [{ x, y, identifier: GRPC_TOUCH_IDENTIFIER, pressure }],
+                display: 0,
+            });
+        let last = points[0];
+        try {
+            await touch(last, GRPC_TOUCH_PRESSURE);
+            attempt.delivered = true;
+            for (const point of points.slice(1)) {
+                await sleep(stepMs);
+                last = point;
+                await touch(point, GRPC_TOUCH_PRESSURE);
+            }
+            await sleep(stepMs);
+            await touch(last, 0);
+        } catch (error) {
+            await touch(last, 0).catch(() => {});
+            throw error;
+        }
+    }
+
     /** Serialize adb commands per device so gestures never interleave. */
     enqueue(deviceId, task) {
         const previous = this.commandQueues.get(deviceId) ?? Promise.resolve();
@@ -224,8 +348,12 @@ export class InputDispatcher {
     async tap(input) {
         await this.ensureInputReady(input.deviceId);
         const [x, y] = await this.toPixels(input.deviceId, [input.x, input.y], input.coordinateSpace);
-        await this.enqueue(input.deviceId, () => this.shell(input.deviceId, ["input", "tap", String(x), String(y)]));
-        return { deviceId: input.deviceId, action: "tap", x, y };
+        const transport = await this.grpcOrAdb(
+            input.deviceId,
+            (controller, attempt) => this.grpcGesture(controller, attempt, [{ x, y }], GRPC_TAP_HOLD_MS),
+            () => this.shell(input.deviceId, ["input", "tap", String(x), String(y)]),
+        );
+        return { deviceId: input.deviceId, action: "tap", x, y, transport };
     }
 
     async swipe(input) {
@@ -236,34 +364,58 @@ export class InputDispatcher {
             input.coordinateSpace,
         );
         const durationMs = Math.max(1, Math.min(60_000, Math.round(Number(input.durationMs ?? 300))));
-        await this.enqueue(input.deviceId, () =>
-            this.shell(input.deviceId, [
-                "input",
-                "swipe",
-                String(startX),
-                String(startY),
-                String(endX),
-                String(endY),
-                String(durationMs),
-            ]),
+        // `input swipe` interpolates internally; over gRPC the samples are ours
+        // to send, so they are spaced about one display frame apart.
+        const steps = Math.max(1, Math.round(durationMs / GRPC_SWIPE_STEP_MS));
+        const points = Array.from({ length: steps + 1 }, (_, index) => ({
+            x: Math.round(startX + ((endX - startX) * index) / steps),
+            y: Math.round(startY + ((endY - startY) * index) / steps),
+        }));
+        const transport = await this.grpcOrAdb(
+            input.deviceId,
+            (controller, attempt) => this.grpcGesture(controller, attempt, points, durationMs / steps),
+            () =>
+                this.shell(input.deviceId, [
+                    "input",
+                    "swipe",
+                    String(startX),
+                    String(startY),
+                    String(endX),
+                    String(endY),
+                    String(durationMs),
+                ]),
         );
-        return { deviceId: input.deviceId, action: "swipe", startX, startY, endX, endY, durationMs };
+        return { deviceId: input.deviceId, action: "swipe", startX, startY, endX, endY, durationMs, transport };
+    }
+
+    /** A W3C key press over gRPC when the keycode has one, otherwise adb. */
+    sendKeyCode(deviceId, keyCode) {
+        const key = GRPC_KEY_NAMES.get(keyCode);
+        return this.grpcOrAdb(
+            deviceId,
+            key ? (controller) => controller.sendKey({ eventType: KEY_EVENT_TYPE.keypress, key }) : null,
+            () => this.shell(deviceId, ["input", "keyevent", String(keyCode)]),
+        );
     }
 
     async sendKey(input) {
         await this.ensureInputReady(input.deviceId);
         const keyCode = resolveKeyCode(input.code);
-        await this.enqueue(input.deviceId, () =>
-            this.shell(input.deviceId, ["input", "keyevent", String(keyCode)]),
-        );
-        return { deviceId: input.deviceId, action: "key", code: String(keyCode) };
+        const transport = await this.sendKeyCode(input.deviceId, keyCode);
+        return { deviceId: input.deviceId, action: "key", code: String(keyCode), transport };
     }
 
     async sendText(input) {
         await this.ensureInputReady(input.deviceId);
         const payload = escapeInputText(input.text);
-        await this.enqueue(input.deviceId, () => this.shell(input.deviceId, ["input", "text", payload]));
-        return { deviceId: input.deviceId, action: "text", length: String(input.text).length };
+        const text = String(input.text);
+        const grpcText = text.length <= GRPC_TEXT_MAX_LENGTH && GRPC_TEXT_PATTERN.test(text);
+        const transport = await this.grpcOrAdb(
+            input.deviceId,
+            grpcText ? (controller) => controller.sendKey({ text }) : null,
+            () => this.shell(input.deviceId, ["input", "text", payload]),
+        );
+        return { deviceId: input.deviceId, action: "text", length: text.length, transport };
     }
 
     async pressButton(input, maybeButton) {
@@ -273,10 +425,8 @@ export class InputDispatcher {
             throw new AppError("unsupported_button", `Unsupported button: ${button}`, 400);
         }
         await this.ensureInputReady(deviceId);
-        await this.enqueue(deviceId, () =>
-            this.shell(deviceId, ["input", "keyevent", String(BUTTON_KEYCODES[button])]),
-        );
-        return { deviceId, action: "button", button };
+        const transport = await this.sendKeyCode(deviceId, BUTTON_KEYCODES[button]);
+        return { deviceId, action: "button", button, transport };
     }
 
     goHome(input) {

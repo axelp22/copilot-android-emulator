@@ -191,13 +191,57 @@ export function createH264StreamController({ onFrame, onError }) {
         decoder = next;
     }
 
-    async function drawSeed(payload) {
+    async function drawSeed(payload, signal) {
         const bitmap = await createImageBitmap(new Blob([payload], { type: "image/png" }));
         try {
-            onFrame(bitmap);
+            // A decode that finishes after a stop or restart belongs to a stream
+            // that is gone, and must not paint over its replacement.
+            if (!signal.aborted) {
+                onFrame(bitmap);
+            }
         } finally {
             bitmap.close();
         }
+    }
+
+    /**
+     * Stills on a still-based stream are decoded newest-first.
+     *
+     * Each one is a complete picture, so a still that arrives while another is
+     * decoding replaces any still waiting behind it. Decoding inline instead
+     * stops the read loop on every frame, and when decoding is slower than the
+     * emulator a backlog builds in the socket that the canvas then works
+     * through, painting ever older frames.
+     *
+     * The queue belongs to one `start()`: a decode still running from a stopped
+     * stream must not clear the first still of its replacement, which on a
+     * static screen may be the only one sent.
+     */
+    function createStillPainter(signal) {
+        let pending = null;
+        let painting = false;
+        return function queueStill(payload) {
+            pending = payload;
+            if (painting) {
+                return;
+            }
+            painting = true;
+            void (async () => {
+                try {
+                    while (pending && !signal.aborted) {
+                        const next = pending;
+                        pending = null;
+                        await drawSeed(next, signal);
+                    }
+                } catch (error) {
+                    if (!signal.aborted) {
+                        fail(error);
+                    }
+                } finally {
+                    painting = false;
+                }
+            })();
+        };
     }
 
     async function start({ url, fps }) {
@@ -205,6 +249,7 @@ export function createH264StreamController({ onFrame, onError }) {
         failed = false;
         abortController = new AbortController();
         const signal = abortController.signal;
+        const queueStill = createStillPainter(signal);
 
         try {
             const response = await fetch(url, { signal });
@@ -264,7 +309,13 @@ export function createH264StreamController({ onFrame, onError }) {
                             recoverDecoder();
                         }
                     } else if (tag === 0x04) {
-                        await drawSeed(payload);
+                        if (stillStream) {
+                            queueStill(payload);
+                        } else {
+                            // A mirrored stream interleaves stills with video, so
+                            // one must paint before the samples that follow it.
+                            await drawSeed(payload, signal);
+                        }
                     }
                 }
                 if (offset > 0) {

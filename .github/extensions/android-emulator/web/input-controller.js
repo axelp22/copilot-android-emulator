@@ -51,6 +51,50 @@ export function createInputController({
         return Boolean(state && state.state === "Booted" && !isControlUnavailable());
     }
 
+    /**
+     * Keystrokes are posted one at a time, in the order they were typed.
+     *
+     * Posting each key as soon as it is pressed lets the browser run the requests
+     * concurrently, so they can reach the device out of order, and on adb every
+     * one pays a full `input` process. Characters typed while a request is in
+     * flight are instead joined into the next `input/text` call: a fast typist
+     * costs one round-trip per pause rather than one per key.
+     */
+    const keyQueue = [];
+    let keyQueueRunning = false;
+
+    function enqueueKeyInput(item) {
+        const last = keyQueue.at(-1);
+        if (item.text !== undefined && last?.text !== undefined) {
+            last.text += item.text;
+        } else {
+            keyQueue.push(item);
+        }
+        if (!keyQueueRunning) {
+            void drainKeyQueue();
+        }
+    }
+
+    async function drainKeyQueue() {
+        keyQueueRunning = true;
+        try {
+            while (keyQueue.length > 0) {
+                const item = keyQueue.shift();
+                try {
+                    if (item.text !== undefined) {
+                        await fetchJson("api/input/text", { text: item.text });
+                    } else {
+                        await fetchJson("api/input/key", { code: item.code });
+                    }
+                } catch (error) {
+                    setNotice(error.message, true);
+                }
+            }
+        } finally {
+            keyQueueRunning = false;
+        }
+    }
+
     function forwardKeyboardEvent(event) {
         if (!canInteract()) {
             return;
@@ -67,14 +111,14 @@ export function createInputController({
 
         const character = printableCharacter(event);
         if (character) {
-            void fetchJson("api/input/text", { text: character }).catch((error) => setNotice(error.message, true));
+            enqueueKeyInput({ text: character });
             event.preventDefault();
             return;
         }
         if (!supportedKeyCodes.has(event.code)) {
             return;
         }
-        void fetchJson("api/input/key", { code: event.code }).catch((error) => setNotice(error.message, true));
+        enqueueKeyInput({ code: event.code });
         event.preventDefault();
     }
 

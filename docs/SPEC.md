@@ -182,6 +182,15 @@ continuous gesture on one touch slot. A touch is released by sending pressure 0 
 identifier; failing to do so leaves the slot held for 120 seconds, so cancel and error
 paths must lift explicitly.
 
+Local emulators send the other actions in the table over gRPC as well. `tap` and `swipe`
+become `sendTouch` gestures. Keys and buttons with a W3C key name (`GoHome`, `GoBack`,
+`AppSwitch`, `Power`, `AudioVolumeUp`, `Enter`, the arrows, and so on) are sent as a
+`sendKey` keypress. Printable-ASCII text up to 256 characters is sent as
+`KeyboardEvent.text`, unescaped. Anything without a gRPC form keeps the adb command.
+When the emulator refuses a request outright, the action is replayed over adb. Any
+other failure is reported instead, because the input may already have landed. After
+any failure the device uses adb for a 30-second backoff.
+
 ## Behavior parity to preserve
 
 Keep these behaviors from the reference — they are the reason it feels good to use:

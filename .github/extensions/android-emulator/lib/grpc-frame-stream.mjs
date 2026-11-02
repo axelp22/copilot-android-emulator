@@ -48,7 +48,11 @@ export async function createGrpcFrameStream({ controller, size, fps = 60, onDiag
         throw new AppError("grpc_unavailable", "This emulator has no gRPC control connection.", 409);
     }
 
-    const stdout = new PassThrough({ highWaterMark: 1 << 20 });
+    // Small on purpose. Anything this buffer holds is a frame the canvas will
+    // paint late, and a full-resolution PNG can be hundreds of KB, so a large
+    // buffer becomes a queue of stale pictures. Filling it early hands control to
+    // the supersede logic in `write`, which keeps only the newest frame.
+    const stdout = new PassThrough({ highWaterMark: 256 * 1024 });
     // Failures propagate by destroying the stream, so a listener must always
     // exist: an unhandled 'error' would take down the extension host.
     stdout.on("error", () => {});
